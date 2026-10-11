@@ -43,8 +43,7 @@ stop_meeting() {
     notify "Meeting stopped" "Transcribing the last chunk..." media-playback-stop
 
     # The daemon flushes the final chunk, saves, then writes "idle". Allow 5 minutes.
-    local i
-    for i in $(seq 1 600); do
+    for _ in $(seq 1 600); do
         [ "$(meeting_state)" = "idle" ] && break
         sleep 0.5
     done

@@ -840,12 +840,14 @@ class C_SingleInstanceTests(unittest.TestCase):
     env = dict(os.environ, VOICENOTES_DEBUG="1", VOICENOTES_SOCKET=str(WORK / "si.sock"))
 
     def launch(self, *args, cwd=None) -> tuple[subprocess.Popen, LogReader]:
-        p = subprocess.Popen([str(APP_PATH), *args], env=self.env, cwd=cwd, stdin=subprocess.DEVNULL,
+        p = subprocess.Popen([sys.executable, "-I", str(APP_PATH), *args], env=self.env, cwd=cwd,
+                             stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         return p, LogReader(p)
 
     def second(self, *args, cwd=None) -> subprocess.CompletedProcess:
-        return subprocess.run([str(APP_PATH), *args], env=self.env, cwd=cwd, capture_output=True,
+        return subprocess.run([sys.executable, "-I", str(APP_PATH), *args], env=self.env, cwd=cwd,
+                              capture_output=True,
                               text=True, timeout=30)
 
     def stop(self, p: subprocess.Popen) -> int:

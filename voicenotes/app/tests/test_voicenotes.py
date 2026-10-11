@@ -875,9 +875,14 @@ class C_SingleInstanceTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(log1.wait_for(json.dumps(FIX["files"]["clip.ogg"])), log1.lines)
             self.assertTrue(log1.wait_for("message: Added 1 file"), log1.lines)
-            # voicenotes-ctl open (as the panel widget calls it) reaches the same window
+            # voicenotes-ctl open (as the panel widget calls it) reaches the same window; the
+            # app runs with this test's Python (CI has PyQt6 only there, not in /usr/bin/python3)
+            app = WORK / "voicenotes-app"
+            app.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{APP_PATH}" "$@"\n')
+            app.chmod(0o755)
             r = subprocess.run([str(CTL_PATH), "open", "transcribe", "--file", FIX["files"]["a.ogg"]],
-                               env=self.env, capture_output=True, text=True, timeout=10)
+                               env=dict(self.env, VOICENOTES_APP=str(app)), capture_output=True,
+                               text=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(log1.wait_for(f'"page": "transcribe", "id": null, "files": ["{FIX["files"]["a.ogg"]}"]'),
                             log1.lines)

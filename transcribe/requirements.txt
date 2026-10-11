@@ -1,0 +1,9 @@
+# npu-transcribe's Python environment (the installer puts it in
+# ~/.local/share/npu-voicenotes/venv). Versions as tested; openvino-genai must match
+# the OpenVINO GenAI C SDK that system/install.sh installs for voxtype (2026.4.1).
+openvino==2026.4.1
+openvino-genai==2026.4.1.0
+openvino-tokenizers==2026.4.1.0
+numpy>=2.0
+# `hf download` for the Whisper models
+huggingface-hub>=0.34

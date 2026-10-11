@@ -1,0 +1,83 @@
+#!/bin/bash
+# Start or stop a voxtype meeting (mic + system audio). On stop, wait until the daemon
+# has transcribed the last chunk, then save a Markdown copy into ~/Documents/Meetings.
+#
+# Bound to Meta+Alt+M via voxtype-meeting.desktop (see docs/voxtype.md).
+#   voxtype-meeting-toggle            toggle
+#   voxtype-meeting-toggle start|stop explicit
+# Env: VOXTYPE_MEETING_DIR (default ~/Documents/Meetings)
+set -eu
+
+OUT_DIR="${VOXTYPE_MEETING_DIR:-$HOME/Documents/Meetings}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
+STATE_FILE="$RUN_DIR/meeting_state"          # written by the voxtype daemon
+STAMP_FILE="$RUN_DIR/meeting-toggle.started"  # our own: start time for the file name
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype-meeting-toggle.lock"
+
+notify() {  # best effort; never fail the toggle because of a notification
+    notify-send -a "Voxtype" -i "${3:-audio-input-microphone}" "$1" "${2:-}" 2>/dev/null || true
+}
+
+meeting_state() {  # first line of the daemon's state file: recording|paused|idle
+    head -n1 "$STATE_FILE" 2>/dev/null || echo idle
+}
+
+start_meeting() {
+    local title
+    title="Meeting $(date '+%Y-%m-%d %H:%M')"
+    # Started from a shortcut there is no terminal, so say it when it does not work.
+    if ! voxtype meeting start --title "$title"; then
+        notify "Meeting NOT started" "Is voxtype running? systemctl --user status voxtype" dialog-error
+        exit 1
+    fi
+    mkdir -p "$RUN_DIR"
+    date '+%Y-%m-%d_%H%M' > "$STAMP_FILE"
+    notify "Meeting recording started" "Microphone + system audio. Press again to stop."
+}
+
+stop_meeting() {
+    if ! voxtype meeting stop; then
+        notify "Meeting stop failed" "Is voxtype running? systemctl --user status voxtype" dialog-error
+        exit 1
+    fi
+    notify "Meeting stopped" "Transcribing the last chunk..." media-playback-stop
+
+    # The daemon flushes the final chunk, saves, then writes "idle". Allow 5 minutes.
+    local i
+    for i in $(seq 1 600); do
+        [ "$(meeting_state)" = "idle" ] && break
+        sleep 0.5
+    done
+    if [ "$(meeting_state)" != "idle" ]; then
+        notify "Meeting export not done" "Daemon still busy. Later run: voxtype meeting export latest -o FILE.md" dialog-warning
+        exit 1
+    fi
+
+    local stamp file
+    stamp="$(cat "$STAMP_FILE" 2>/dev/null || date '+%Y-%m-%d_%H%M')"
+    mkdir -p "$OUT_DIR"
+    file="$OUT_DIR/$stamp-meeting.md"
+    [ -e "$file" ] && file="$OUT_DIR/$stamp-meeting-$(date +%s).md"   # never overwrite
+    if ! voxtype meeting export latest --format markdown --timestamps --speakers --metadata --output "$file"; then
+        notify "Meeting export failed" "Saved in voxtype's database; try: voxtype meeting export latest -o FILE.md" dialog-warning
+        exit 1
+    fi
+    rm -f "$STAMP_FILE"
+    notify "Meeting transcript saved" "$file" document-save
+    echo "$file"
+}
+
+# One toggle at a time (double-clicked panel button, key auto-repeat...).
+exec 9>"$LOCK_FILE"
+flock -n 9 || { notify "Meeting toggle already running" "" dialog-information; exit 0; }
+
+case "${1:-toggle}" in
+    start)  start_meeting ;;
+    stop)   stop_meeting ;;
+    toggle)
+        case "$(meeting_state)" in
+            recording|paused) stop_meeting ;;
+            *)                start_meeting ;;
+        esac ;;
+    *) echo "usage: $0 [toggle|start|stop]" >&2; exit 2 ;;
+esac

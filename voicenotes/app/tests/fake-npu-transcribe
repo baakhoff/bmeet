@@ -1,0 +1,70 @@
+#!/usr/bin/python3 -I
+"""Stand-in for npu-transcribe in the Voice Notes GUI tests (VOICENOTES_TRANSCRIBE).
+
+Prints the same stderr lines as the real tool without a terminal (log lines plus
+one progress line per block), writes NAME.srt/NAME.md next to the input, prints
+their paths on stdout and appends a history line like the real tool does.
+FAKE_TRANSCRIBE_DELAY: seconds per step (default 0.2); FAKE_TRANSCRIBE_FAIL=1: fail.
+Ctrl+C / SIGINT -> "interrupted", exit 130 (as the real tool).
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def log(msg: str) -> None:
+    print(f"npu-transcribe: {msg}", file=sys.stderr, flush=True)
+
+
+def main(argv: list[str]) -> int:
+    model, language, translate = "turbo", "auto", "--translate" in argv
+    if "--model" in argv:
+        model = argv[argv.index("--model") + 1]
+    if "--language" in argv:
+        language = argv[argv.index("--language") + 1]
+    src = Path(argv[argv.index("--") + 1] if "--" in argv else argv[-1]).absolute()
+    delay = float(os.environ.get("FAKE_TRANSCRIBE_DELAY", "0.2"))
+    hist = Path(os.environ["NPU_TRANSCRIBE_HISTORY"])
+
+    def record(outputs: list[Path], status: str) -> None:
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        with hist.open("a") as f:
+            f.write(json.dumps({"time": int(time.time()), "input": str(src),
+                                "outputs": [str(o) for o in outputs], "model": model,
+                                "language": "en" if language == "auto" else language,
+                                "device": "NPU", "duration": 300.0, "status": status}) + "\n")
+
+    log(f"loading whisper-{model}-int8-ov on NPU (the first NPU run compiles the model: "
+        "~1 min small, ~4 min turbo; cached afterwards)")
+    time.sleep(delay)
+    log("model ready on NPU in 0.1 s")
+    if os.environ.get("FAKE_TRANSCRIBE_FAIL"):
+        log(f"ERROR: {src.name}: ffmpeg failed: Invalid data found when processing input")
+        record([], "failed")
+        return 1
+    log("language: en (auto-detected from the first block)")
+    for done in (120, 240, 300):
+        time.sleep(delay)
+        print(f"{src.name}: {done / 3:3.0f}%  00:{done // 60:02d}:{done % 60:02d}/00:05:00  "
+              f"elapsed 00:00:0{done // 120}  speed 12.0x", file=sys.stderr, flush=True)
+    outputs = []
+    for ext, text in ((".srt", "1\n00:00:00,000 --> 00:00:02,000\nHello fake world.\n"),
+                      (".md", f"# {src.stem}\n\n- **Model:** fake\n\n[00:00:00] Hello fake world, "
+                              f"wombat.{' (translated)' if translate else ''}\n")):
+        out = src.with_suffix(ext)
+        out.write_text(text)
+        outputs.append(out)
+        print(out, flush=True)
+    record(outputs, "done")
+    log(f"done: {src.name}: 00:05:00 of audio in 1.0 s on NPU (300.0x realtime), 1 segment(s), language en")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        log("interrupted")
+        sys.exit(130)

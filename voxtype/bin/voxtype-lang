@@ -1,0 +1,65 @@
+#!/bin/bash
+# Switch the dictation language of voxtype's OpenVINO engine and restart the daemon.
+# The OpenVINO engine takes exactly one language per daemon run (no auto-detect), so
+# switching = `voxtype config set openvino.language XX` + restart (~3 s, model blob is
+# cached). A running meeting or dictation is NOT interrupted - the script refuses then.
+#
+#   voxtype-lang            next language from ~/.config/npu-voicenotes/languages
+#                           (e.g. "en de"; bound to Meta+Shift+H)
+#   voxtype-lang de|en|...  set explicitly (any Whisper language code)
+#   voxtype-lang --show     print current language
+set -eu
+
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype/meeting_state"
+LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages"
+
+notify() { notify-send -a "Voxtype" -i preferences-desktop-locale "$1" "${2:-}" 2>/dev/null || true; }
+
+current="$(voxtype config get openvino.language)" \
+    || { notify "Language not changed" "voxtype config get failed - is voxtype installed?"; exit 1; }
+next_language() {  # the configured language after $current (wraps around)
+    local langs=() words=() l i
+    declare -A seen=()
+    if [ -r "$LANG_FILE" ]; then
+        read -r -a words < <(tr 'A-Z,\n' 'a-z  ' < "$LANG_FILE") || true
+        for l in ${words[@]+"${words[@]}"}; do
+            [[ $l =~ ^[a-z]{2,3}$ ]] && [ -z "${seen[$l]:-}" ] && { langs+=("$l"); seen[$l]=1; }
+        done
+    fi
+    [ "${#langs[@]}" -gt 0 ] || langs=(en)
+    for i in "${!langs[@]}"; do
+        if [ "${langs[$i]}" = "$current" ]; then
+            echo "${langs[$(( (i + 1) % ${#langs[@]} ))]}"; return
+        fi
+    done
+    echo "${langs[0]}"
+}
+
+case "${1:-toggle}" in
+    --show) echo "$current"; exit 0 ;;
+    toggle) new="$(next_language)" ;;
+    [a-z][a-z]|[a-z][a-z][a-z]) new="$1" ;;
+    *) echo "usage: $0 [toggle|<whisper language code>|--show]" >&2; exit 2 ;;
+esac
+
+# A restart would cut a running meeting short.
+case "$(head -n1 "$STATE_FILE" 2>/dev/null || echo idle)" in
+    recording|paused)
+        notify "Language not changed" "A meeting is running; stop it first."
+        exit 1 ;;
+esac
+# ... or throw away a dictation that is being recorded/transcribed right now.
+case "$(voxtype status 2>/dev/null || echo stopped)" in
+    recording|streaming|transcribing)
+        notify "Language not changed" "Dictation in progress; try again when it is done."
+        exit 1 ;;
+esac
+
+if [ "$new" = "$current" ]; then
+    notify "Dictation language: ${new^^}" "unchanged (list more languages in $LANG_FILE)"
+else
+    voxtype config set openvino.language "$new" >/dev/null
+    systemctl --user restart voxtype.service
+    notify "Dictation language: ${new^^}" "voxtype restarted"
+fi
+echo "$new"

@@ -1,0 +1,133 @@
+# npu-voicenotes: voxtype 1.1.0 config for Whisper on the Intel NPU
+# (Ubuntu/Kubuntu 26.04, KDE Plasma 6 Wayland, PipeWire).
+#
+# Installed to ~/.config/voxtype/config.toml by voxtype/user-setup.sh. A config that
+# was not written by npu-voicenotes is backed up first; this one is kept on re-runs
+# (so your changes stay). Change single values later with:
+#     voxtype config set <key> <value>      (keeps comments)
+#     systemctl --user restart voxtype     (openvino.* keys need a restart)
+# Reference: /usr/share/doc/voxtype/README.md, `voxtype config schema`.
+
+# Whisper through Intel OpenVINO GenAI (needs the onnx-avx2 binary variant; system/install.sh
+# switches /usr/bin/voxtype to it).
+engine = "openvino"
+
+# Needed by `voxtype record toggle`, `voxtype status` and meeting-state tracking.
+state_file = "auto"
+
+[hotkey]
+# KWin cannot deliver key-release events to custom shortcuts, so push-to-talk is not
+# possible on Plasma; a KDE global shortcut runs `voxtype record toggle` instead
+# (see docs/voxtype.md). The built-in evdev hotkey stays OFF, so the user does NOT have to be
+# in the `input` group (which would let any user process read every keystroke).
+enabled = false
+mode = "toggle"
+
+[audio]
+# ALSA name; "default" goes through pipewire-alsa to the current PipeWire default source.
+device = "default"
+sample_rate = 16000
+# Safety cap for one dictation (seconds). Meeting mode has its own limit below.
+max_duration_secs = 120
+
+[audio.feedback]
+# Short start/stop sounds, so you know whether toggle mode is listening.
+enabled = true
+theme = "subtle"
+volume = 0.5
+
+[openvino]
+# Whisper small, multilingual, int8 (OpenVINO/whisper-small-int8-ov from Hugging Face).
+# Measured on a Core Ultra 7 258V NPU: first compile ~60 s (once, cached in
+# ~/.cache/voxtype/openvino/), daemon load from cache ~3 s, a 5 s utterance ~0.5 s.
+# whisper-large-v3-turbo does NOT work in voxtype on the NPU (docs/voxtype.md).
+model = "@MODELS_DIR@/whisper-small-int8-ov"
+
+# NPU first. If the NPU fails to START, voxtype's hard-coded chain is NPU -> GPU -> CPU;
+# system/install.sh leaves OpenVINO's GPU plugin out, so it goes straight to the CPU and
+# never touches the iGPU. Logged as "fell back to 'CPU'" (journalctl --user -u voxtype).
+# Errors DURING a transcription do not fall back (that dictation just fails).
+device = "NPU"
+
+# One language per daemon run with this engine (no auto-detect, no ["en","de"] list).
+# Switch with `voxtype-lang` (Meta+Shift+H: next language from
+# ~/.config/npu-voicenotes/languages) or `voxtype-lang de`; both restart the daemon.
+language = "@LANGUAGE@"
+translate = false
+
+# Keep the compiled pipeline loaded so dictation starts instantly.
+on_demand_loading = false
+
+# Intel's OpenVINO GenAI C/C++ SDK 2026.4.1 (provides libopenvino_genai_c.so, which the
+# pip wheel lacks). system/install.sh unpacks it to /opt/intel and points this symlink at it.
+openvino_dir = "/opt/intel/openvino_genai"
+
+[output]
+# "paste" = wl-copy the text, then send the paste keystroke. This is the one output
+# mode that works for every language and keyboard layout on KWin: wtype is unsupported on KWin,
+# ydotool "type" can only type US-layout ASCII, eitype/dotool are not packaged for
+# Ubuntu and depend on the active keyboard layout.
+mode = "paste"
+
+# The keystroke is sent by ydotool (ydotoold user service, pulled in by voxtype.service).
+# ctrl+v works in browsers, Qt/GTK/Electron apps. Terminals (Konsole: Ctrl+Shift+V)
+# do not paste on ctrl+v - use the clipboard-only shortcut there (Meta+Alt+H).
+# shift+insert is NOT used: in Konsole it pastes the PRIMARY selection instead.
+paste_keys = "ctrl+v"
+
+# Keep the dictated text on the clipboard. restore_clipboard = true would put your
+# previous clipboard back, but voxtype 1.1.0 appends a newline when doing so (issue
+# #747), which can make a later paste into a terminal execute a command.
+restore_clipboard = false
+
+# Only used by `voxtype record toggle --type` (paste mode ignores it in 1.1.0).
+driver_order = ["ydotool", "clipboard"]
+fallback_to_clipboard = true
+type_delay_ms = 0
+pre_type_delay_ms = 0
+
+[output.notification]
+# Off: Plasma shows only the first of these (voxtype issue #850), and the dictated text
+# would end up in the notification history. Sounds + OSD show the state instead.
+on_recording_start = false
+on_recording_stop = false
+on_transcription = false
+
+[osd]
+# Small waveform overlay while recording (GTK4 + gtk4-layer-shell; KWin supports
+# layer-shell). Set enabled = false to hide it. It runs as a child of the daemon for
+# as long as the daemon runs; the service drop-in written by user-setup.sh makes it draw
+# in software (GSK_RENDERER=cairo, GDK_DISABLE=gl,vulkan,dmabuf) so it creates no GPU
+# context. Set enabled = false to have no overlay at all.
+enabled = true
+frontend = "gtk4"
+
+[meeting]
+enabled = true
+# Each chunk is transcribed separately (mic and system audio each get a pass).
+chunk_duration_secs = 30
+# Database + JSON transcripts live in ~/.local/share/voxtype/meetings/.
+# Markdown copies go to ~/Documents/Meetings via voxtype-meeting-toggle (no config key
+# for an export directory exists in 1.1.0).
+storage_path = "auto"
+retain_audio = false
+max_duration_mins = 180
+
+[meeting.audio]
+mic_device = "default"
+# System audio = the monitor of whatever is the CURRENT default output (laptop speakers,
+# USB headset, HDMI...). "auto" would pick the first *.monitor it finds, which can be
+# an idle HDMI output.
+loopback_device = "@DEFAULT_MONITOR@"
+# GTCRN speech enhancement + transcript de-duplication against speaker bleed-through
+# (useful without headphones). Model file is pre-placed by user-setup.sh (sha256-pinned).
+echo_cancel = "auto"
+vad_threshold = 0.01
+
+[meeting.diarization]
+# "simple" labels speech as You (mic) / Remote (system audio); no extra model.
+enabled = true
+backend = "simple"
+
+[meeting.summary]
+backend = "disabled"

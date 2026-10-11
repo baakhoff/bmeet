@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [ { "Name": "baakhoff" } ],
+        "Category": "Multimedia",
+        "Description": "Dictation and meeting transcription on the Intel NPU (voxtype + npu-transcribe)",
+        "Icon": "audio-input-microphone",
+        "Id": "io.github.baakhoff.voicenotes",
+        "License": "MIT",
+        "Name": "Voice Notes",
+        "Version": "0.1.0",
+        "Website": "https://github.com/baakhoff/npu-voicenotes"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

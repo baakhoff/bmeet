@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Voxtype: Meeting
+GenericName=Meeting transcription (toggle)
+Comment=Start/stop meeting transcription (mic + system audio); Markdown goes to ~/Documents/Meetings
+Exec=@HOME@/.local/bin/voxtype-meeting-toggle
+Icon=media-record
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+Keywords=meeting;transcript;voxtype;
+X-KDE-Shortcuts=Meta+Alt+M

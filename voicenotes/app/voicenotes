@@ -1,0 +1,2654 @@
+#!/usr/bin/python3 -I
+"""Voice Notes - dictation, meeting transcripts and file transcripts in one window.
+
+Usage:
+  voicenotes [meetings|files|transcribe] [--id MEETING_ID] [--file PATH]... [FILE...]
+  voicenotes --version
+
+  meetings|files|transcribe   page to show (default: the page used last)
+  --id ID                     select this meeting (voxtype meeting id)
+  --file PATH, FILE           an audio/video file is queued on "Transcribe a file";
+                              a transcript (.md/.srt/.txt) from the list or a meeting's
+                              Markdown copy is selected on its page
+
+One window per user: a second launch hands its arguments to the running window
+(local socket in $XDG_RUNTIME_DIR) and raises it.
+
+A front end for voxtype (dictation daemon + meetings on the Intel NPU) and
+npu-transcribe (Whisper on the NPU for audio/video files). Live state comes from
+voicenotes-ctl (imported, not spawned); meetings are read from voxtype's SQLite
+index (read-only); exports and deletes go through voxtype's CLI. Runs on the
+system PyQt6, so it gets the Breeze style and the KDE file dialogs.
+
+Environment (testing): VOICENOTES_CTL, VOICENOTES_VOXTYPE, VOICENOTES_TRANSCRIBE,
+VOICENOTES_SOCKET, VOICENOTES_DEBUG=1, VOICENOTES_DRY_RUN=1 (log instead of
+recording, starting meetings, switching language, opening files/folders,
+notifying), plus voicenotes-ctl's VOICENOTES_MEETING_DB, VOICENOTES_RUN_DIR,
+VOXTYPE_MEETING_DIR and NPU_TRANSCRIBE_HISTORY.
+"""
+from __future__ import annotations
+
+import fcntl
+import html
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import sqlite3
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # importing voicenotes-ctl must not drop a __pycache__ next to it
+
+from PyQt6.QtCore import (QDateTime, QFile, QLocale, QMimeDatabase, QObject,  # noqa: E402
+                          QProcess, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFontDatabase,  # noqa: E402
+                         QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPen,
+                         QShortcut, QTextCharFormat, QTextCursor)
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa: E402
+                             QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+                             QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                             QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
+                             QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
+                             QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+
+__version__ = "0.1.0"
+APP_ID = "voicenotes"
+APP_NAME = "Voice Notes"
+APP_FILE = Path(__file__).resolve()
+HOME = Path.home()
+PAGES = ("meetings", "files", "transcribe")
+PAGE_TITLES = {"meetings": "Meetings", "files": "Transcribed files", "transcribe": "Transcribe a file"}
+PAGE_ICONS = {"meetings": "meeting-attending", "files": "view-media-lyrics",
+              "transcribe": "document-import"}
+DEBUG = bool(os.environ.get("VOICENOTES_DEBUG"))
+DRY_RUN = bool(os.environ.get("VOICENOTES_DRY_RUN"))
+CTL_PATH = Path(os.environ.get("VOICENOTES_CTL") or APP_FILE.parent.parent / "voicenotes-ctl")
+VOXTYPE = os.environ.get("VOICENOTES_VOXTYPE") or "voxtype"
+COLORS = {"red": "#da4453", "orange": "#f67400", "green": "#27ae60", "blue": "#3daee9",
+          "gray": "#7f8c8d"}
+KEY_ROLE = Qt.ItemDataRole.UserRole
+SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+MEDIA_FILTER = ("Audio and video files (*.mp3 *.m4a *.aac *.ogg *.oga *.opus *.wav *.flac *.wma"
+                " *.amr *.mka *.mp4 *.m4v *.mkv *.webm *.mov *.avi *.wmv *.3gp *.mpg *.mpeg *.ts)"
+                ";;All files (*)")
+# Matched by audio/* but no audio inside (same list as npu-transcribe's Dolphin menu).
+NOT_MEDIA = {"audio/x-mpegurl", "audio/mpegurl", "audio/x-scpls", "audio/x-ms-asx", "audio/midi"}
+EXTRA_MEDIA = {"application/ogg", "application/x-matroska", "application/vnd.rn-realmedia",
+               "application/mxf"}
+EXPORT_FORMATS = (("Markdown (*.md)", "markdown", ".md"), ("Plain text (*.txt)", "text", ".txt"),
+                  ("JSON (*.json)", "json", ".json"))
+
+
+def debug(*args) -> None:
+    if DEBUG:
+        print("voicenotes:", *args, file=sys.stderr, flush=True)
+
+
+def _find_transcribe() -> str:
+    """The installer's wrapper in ~/.local/bin (runs it in its venv), else PATH."""
+    p = HOME / ".local/bin/npu-transcribe"
+    if os.access(p, os.X_OK):
+        return str(p)
+    return shutil.which("npu-transcribe") or "npu-transcribe"
+
+
+TRANSCRIBE = os.environ.get("VOICENOTES_TRANSCRIBE") or _find_transcribe()
+
+
+# ============================================================================ voicenotes-ctl
+
+def load_ctl():
+    """Import voicenotes-ctl (a script without .py) as a module. Its status() only reads
+    a few small files, so the window can poll it every second without spawning anything."""
+    try:
+        loader = importlib.machinery.SourceFileLoader("voicenotes_ctl", str(CTL_PATH))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module, None
+    except Exception as exc:  # missing/broken: the window still works, minus live state
+        return None, f"cannot load {CTL_PATH}: {exc}"
+
+
+ctl, CTL_ERROR = load_ctl()
+
+
+def _ctl_path(name: str, env: str, default: Path) -> Path:
+    """Data paths come from voicenotes-ctl (one source of truth, incl. its env overrides)."""
+    if ctl is not None and hasattr(ctl, name):
+        return Path(getattr(ctl, name))
+    return Path(os.environ.get(env) or default)
+
+
+MEETING_DB = _ctl_path("MEETING_DB", "VOICENOTES_MEETING_DB",
+                       HOME / ".local/share/voxtype/meetings/index.db")
+MEETING_MD_DIR = _ctl_path("MEETING_MD_DIR", "VOXTYPE_MEETING_DIR", HOME / "Documents/Meetings")
+FILE_HISTORY = _ctl_path("FILE_HISTORY", "NPU_TRANSCRIBE_HISTORY",
+                         HOME / ".local/share/npu-transcribe/history.jsonl")
+RUN_DIR = _ctl_path("RUN", "VOICENOTES_RUN_DIR",
+                    Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
+BIN = Path(getattr(ctl, "BIN", HOME / ".local/bin"))
+
+
+# ============================================================================ small helpers
+
+def fmt_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "–"
+    s = int(round(seconds))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def fmt_date(epoch: float | None, long: bool = False) -> str:
+    if not epoch:
+        return "–"
+    fmt = "ddd d MMM yyyy, HH:mm" if long else "yyyy-MM-dd HH:mm"
+    return QLocale().toString(QDateTime.fromSecsSinceEpoch(int(epoch)), fmt)
+
+
+def configured_languages() -> list[str]:
+    """Dictation languages from ~/.config/npu-voicenotes/languages (via voicenotes-ctl)."""
+    if ctl is not None and hasattr(ctl, "languages"):
+        try:
+            return ctl.languages()
+        except Exception as exc:  # unreadable file etc.: offer English only
+            debug("languages:", exc)
+    return ["en"]
+
+
+def language_name(code: str) -> str:
+    """English name of a Whisper language code ("de" -> "German"), else the code."""
+    loc = QLocale(code)
+    if loc.language() in (QLocale.Language.C, QLocale.Language.AnyLanguage) \
+            or loc.name().split("_")[0] != code:
+        return code.upper()
+    return QLocale.languageToString(loc.language())
+
+
+def tilde(path: str | Path) -> str:
+    p, home = str(path), str(HOME)
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
+def stat_sig(path: Path | str) -> tuple | None:
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def read_text(path: str, limit: int = 16 << 20) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def safe_filename(name: str) -> str:
+    name = re.sub(r"[/\x00-\x1f]+", " ", name).strip(" .")
+    return name or "transcript"
+
+
+def pid_alive(pid: int | None) -> bool:
+    """True while `pid` runs (zombies count as gone)."""
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+class TextCache:
+    """File contents for the search box, re-read only when mtime/size change."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, tuple[tuple, str]] = {}
+
+    def get(self, path: str | None) -> str | None:
+        if not path:
+            return None
+        sig = stat_sig(path)
+        if sig is None:
+            return None
+        hit = self._data.get(path)
+        if hit and hit[0] == sig:
+            return hit[1]
+        text = read_text(path)
+        if text is not None:
+            self._data[path] = (sig, text)
+        return text
+
+
+def search_terms(query: str) -> list[str]:
+    return query.casefold().split()
+
+
+def matches(terms: list[str], *texts: str | None) -> bool:
+    """All terms (case-insensitive) occur somewhere in the texts."""
+    if not terms:
+        return True
+    hay = "\n".join(t for t in texts if t).casefold()
+    return all(t in hay for t in terms)
+
+
+_MIME_DB: QMimeDatabase | None = None
+
+
+def is_media(path: str) -> bool:
+    global _MIME_DB
+    if _MIME_DB is None:
+        _MIME_DB = QMimeDatabase()
+    mt = _MIME_DB.mimeTypeForFile(path)
+    names = [mt.name(), *mt.allAncestors()]
+    if mt.name() in NOT_MEDIA:
+        return False
+    return any(n.startswith(("audio/", "video/")) or n in EXTRA_MEDIA for n in names)
+
+
+# ============================================================================ data: meetings
+
+MD_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{4})-meeting.*\.md$")
+
+
+@dataclass
+class Meeting:
+    id: str
+    title: str
+    started_at: int
+    ended_at: int | None = None
+    duration_secs: int | None = None
+    status: str = ""
+    chunk_count: int = 0
+    storage_path: str | None = None
+    model: str | None = None
+    md_path: str | None = None  # Markdown copy in ~/Documents/Meetings, if any
+
+    def duration(self) -> int | None:
+        if self.duration_secs is not None:
+            return int(self.duration_secs)
+        if self.ended_at:
+            return max(0, int(self.ended_at) - self.started_at)
+        return None
+
+    def signature(self) -> tuple:
+        return (self.title, self.ended_at, self.duration_secs, self.status, self.chunk_count,
+                self.md_path)
+
+
+def minute_stamp(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d_%H%M", time.localtime(epoch))
+
+
+def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
+    """Find the Markdown copy voxtype-meeting-toggle wrote for each meeting:
+    MD_DIR/YYYY-MM-DD_HHMM-meeting[-EPOCH].md, named after the start minute. The stamp
+    is taken just after `voxtype meeting start` returns, so a start at hh:mm:59 may
+    be stamped a minute later. Files go out oldest first, so two meetings started
+    in the same minute each get their own."""
+    candidates: dict[str, list[tuple[float, str]]] = {}
+    try:
+        for entry in os.scandir(md_dir):
+            m = MD_NAME.match(entry.name)
+            if m and entry.is_file():
+                candidates.setdefault(m[1], []).append((entry.stat().st_mtime, entry.path))
+    except OSError:
+        return
+    for files in candidates.values():
+        files.sort()
+    chronological = sorted(meetings, key=lambda m: m.started_at)
+    for offset in (0, 10):  # exact minutes first, then "the start took a moment"
+        for m in chronological:
+            if m.md_path is None and (files := candidates.get(minute_stamp(m.started_at + offset))):
+                m.md_path = files.pop(0)[1]
+
+
+def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> list[Meeting]:
+    """All meetings, newest first, from voxtype's index (opened read-only)."""
+    db_path = Path(db_path or MEETING_DB)
+    if not db_path.is_file():
+        return []
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        rows = con.execute("SELECT id, title, started_at, ended_at, duration_secs, status, "
+                           "chunk_count, storage_path, model FROM meetings "
+                           "ORDER BY started_at DESC").fetchall()
+    finally:
+        con.close()
+    meetings = [Meeting(id=str(r[0]), title=(r[1] or "").strip() or "Meeting",
+                        started_at=int(r[2] or 0), ended_at=r[3], duration_secs=r[4],
+                        status=str(r[5] or ""), chunk_count=int(r[6] or 0), storage_path=r[7],
+                        model=r[8]) for r in rows]
+    assign_meeting_mds(meetings, Path(md_dir or MEETING_MD_DIR))
+    return meetings
+
+
+def export_cmd(meeting_id: str, fmt: str = "markdown", output: str | None = None) -> list[str]:
+    cmd = [VOXTYPE, "meeting", "export", "--format", fmt, "--timestamps", "--speakers", "--metadata"]
+    if output:
+        cmd += ["--output", output]
+    return cmd + ["--", meeting_id]
+
+
+# ============================================================================ data: file history
+
+@dataclass
+class HistoryEntry:
+    """One line of npu-transcribe's history.jsonl; `raw` (the line) is its identity."""
+    raw: str
+    time: int
+    input: str
+    outputs: list[str]
+    model: str = ""
+    language: str = ""
+    device: str = ""
+    duration: float = 0.0
+    status: str = "done"
+
+    @property
+    def name(self) -> str:
+        return Path(self.input).name or self.input
+
+    def output(self, ext: str) -> str | None:
+        return next((o for o in self.outputs if o.lower().endswith(ext)), None)
+
+    def existing_outputs(self) -> list[str]:
+        return [o for o in self.outputs if os.path.isfile(o)]
+
+    def text_path(self) -> str | None:
+        """The file to show: notes (.md), else plain text, else subtitles."""
+        for ext in (".md", ".txt", ".srt"):
+            p = self.output(ext)
+            if p and os.path.isfile(p):
+                return p
+        return None
+
+    def state(self) -> str:
+        if self.status != "done":
+            return "Failed"
+        return "Done" if self.existing_outputs() else "Files missing"
+
+    def matches_path(self, path: str) -> bool:
+        p = os.path.abspath(path)
+        return p == self.input or p in self.outputs
+
+
+def load_history(path: Path | None = None) -> list[HistoryEntry]:
+    """Transcribed files, newest first. Broken lines are skipped."""
+    try:
+        text = Path(path or FILE_HISTORY).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    entries: list[HistoryEntry] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            h = json.loads(line)
+            entries.append(HistoryEntry(
+                raw=line, time=int(h.get("time") or 0), input=str(h["input"]),
+                outputs=[str(o) for o in h.get("outputs") or [] if o],
+                model=str(h.get("model") or ""), language=str(h.get("language") or ""),
+                device=str(h.get("device") or ""), duration=float(h.get("duration") or 0.0),
+                status=str(h.get("status") or "done")))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    entries.reverse()  # equal times: the later line first (sort is stable)
+    entries.sort(key=lambda e: e.time, reverse=True)
+    return entries
+
+
+def remove_history_entries(raws: set[str], path: Path | None = None) -> int:
+    """Drop the given lines from history.jsonl, rewriting it in place under the same
+    flock npu-transcribe takes for appending (so a concurrent append is not lost)."""
+    path = Path(path or FILE_HISTORY)
+    with open(path, "r+", encoding="utf-8", errors="surrogateescape") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        lines = f.read().splitlines(keepends=True)
+        keep = [ln for ln in lines if ln.strip() not in raws]
+        removed = len(lines) - len(keep)
+        if removed:
+            f.seek(0)
+            f.writelines(keep)
+            f.truncate()
+    return removed
+
+
+# ============================================================================ npu-transcribe output
+
+PROGRESS_RE = re.compile(r":\s+(\?|\d+)%\s+(\d+:\d\d:\d\d)/(\S+)\s+elapsed\s+(\d+:\d\d:\d\d)"
+                         r"\s+speed\s+(\S+)\s*$")
+LOG_PREFIX = "npu-transcribe: "
+
+
+def parse_hms(text: str) -> int | None:
+    try:
+        h, m, s = (int(x) for x in text.split(":"))
+        return h * 3600 + m * 60 + s
+    except ValueError:
+        return None
+
+
+def parse_transcribe_line(line: str) -> dict:
+    """Classify one stderr line of npu-transcribe. Without a terminal it prints log
+    lines "npu-transcribe: ..." and, after each ~2 min audio block, a progress line
+    "NAME:  40%  00:02:00/00:05:00  elapsed 00:00:10  speed 12.0x"."""
+    line = line.rstrip("\r\n")
+    if line.startswith(LOG_PREFIX):
+        msg = line[len(LOG_PREFIX):]
+        for prefix, kind in (("ERROR: ", "error"), ("error: ", "error"), ("WARNING: ", "warning"),
+                             ("done: ", "done")):
+            if msg.startswith(prefix):
+                return {"kind": kind, "text": msg[len(prefix):]}
+        if msg.startswith(("loading ", "reloading ")):
+            return {"kind": "loading", "text": msg, "compile": "compiles the model" in msg}
+        if msg.startswith("model ready"):
+            return {"kind": "ready", "text": msg}
+        if msg.startswith("language: "):
+            return {"kind": "language", "language": msg.split()[1], "text": msg}
+        if msg == "interrupted":
+            return {"kind": "interrupted", "text": msg}
+        return {"kind": "info", "text": msg}
+    m = PROGRESS_RE.search(line)
+    if m:
+        done, total = parse_hms(m[2]), (None if m[3] == "?" else parse_hms(m[3]))
+        percent = None if m[1] == "?" else int(m[1])
+        fraction = min(1.0, done / total) if total else (percent / 100 if percent is not None else None)
+        try:
+            speed = float(m[5].rstrip("x"))
+        except ValueError:
+            speed = None
+        return {"kind": "progress", "percent": percent, "done": done, "total": total,
+                "fraction": fraction, "speed": speed}
+    return {"kind": "other", "text": line}
+
+
+# ============================================================================ command line
+
+def parse_cli(argv: list[str], cwd: str | None = None) -> dict:
+    """[PAGE] [--id ID] [--file PATH]... [FILE...] -> {"page", "id", "files"}. Files become
+    absolute paths, because they may be forwarded to a window with another cwd."""
+    cwd = cwd or os.getcwd()
+    page, meeting_id, files = None, None, []
+    args, only_files = list(argv), False
+    while args:
+        a = args.pop(0)
+        if only_files:
+            files.append(a)
+        elif a == "--":
+            only_files = True
+        elif a == "--id" and args:
+            meeting_id = args.pop(0)
+        elif a.startswith("--id="):
+            meeting_id = a[5:]
+        elif a == "--file" and args:
+            files.append(args.pop(0))
+        elif a.startswith("--file="):
+            files.append(a[7:])
+        elif a in PAGES and page is None and not files:
+            page = a
+        elif a.startswith("-") and a != "-":
+            raise ValueError(f"unknown option or missing value: {a}")
+        else:
+            files.append(a)
+
+    def absolute(f: str) -> str:
+        if f.startswith("file:"):
+            f = QUrl(f).toLocalFile()
+        return os.path.abspath(os.path.join(cwd, os.path.expanduser(f)))
+    return {"page": page, "id": meeting_id or None, "files": [absolute(f) for f in files if f]}
+
+
+# ============================================================================ processes & desktop
+
+def run_command(parent: QObject, cmd: list[str], callback=None, timeout_ms: int = 300_000) -> QProcess:
+    """Run cmd without blocking the UI; callback(exit_code, stdout, stderr) once.
+    exit_code is -1 when the program could not start or crashed/timed out."""
+    proc = QProcess(parent)
+    proc.setProgram(cmd[0])
+    proc.setArguments(cmd[1:])
+    state = {"done": False}
+
+    def finish(code: int, out: str, err: str) -> None:
+        if state["done"]:
+            return
+        state["done"] = True
+        timer.stop()
+        debug("exit", code, shlex.join(cmd))
+        if callback:
+            callback(code, out, err)
+        proc.deleteLater()
+
+    def on_finished(code: int, status: QProcess.ExitStatus) -> None:
+        try:
+            out = proc.readAllStandardOutput().data().decode(errors="replace")
+            err = proc.readAllStandardError().data().decode(errors="replace")
+        except RuntimeError:  # the parent (window) is being destroyed: nobody to tell
+            state["done"] = True
+            return
+        finish(code if status == QProcess.ExitStatus.NormalExit else -1, out, err)
+
+    def on_error(error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.FailedToStart and not state["done"]:
+            finish(-1, "", f"could not start {cmd[0]}")
+
+    timer = QTimer(proc, singleShot=True, interval=timeout_ms)
+    timer.timeout.connect(proc.kill)
+    proc.finished.connect(on_finished)
+    proc.errorOccurred.connect(on_error)
+    debug("run", shlex.join(cmd))
+    proc.start()
+    timer.start()
+    return proc
+
+
+def run_detached(cmd: list[str]) -> int | None:
+    """Start and forget (outlives the window); returns the pid. Logged only in dry-run."""
+    debug("detached" + (" (dry run)" if DRY_RUN else ""), shlex.join(cmd))
+    if DRY_RUN:
+        return None
+    ok, pid = QProcess.startDetached(cmd[0], cmd[1:])
+    return pid if ok else None
+
+
+def open_url(url: QUrl) -> None:
+    debug("open" + (" (dry run)" if DRY_RUN else ""), url.toString())
+    if not DRY_RUN:
+        QDesktopServices.openUrl(url)
+
+
+def open_path(path: str) -> None:
+    open_url(QUrl.fromLocalFile(path))
+
+
+def show_in_folder(path: str) -> None:
+    """Open the file manager with `path` selected (org.freedesktop.FileManager1,
+    which Dolphin implements); fall back to opening the folder."""
+    debug("show-in-folder" + (" (dry run)" if DRY_RUN else ""), path)
+    if DRY_RUN:
+        return
+    try:
+        from PyQt6.QtDBus import QDBusConnection, QDBusMessage
+        msg = QDBusMessage.createMethodCall("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                                            "org.freedesktop.FileManager1", "ShowItems")
+        msg.setArguments([[QUrl.fromLocalFile(path).toString()], ""])
+        if QDBusConnection.sessionBus().send(msg):
+            return
+    except Exception as exc:  # no D-Bus: plain folder
+        debug("FileManager1 failed:", exc)
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+
+
+def move_to_trash(path: str) -> bool:
+    debug("trash", path)
+    ok, _ = QFile.moveToTrash(path)
+    return bool(ok)
+
+
+def notify(summary: str, body: str, icon: str = "view-media-lyrics") -> None:
+    run_detached(["notify-send", f"--app-name={APP_NAME}", f"--icon={icon}", summary, body])
+
+
+def icon(name: str, *fallbacks: str) -> QIcon:
+    for n in (name, *fallbacks):
+        if QIcon.hasThemeIcon(n):
+            return QIcon.fromTheme(n)
+    return QIcon.fromTheme(name)
+
+
+def message_html(title: str, body: str = "", kind: str = "info") -> str:
+    color = {"error": COLORS["red"], "busy": COLORS["blue"]}.get(kind)
+    style = f' style="color:{color}"' if color else ""
+    text = f"<h3{style}>{html.escape(title)}</h3>"
+    if body:
+        text += "<p>" + html.escape(body).replace("\n", "<br>") + "</p>"
+    return text
+
+
+# ============================================================================ widgets
+
+class StateDot(QWidget):
+    """Small coloured circle in front of a state label."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedSize(12, 12)
+        self._color = QColor(COLORS["gray"])
+
+    def set_color(self, color: str) -> None:
+        if QColor(color) != self._color:
+            self._color = QColor(color)
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        p.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
+
+
+def state_widget() -> tuple[QWidget, StateDot, QLabel]:
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(6, 0, 6, 0)
+    lay.setSpacing(6)
+    dot, label = StateDot(), QLabel()
+    lay.addWidget(dot)
+    lay.addWidget(label)
+    return w, dot, label
+
+
+class Banner(QFrame):
+    """Inline message strip in the style of KDE's KMessageWidget."""
+
+    def __init__(self, kind: str = "warning") -> None:
+        super().__init__()
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(10, 6, 6, 6)
+        self.icon = QLabel()
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._lay.addWidget(self.icon)
+        self._lay.addWidget(self.text, 1)
+        self.set_kind(kind)
+
+    def set_kind(self, kind: str) -> None:
+        self.kind = kind
+        name = {"warning": "dialog-warning", "error": "dialog-error"}.get(kind, "dialog-information")
+        self.icon.setPixmap(QIcon.fromTheme(name).pixmap(22, 22))
+        self.update()
+
+    def add_button(self, text: str, slot, icon_name: str = "") -> QPushButton:
+        btn = QPushButton(QIcon.fromTheme(icon_name) if icon_name else QIcon(), text)
+        btn.clicked.connect(slot)
+        self._lay.addWidget(btn)
+        return btn
+
+    def paintEvent(self, _event) -> None:
+        c = QColor(COLORS[{"warning": "orange", "error": "red"}.get(self.kind, "blue")])
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(c, 1))
+        fill = QColor(c)
+        fill.setAlpha(40)
+        p.setBrush(fill)
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 4, 4)
+
+
+class DropZone(QFrame):
+    """Dashed area that accepts dropped files, with a "Choose files…" button."""
+    files_dropped = pyqtSignal(list)
+    browse = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(130)
+        self._hover = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        pic = QLabel()
+        pic.setPixmap(icon("document-import").pixmap(48, 48))
+        pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        text = QLabel("Drop audio or video files here")
+        text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = text.font()
+        f.setPointSizeF(f.pointSizeF() * 1.15)
+        text.setFont(f)
+        btn = QPushButton(QIcon.fromTheme("document-open"), "Choose files…")
+        btn.clicked.connect(self.browse)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(btn)
+        row.addStretch()
+        lay.addStretch()
+        lay.addWidget(pic)
+        lay.addWidget(text)
+        lay.addLayout(row)
+        lay.addStretch()
+
+    @staticmethod
+    def _paths(event) -> list[str]:
+        md = event.mimeData()
+        return [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
+
+    def dragEnterEvent(self, event) -> None:
+        if self._paths(event):
+            event.acceptProposedAction()
+            self._hover = True
+            self.update()
+
+    def dragLeaveEvent(self, _event) -> None:
+        self._hover = False
+        self.update()
+
+    def dropEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        paths = self._paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self.files_dropped.emit(paths)
+
+    def paintEvent(self, _event) -> None:
+        pal = self.palette()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = pal.color(QPalette.ColorRole.Highlight) if self._hover else pal.color(QPalette.ColorRole.Mid)
+        pen = QPen(color, 2 if self._hover else 1.5, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        fill = QColor(pal.color(QPalette.ColorRole.Highlight))
+        fill.setAlpha(30 if self._hover else 0)
+        p.setBrush(fill)
+        p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 8, 8)
+
+
+class MarkdownView(QTextBrowser):
+    """Read-only transcript view; highlights the search terms."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setOpenLinks(False)
+        self.anchorClicked.connect(open_url)
+        self.document().setDocumentMargin(12)
+        self._terms: list[str] = []
+
+    def show_markdown(self, text: str) -> None:
+        self.setMarkdown(text)
+        self._highlight()
+
+    def show_plain(self, text: str) -> None:
+        self.setPlainText(text)
+        self._highlight()
+
+    def show_message(self, html_text: str) -> None:
+        self.setHtml(html_text)
+        self.setExtraSelections([])
+
+    def set_terms(self, terms: list[str]) -> None:
+        if terms != self._terms:
+            self._terms = terms
+            self._highlight()
+
+    def _highlight(self) -> None:
+        selections, first = [], None
+        fmt = QTextCharFormat()
+        color = QColor(self.palette().color(QPalette.ColorRole.Highlight))
+        color.setAlpha(110)
+        fmt.setBackground(color)
+        doc = self.document()
+        for term in self._terms:
+            cur = QTextCursor(doc)
+            for _ in range(500):
+                cur = doc.find(term, cur)
+                if cur.isNull():
+                    break
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor, sel.format = QTextCursor(cur), fmt
+                selections.append(sel)
+                if first is None or cur.position() < first:
+                    first = cur.position()
+        self.setExtraSelections(selections)
+        if first is not None:
+            c = QTextCursor(doc)
+            c.setPosition(first)
+            self.setTextCursor(c)
+            self.ensureCursorVisible()
+        else:
+            self.moveCursor(QTextCursor.MoveOperation.Start)
+
+
+class SortItem(QTreeWidgetItem):
+    """Sorts by SORT_ROLE data (dates, durations) instead of the displayed text."""
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree else 0
+        a, b = self.data(col, SORT_ROLE), other.data(col, SORT_ROLE)
+        if a is None or b is None or type(a) is not type(b):
+            return self.text(col).casefold() < other.text(col).casefold()
+        return a < b
+
+
+# ============================================================================ list + detail pages
+
+class ListDetailPage(QWidget):
+    """List (top) and detail (bottom) in a splitter, like KMail's message list + preview."""
+    COLUMNS: tuple[str, ...] = ()
+    EMPTY = ""
+
+    def __init__(self, main: MainWindow) -> None:
+        super().__init__()
+        self.main = main
+        self.terms: list[str] = []
+        self.current_text = ""  # what Copy copies
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(self.COLUMNS)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAllColumnsShowFocus(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(1, Qt.SortOrder.DescendingOrder)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, len(self.COLUMNS)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.currentItemChanged.connect(lambda *_: self.show_current())
+
+        self.title = QLabel()
+        f = self.title.font()
+        f.setPointSizeF(f.pointSizeF() * 1.25)
+        f.setBold(True)
+        self.title.setFont(f)
+        self.title.setWordWrap(True)
+        self.title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.meta = QLabel()
+        self.meta.setWordWrap(True)
+        self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        pal = self.meta.palette()
+        pal.setColor(QPalette.ColorRole.WindowText, pal.color(QPalette.ColorRole.PlaceholderText))
+        self.meta.setPalette(pal)
+        self.bar = QToolBar()
+        self.bar.setIconSize(QSize(16, 16))
+        self.bar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.view = MarkdownView()
+
+        detail = QWidget()
+        dl = QVBoxLayout(detail)
+        dl.setContentsMargins(0, 8, 0, 0)
+        dl.setSpacing(4)
+        head = QVBoxLayout()
+        head.setContentsMargins(4, 0, 4, 0)
+        head.addWidget(self.title)
+        head.addWidget(self.meta)
+        dl.addLayout(head)
+        dl.addWidget(self.bar)
+        dl.addWidget(self.view, 1)
+
+        self.placeholder = QLabel()
+        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder.setWordWrap(True)
+        self.placeholder.setMargin(24)
+        self.placeholder.setPalette(pal)
+        self.detail_stack = QStackedWidget()
+        self.detail_stack.addWidget(self.placeholder)
+        self.detail_stack.addWidget(detail)
+
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.addWidget(self.tree)
+        self.splitter.addWidget(self.detail_stack)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setChildrenCollapsible(False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.splitter)
+
+    # -- helpers for subclasses
+    def add_action(self, icon_name: str, text: str, slot, tip: str = "",
+                   shortcut: QKeySequence.StandardKey | None = None) -> QAction:
+        act = QAction(icon(icon_name), text, self)
+        act.setToolTip(tip or text)
+        act.triggered.connect(slot)
+        if shortcut is not None:
+            act.setShortcut(QKeySequence(shortcut))
+            act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.bar.addAction(act)
+        self.tree.addAction(act)
+        return act
+
+    def items(self) -> list[QTreeWidgetItem]:
+        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+
+    def current_key(self) -> str | None:
+        item = self.tree.currentItem()
+        return item.data(0, KEY_ROLE) if item is not None and not item.isHidden() else None
+
+    def item_for(self, key: str | None) -> QTreeWidgetItem | None:
+        return next((it for it in self.items() if it.data(0, KEY_ROLE) == key), None) if key else None
+
+    def select_key(self, key: str | None) -> bool:
+        item = self.item_for(key)
+        if item is None or item.isHidden():
+            return False
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
+        return True
+
+    def select_first_visible(self) -> None:
+        for item in self.items():  # items() is in display (sorted) order
+            if not item.isHidden():
+                self.tree.setCurrentItem(item)
+                return
+        self.tree.setCurrentItem(None)
+
+    def counts(self) -> tuple[int, int]:
+        items = self.items()
+        return sum(not it.isHidden() for it in items), len(items)
+
+    def show_current(self) -> None:
+        key = self.current_key()
+        if key is None:
+            shown, total = self.counts()
+            self.placeholder.setText(self.EMPTY if total == 0 else
+                                     "Nothing matches the search." if shown == 0 else
+                                     "Select an item to see its transcript.")
+            self.detail_stack.setCurrentIndex(0)
+            self.current_text = ""
+            return
+        self.detail_stack.setCurrentIndex(1)
+        self.show_detail(key)
+
+    def set_filter(self, terms: list[str]) -> None:
+        self.terms = terms
+        for item in self.items():
+            item.setHidden(not self.item_matches(item.data(0, KEY_ROLE), terms))
+        if self.current_key() is None:
+            self.select_first_visible()
+            if self.tree.currentItem() is None:
+                self.show_current()
+        self.view.set_terms(terms)
+
+    def repopulate(self, rows: list[tuple[str, list[str], list, str]], keep: str | None) -> None:
+        """rows: (key, column texts, sort keys, tooltip). Keeps the selection."""
+        self.tree.blockSignals(True)
+        self.tree.setSortingEnabled(False)
+        self.tree.clear()
+        for key, texts, sort_keys, tip in rows:
+            item = SortItem(texts)
+            item.setData(0, KEY_ROLE, key)
+            for col, value in enumerate(sort_keys):
+                if value is not None:
+                    item.setData(col, SORT_ROLE, value)
+            if tip:
+                item.setToolTip(0, tip)
+            self.tree.addTopLevelItem(item)
+        self.tree.setSortingEnabled(True)
+        for item in self.items():
+            item.setHidden(not self.item_matches(item.data(0, KEY_ROLE), self.terms))
+        if not self.select_key(keep):
+            self.select_first_visible()
+        self.tree.blockSignals(False)
+
+    # -- overridden
+    def item_matches(self, key: str, terms: list[str]) -> bool:
+        return True
+
+    def show_detail(self, key: str) -> None:
+        pass
+
+    def copy_text(self) -> None:
+        if self.current_text:
+            QGuiApplication.clipboard().setText(self.current_text)
+            self.main.message("Copied the transcript to the clipboard")
+
+
+class MeetingsPage(ListDetailPage):
+    COLUMNS = ("Title", "Date", "Duration", "Status")
+    EMPTY = ("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
+             "microphone and the system audio. The transcript shows up here when you stop.")
+
+    def __init__(self, main: MainWindow) -> None:
+        super().__init__(main)
+        self.meetings: dict[str, Meeting] = {}
+        self.export_cache: dict[str, str] = {}   # meeting id -> exported Markdown
+        self.export_failed: set[str] = set()
+        self.texts = TextCache()
+        self.live_id: str | None = None
+        self.live_state = "idle"
+        self.live_elapsed: float | None = None
+        self.error: str | None = None
+        self._req = 0
+        self._index_queue: list[str] = []
+        self._index_busy = False
+        self.act_refresh = self.add_action("view-refresh", "Reload", lambda: self.show_current_force(),
+                                           "Load the transcript again from voxtype")
+        self.act_copy = self.add_action("edit-copy", "Copy all", self.copy_text,
+                                        "Copy the whole transcript (Markdown) to the clipboard")
+        self.act_export = self.add_action("document-export", "Export…", self.export,
+                                          "Save the transcript as Markdown, plain text or JSON")
+        self.act_folder = self.add_action("document-open-folder", "Open folder", self.open_folder,
+                                          "Show the Markdown copy in the file manager")
+        self.act_delete = self.add_action("edit-delete", "Delete…", self.delete,
+                                          "Delete this meeting from voxtype", QKeySequence.StandardKey.Delete)
+
+    def is_live(self, m: Meeting) -> bool:
+        return m.id == self.live_id and self.live_state in ("recording", "paused")
+
+    def current(self) -> Meeting | None:
+        return self.meetings.get(self.current_key() or "")
+
+    def reload(self) -> None:
+        old_key = self.current_key()
+        old_sig = self.meetings[old_key].signature() if old_key in self.meetings else None
+        try:
+            meetings = load_meetings()
+            self.error = None
+        except sqlite3.Error as exc:
+            meetings, self.error = [], f"Cannot read {MEETING_DB}: {exc}"
+        old = self.meetings
+        self.meetings = {m.id: m for m in meetings}
+        for mid in list(self.export_cache) + list(self.export_failed):  # meeting changed or gone:
+            new = self.meetings.get(mid)                               # export it again when needed
+            if new is None or (mid in old and old[mid].signature() != new.signature()):
+                self.export_cache.pop(mid, None)
+                self.export_failed.discard(mid)
+        rows = []
+        for m in meetings:
+            rows.append((m.id, [m.title, fmt_date(m.started_at), self.duration_text(m), self.status_text(m)],
+                         [m.title.casefold(), m.started_at, self.duration_value(m), None],
+                         tilde(m.md_path) if m.md_path else ""))
+        self.repopulate(rows, old_key)
+        new_key = self.current_key()
+        new_sig = self.meetings[new_key].signature() if new_key in self.meetings else None
+        if new_key != old_key or new_sig != old_sig:
+            self.show_current()
+        if self.error:
+            self.placeholder.setText(self.error)
+            self.detail_stack.setCurrentIndex(0)
+
+    def duration_value(self, m: Meeting) -> float | None:
+        return self.live_elapsed if self.is_live(m) else m.duration()
+
+    def duration_text(self, m: Meeting) -> str:
+        return fmt_duration(self.duration_value(m))
+
+    def status_text(self, m: Meeting) -> str:
+        if self.is_live(m):
+            return "Recording" if self.live_state == "recording" else "Paused"
+        return m.status.replace("_", " ").capitalize() or "–"
+
+    def set_live(self, meeting_id: str | None, state: str, elapsed: float | None) -> None:
+        """Called every second by the window: update the running meeting's row."""
+        old_id = self.live_id
+        changed = (meeting_id, state) != (self.live_id, self.live_state)
+        self.live_id, self.live_state, self.live_elapsed = meeting_id, state, elapsed
+        for mid in {meeting_id, old_id} - {None}:
+            item, m = self.item_for(mid), self.meetings.get(mid)
+            if item is not None and m is not None:
+                item.setText(2, self.duration_text(m))
+                item.setText(3, self.status_text(m))
+        if changed and self.current_key():
+            self.show_current()
+        elif meeting_id and self.current_key() == meeting_id:
+            self.meta.setText(self.meta_text(self.meetings[meeting_id]))
+
+    def meta_text(self, m: Meeting) -> str:
+        parts = [fmt_date(m.started_at, long=True), self.duration_text(m), self.status_text(m)]
+        if m.chunk_count:
+            parts.append(f"{m.chunk_count} chunk{'s' if m.chunk_count != 1 else ''}")
+        if m.model:
+            parts.append(Path(m.model).name)
+        text = " · ".join(parts)
+        text += "\n" + (f"Markdown copy: {tilde(m.md_path)}" if m.md_path
+                        else "From voxtype's meeting database (no Markdown copy)")
+        return text
+
+    def show_detail(self, key: str) -> None:
+        m = self.meetings.get(key)
+        if m is None:
+            return
+        live = self.is_live(m)
+        self.title.setText(m.title)
+        self.meta.setText(self.meta_text(m))
+        self.act_refresh.setVisible(live or not m.md_path)
+        self.act_delete.setEnabled(not live)
+        self.act_delete.setToolTip("Stop the meeting before deleting it" if live
+                                   else "Delete this meeting from voxtype")
+        self.load_body(m, live)
+
+    def show_current_force(self) -> None:
+        m = self.current()
+        if m:
+            self.export_cache.pop(m.id, None)
+            self.load_body(m, self.is_live(m))
+
+    def load_body(self, m: Meeting, live: bool) -> None:
+        self._req += 1
+        req = self._req
+        if m.md_path and not live:
+            text = self.texts.get(m.md_path)
+            if text is not None:
+                self._show_text(text)
+                return
+        if not live and m.id in self.export_cache:
+            self._show_text(self.export_cache[m.id])
+            return
+        self.current_text = ""
+        self.act_copy.setEnabled(False)
+        self.view.show_message(message_html("Loading the transcript…", "voxtype meeting export", "busy"))
+
+        def done(code: int, out: str, err: str) -> None:
+            if code == 0 and not live:
+                self.export_cache[m.id] = out
+                self.export_failed.discard(m.id)
+            if req != self._req:
+                return  # the selection moved on
+            if code == 0:
+                self._show_text(out)
+                if live and not self.terms:  # follow the growing transcript
+                    self.view.moveCursor(QTextCursor.MoveOperation.End)
+            else:
+                self.view.show_message(message_html(
+                    "Could not load the transcript",
+                    (err.strip() or f"voxtype exited with status {code}")
+                    + ("\n\nIs the voxtype daemon running?" if code == -1 else ""), "error"))
+        run_command(self, export_cmd(m.id), done, timeout_ms=60_000)
+
+    def _show_text(self, text: str) -> None:
+        self.current_text = text
+        self.act_copy.setEnabled(bool(text.strip()))
+        self.view.show_markdown(text if text.strip() else "*(the transcript is empty)*")
+
+    # -- search: title + Markdown copy, else the exported transcript (fetched on demand)
+    def content(self, m: Meeting) -> str | None:
+        if m.md_path:
+            text = self.texts.get(m.md_path)
+            if text is not None:
+                return text
+        return self.export_cache.get(m.id)
+
+    def item_matches(self, key: str, terms: list[str]) -> bool:
+        m = self.meetings.get(key)
+        if m is None:
+            return False
+        if not terms:
+            return True
+        content = self.content(m)
+        if content is None and not self.is_live(m) and m.id not in self.export_failed \
+                and m.id not in self._index_queue:
+            self._index_queue.append(m.id)
+            QTimer.singleShot(0, self._index_next)
+        return matches(terms, m.title, content)
+
+    def _index_next(self) -> None:
+        if self._index_busy:
+            return
+        while self._index_queue:
+            mid = self._index_queue.pop(0)
+            if mid in self.meetings and mid not in self.export_cache and mid not in self.export_failed:
+                break
+        else:
+            return
+        self._index_busy = True
+
+        def done(code: int, out: str, _err: str) -> None:
+            self._index_busy = False
+            if code == 0:
+                self.export_cache[mid] = out
+            else:
+                self.export_failed.add(mid)
+            if self.terms:
+                self.main.apply_search()
+            self._index_next()
+        run_command(self, export_cmd(mid), done, timeout_ms=60_000)
+
+    # -- actions
+    def export(self) -> None:
+        m = self.current()
+        if m is None:
+            return
+        start = Path(self.main.settings.value("meetings/exportDir", "") or
+                     (MEETING_MD_DIR if MEETING_MD_DIR.is_dir() else HOME / "Documents"))
+        path, flt = QFileDialog.getSaveFileName(self, "Export meeting transcript",
+                                                str(start / f"{safe_filename(m.title)}.md"),
+                                                ";;".join(f[0] for f in EXPORT_FORMATS))
+        if path:
+            self.main.settings.setValue("meetings/exportDir", str(Path(path).parent))
+            self.export_to(m.id, path, flt)
+
+    def export_to(self, meeting_id: str, path: str, name_filter: str = "") -> str:
+        """Format from the file extension, else from the chosen filter (extension added)."""
+        ext = Path(path).suffix.lower()
+        fmt = next((f[1] for f in EXPORT_FORMATS if f[2] == ext), None)
+        if fmt is None:
+            fmt, ext = next(((f[1], f[2]) for f in EXPORT_FORMATS if f[0] == name_filter),
+                            ("markdown", ".md"))
+            path += ext
+
+        def done(code: int, _out: str, err: str) -> None:
+            if code == 0:
+                self.main.message(f"Exported to {tilde(path)}")
+            else:
+                self.main.error_box("Export failed", err.strip() or f"voxtype exited with status {code}")
+        run_command(self, export_cmd(meeting_id, fmt, path), done, timeout_ms=60_000)
+        return path
+
+    def open_folder(self) -> None:
+        m = self.current()
+        if m and m.md_path and os.path.isfile(m.md_path):
+            show_in_folder(m.md_path)
+        elif m and m.storage_path and os.path.isdir(m.storage_path):
+            open_path(m.storage_path)
+        else:
+            open_path(str(MEETING_MD_DIR if MEETING_MD_DIR.is_dir() else HOME))
+
+    def ask_delete(self, m: Meeting) -> tuple[bool, bool]:
+        """(delete?, also trash the Markdown copy?)"""
+        box = QMessageBox(QMessageBox.Icon.Warning, "Delete meeting",
+                          f"Delete “{m.title}” ({fmt_date(m.started_at)})?", parent=self)
+        box.setInformativeText("The meeting and its transcript are removed from voxtype's "
+                               "database. This cannot be undone.")
+        cb = None
+        if m.md_path and os.path.isfile(m.md_path):
+            cb = QCheckBox(f"Also move the Markdown copy “{Path(m.md_path).name}” to the Trash")
+            box.setCheckBox(cb)
+        delete_btn = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        delete_btn.setIcon(QIcon.fromTheme("edit-delete"))
+        box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Cancel))
+        box.exec()
+        return box.clickedButton() is delete_btn, bool(cb and cb.isChecked())
+
+    def delete(self) -> None:
+        m = self.current()
+        if m is None or self.is_live(m):
+            return
+        ok, trash_md = self.ask_delete(m)
+        if not ok:
+            return
+
+        def done(code: int, _out: str, err: str) -> None:
+            if code != 0:
+                self.main.error_box("Delete failed", err.strip() or f"voxtype exited with status {code}")
+                return
+            self.export_cache.pop(m.id, None)
+            text = f"Deleted “{m.title}”"
+            if trash_md and m.md_path:
+                if move_to_trash(m.md_path):
+                    text += "; its Markdown copy is in the Trash"
+                else:
+                    self.main.error_box("Could not move to the Trash", m.md_path)
+            self.main.message(text)
+            self.reload()
+            self.main.update_counts()
+        run_command(self, [VOXTYPE, "meeting", "delete", "--force", "--", m.id], done, timeout_ms=60_000)
+
+    def select_md(self, path: str) -> bool:
+        p = os.path.abspath(path)
+        return any(m.md_path == p and self.select_key(m.id) for m in self.meetings.values())
+
+    def select_newest(self) -> None:
+        if self.meetings:
+            self.select_key(max(self.meetings.values(), key=lambda m: m.started_at).id)
+
+
+class FilesPage(ListDetailPage):
+    COLUMNS = ("Name", "Date", "Duration", "Model", "Status")
+    EMPTY = ("No transcribed files yet.\n\nUse “Transcribe a file”, or right-click a recording "
+             "in Dolphin → Transcribe (NPU).")
+
+    def __init__(self, main: MainWindow) -> None:
+        super().__init__(main)
+        self.entries: dict[str, HistoryEntry] = {}
+        self.texts = TextCache()
+        self.act_copy = self.add_action("edit-copy", "Copy", self.copy_text,
+                                        "Copy the transcript to the clipboard")
+        self.act_srt = self.add_action("media-view-subtitles-symbolic", "Open subtitles",
+                                       lambda: self._open(".srt"), "Open the .srt subtitles")
+        self.act_notes = self.add_action("document-open", "Open notes", lambda: self._open(".md"),
+                                         "Open the .md notes in your editor")
+        self.act_folder = self.add_action("document-open-folder", "Open folder", self.open_folder,
+                                          "Show the transcript in the file manager")
+        self.act_again = self.add_action("view-refresh", "Transcribe again", self.again,
+                                         "Queue the audio/video file on “Transcribe a file”")
+        self.act_remove = self.add_action("list-remove", "Remove from list…", self.remove,
+                                          "Remove from this list (files stay unless you choose otherwise)",
+                                          QKeySequence.StandardKey.Delete)
+
+    def current(self) -> HistoryEntry | None:
+        return self.entries.get(self.current_key() or "")
+
+    def reload(self) -> None:
+        old_key = self.current_key()
+        old_sig = self._sig(old_key)
+        entries = load_history()
+        self.entries = {}
+        rows = []
+        for e in entries:
+            if e.raw in self.entries:
+                continue
+            self.entries[e.raw] = e
+            model = " · ".join(x for x in (e.model and Path(e.model).name, e.device) if x)
+            rows.append((e.raw, [e.name, fmt_date(e.time), fmt_duration(e.duration or None), model, e.state()],
+                         [e.name.casefold(), e.time, e.duration, None, None], e.input))
+        self.repopulate(rows, old_key)
+        new_key = self.current_key()
+        if new_key != old_key or self._sig(new_key) != old_sig:
+            self.show_current()
+
+    def _sig(self, key: str | None) -> tuple | None:
+        e = self.entries.get(key or "")
+        return (key, e.state(), stat_sig(e.text_path() or "")) if e else None
+
+    def item_matches(self, key: str, terms: list[str]) -> bool:
+        e = self.entries.get(key)
+        if e is None:
+            return False
+        return not terms or matches(terms, e.name, self.texts.get(e.text_path()))
+
+    def show_detail(self, key: str) -> None:
+        e = self.entries.get(key)
+        if e is None:
+            return
+        self.title.setText(e.name)
+        self.title.setToolTip(e.input)
+        parts = [fmt_date(e.time, long=True), fmt_duration(e.duration or None)]
+        if e.model:
+            parts.append(f"{Path(e.model).name} on {e.device}" if e.device else Path(e.model).name)
+        if e.language and e.language != "?":
+            parts.append(f"language {e.language}")
+        parts.append(e.state())
+        self.meta.setText(" · ".join(parts) + f"\n{tilde(e.input)}")
+        srt, md = e.output(".srt"), e.output(".md")
+        self.act_srt.setEnabled(bool(srt and os.path.isfile(srt)))
+        self.act_notes.setEnabled(bool(md and os.path.isfile(md)))
+        self.act_again.setEnabled(os.path.isfile(e.input))
+        path = e.text_path()
+        self.current_text = ""
+        if e.status != "done":
+            self.view.show_message(message_html(
+                "Transcription failed",
+                f"{e.input}\n\nUse “Transcribe again” to retry; the Transcribe page shows the "
+                "log of runs started from this window.", "error"))
+        elif path is None:
+            self.view.show_message(message_html(
+                "The transcript files were moved or deleted",
+                "\n".join(e.outputs) or "(npu-transcribe recorded no output files)", "error"))
+        else:
+            text = self.texts.get(path) or ""
+            self.current_text = text
+            if path.lower().endswith(".md"):
+                self.view.show_markdown(text)
+            else:
+                self.view.show_plain(text)
+        self.act_copy.setEnabled(bool(self.current_text.strip()))
+
+    def _open(self, ext: str) -> None:
+        e = self.current()
+        path = e.output(ext) if e else None
+        if path and os.path.isfile(path):
+            open_path(path)
+
+    def open_folder(self) -> None:
+        e = self.current()
+        if e is None:
+            return
+        target = e.text_path() or next(iter(e.existing_outputs()), None) or \
+            (e.input if os.path.exists(e.input) else None)
+        if target:
+            show_in_folder(target)
+        elif os.path.isdir(os.path.dirname(e.input)):
+            open_path(os.path.dirname(e.input))
+
+    def again(self) -> None:
+        e = self.current()
+        if e and os.path.isfile(e.input):
+            self.main.transcribe_page.add_files([e.input])
+            self.main.set_page("transcribe")
+
+    def ask_remove(self, e: HistoryEntry, outputs: list[str]) -> tuple[bool, bool]:
+        """(remove from the list?, also trash the transcript files?)"""
+        box = QMessageBox(QMessageBox.Icon.Question, "Remove from list",
+                          f"Remove “{e.name}” from the list?", parent=self)
+        box.setInformativeText("Only the list entry is removed: the recording and its "
+                               "transcripts stay where they are, unless you tick the box.")
+        cb = None
+        if outputs:
+            cb = QCheckBox("Also move the transcript files to the Trash: "
+                           + ", ".join(Path(o).name for o in outputs))
+            box.setCheckBox(cb)
+        remove_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
+        remove_btn.setIcon(QIcon.fromTheme("list-remove"))
+        box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Cancel))
+        box.exec()
+        return box.clickedButton() is remove_btn, bool(cb and cb.isChecked())
+
+    def remove(self) -> None:
+        e = self.current()
+        if e is None:
+            return
+        outputs = e.existing_outputs()
+        ok, trash = self.ask_remove(e, outputs)
+        if not ok:
+            return
+        try:
+            remove_history_entries({e.raw})
+        except OSError as exc:
+            self.main.error_box("Could not update the list", f"{FILE_HISTORY}: {exc}")
+            return
+        failed = [o for o in outputs if trash and not move_to_trash(o)]
+        if failed:
+            self.main.error_box("Could not move to the Trash", "\n".join(failed))
+        self.main.message(f"Removed “{e.name}” from the list"
+                          + ("; its transcripts are in the Trash" if trash and not failed else ""))
+        self.reload()
+        self.main.update_counts()
+
+    def select_path(self, path: str) -> bool:
+        """Select the newest entry whose input or output is `path`."""
+        for key, e in self.entries.items():  # dict order = newest first
+            if e.matches_path(path) and self.select_key(key):
+                return True
+        return False
+
+    def find_for_job(self, job: Job) -> str | None:
+        outs = set(job.outputs)
+        for key, e in self.entries.items():
+            if e.input == job.path and (not outs or outs == set(e.outputs)):
+                return key
+        return None
+
+
+# ============================================================================ transcribe page
+
+@dataclass
+class Job:
+    path: str
+    state: str = "ready"   # ready -> queued -> running -> done | failed | cancelled
+    model: str = "turbo"
+    language: str = "auto"
+    translate: bool = False
+    phase: str = ""
+    fraction: float | None = None
+    remaining: float | None = None
+    language_found: str = ""
+    error: str = ""
+    log: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    started: float = 0.0
+    item: QTreeWidgetItem | None = None
+    proc: QProcess | None = None
+    cancel_requested: bool = False
+    _err_buf: str = ""
+    _out_buf: str = ""
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    def args(self) -> list[str]:
+        return (["--model", self.model, "--language", self.language]
+                + (["--translate"] if self.translate else []) + ["--", self.path])
+
+    def options_text(self) -> str:
+        if self.state == "ready":
+            return "–"
+        lang = {"auto": "auto language"}.get(self.language, self.language)
+        return f"{self.model} · {lang}" + (" → English" if self.translate else "")
+
+    def status_text(self) -> str:
+        if self.state == "running":
+            if self.fraction is not None:
+                return f"{self.fraction * 100:.0f} %"
+            return self.phase or "Starting…"
+        return {"ready": "Ready", "queued": "Waiting", "done": "Done",
+                "cancelled": "Cancelled"}.get(self.state, f"Failed: {self.error}")
+
+
+class TranscribePage(QWidget):
+    job_finished = pyqtSignal(object)
+
+    def __init__(self, main: MainWindow) -> None:
+        super().__init__()
+        self.main = main
+        self.jobs: list[Job] = []
+
+        self.missing = Banner("error")
+        self.missing.text.setText(f"npu-transcribe was not found ({TRANSCRIBE}). Run the "
+                                  "npu-voicenotes installer again to set it up.")
+        if os.access(TRANSCRIBE, os.X_OK):
+            self.missing.hide()  # (never show() a widget before it has a parent: it becomes a window)
+
+        self.drop = DropZone()
+        self.drop.files_dropped.connect(self.add_files)
+        self.drop.browse.connect(self.browse)
+
+        self.model = QComboBox()
+        self.model.addItem("Accurate (Whisper large-v3 turbo)", "turbo")
+        self.model.addItem("Fast (Whisper small)", "small")
+        self.model.setToolTip("turbo is more accurate and on the NPU about as fast; small needs less "
+                              "memory and is faster on the CPU")
+        self.language = QComboBox()
+        self.language.addItem("Detect automatically", "auto")
+        for code in dict.fromkeys(["en", *configured_languages()]):
+            self.language.addItem(language_name(code), code)
+        self.language.setToolTip("Spoken language. Auto-detection listens to the first ~2 minutes.")
+        self.translate = QCheckBox("Translate to English")
+        self.translate.setToolTip("Write English text whatever the spoken language")
+        self.translate.toggled.connect(self._translate_toggled)
+        self.model.currentIndexChanged.connect(lambda _: self._update_hint())
+        opts = QHBoxLayout()
+        for label, widget in (("Model:", self.model), ("Language:", self.language)):
+            lbl = QLabel(label)
+            lbl.setBuddy(widget)
+            opts.addWidget(lbl)
+            opts.addWidget(widget)
+            opts.addSpacing(12)
+        opts.addWidget(self.translate)
+        opts.addStretch()
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        pal = self.hint.palette()
+        pal.setColor(QPalette.ColorRole.WindowText, pal.color(QPalette.ColorRole.PlaceholderText))
+        self.hint.setPalette(pal)
+
+        self.queue = QTreeWidget()
+        self.queue.setHeaderLabels(("File", "Options", "Status"))
+        self.queue.setRootIsDecorated(False)
+        self.queue.setUniformRowHeights(True)
+        self.queue.setAllColumnsShowFocus(True)
+        self.queue.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        h = self.queue.header()
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        h.resizeSection(2, 220)
+        self.queue.itemSelectionChanged.connect(self._selection_changed)
+        self.queue.itemDoubleClicked.connect(lambda *_: self.show_result())
+
+        self.start_btn = QPushButton(icon("media-playback-start"), "Transcribe")
+        self.start_btn.setDefault(True)
+        self.start_btn.clicked.connect(self.start_ready)
+        self.remove_btn = QPushButton(icon("list-remove"), "Remove")
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.clear_btn = QPushButton(icon("edit-clear-history"), "Clear finished")
+        self.clear_btn.clicked.connect(self.clear_finished)
+        self.result_btn = QPushButton(icon("view-media-lyrics"), "Show transcript")
+        self.result_btn.clicked.connect(self.show_result)
+        buttons = QHBoxLayout()
+        for b in (self.start_btn, self.remove_btn, self.clear_btn):
+            buttons.addWidget(b)
+        buttons.addStretch()
+        buttons.addWidget(self.result_btn)
+
+        self.run_frame = QFrame()
+        self.run_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        rl = QVBoxLayout(self.run_frame)
+        self.run_title = QLabel()
+        f = self.run_title.font()
+        f.setBold(True)
+        self.run_title.setFont(f)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setTextVisible(False)
+        self.run_phase = QLabel()
+        self.cancel_btn = QPushButton(icon("process-stop"), "Cancel")
+        self.cancel_btn.setToolTip("Stop this transcription (nothing is written for it)")
+        self.cancel_btn.clicked.connect(self.cancel_current)
+        row = QHBoxLayout()
+        row.addWidget(self.progress, 1)
+        row.addWidget(self.cancel_btn)
+        rl.addWidget(self.run_title)
+        rl.addLayout(row)
+        rl.addWidget(self.run_phase)
+        self.run_frame.hide()
+
+        self.log_toggle = QToolButton()
+        self.log_toggle.setText("Log")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.log_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.log_toggle.setAutoRaise(True)
+        self.log_toggle.toggled.connect(self._log_toggled)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.log_view.setPlaceholderText("npu-transcribe's messages for the selected file appear here.")
+        self.log_view.hide()
+        self._log_job: Job | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.addWidget(self.missing)
+        lay.addWidget(self.drop)
+        lay.addLayout(opts)
+        lay.addWidget(self.hint)
+        lay.addWidget(self.queue, 2)
+        lay.addLayout(buttons)
+        lay.addWidget(self.run_frame)
+        lay.addWidget(self.log_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.log_view, 1)
+
+        self.ticker = QTimer(self, interval=1000)
+        self.ticker.timeout.connect(self._tick)
+        self._update_hint()
+        self._update_buttons()
+
+    # -- options
+    def _translate_toggled(self, on: bool) -> None:
+        if on and self.model.currentData() == "turbo":
+            self.model.setCurrentIndex(self.model.findData("small"))
+        self._update_hint()
+
+    def _update_hint(self) -> None:
+        text = "Transcripts are saved next to each file: NAME.srt (subtitles) and NAME.md (notes)."
+        if self.translate.isChecked():
+            text += (" Translation works best with the small model (turbo was not trained to translate)."
+                     if self.model.currentData() == "turbo" else
+                     " Translation uses the small model (turbo was not trained to translate).")
+        self.hint.setText(text)
+
+    def options(self) -> dict:
+        return {"model": self.model.currentData(), "language": self.language.currentData(),
+                "translate": self.translate.isChecked()}
+
+    def set_options(self, model: str, language: str, translate: bool) -> None:
+        self.translate.setChecked(bool(translate))
+        if (i := self.model.findData(model)) >= 0:
+            self.model.setCurrentIndex(i)
+        if (i := self.language.findData(language)) >= 0:
+            self.language.setCurrentIndex(i)
+
+    # -- queue
+    def browse(self) -> None:
+        start = self.main.settings.value("transcribe/lastDir", "") or str(HOME)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio or video files", start, MEDIA_FILTER)
+        if paths:
+            self.main.settings.setValue("transcribe/lastDir", os.path.dirname(paths[0]))
+            self.add_files(paths)
+
+    def add_files(self, paths: list[str]) -> int:
+        added, skipped = 0, []
+        for p in paths:
+            p = os.path.abspath(os.path.expanduser(p))
+            if not os.path.isfile(p):
+                skipped.append(f"{os.path.basename(p)} (not found)")
+            elif not is_media(p):
+                skipped.append(f"{os.path.basename(p)} (not audio or video)")
+            elif any(j.path == p and j.state in ("ready", "queued", "running") for j in self.jobs):
+                skipped.append(f"{os.path.basename(p)} (already in the queue)")
+            else:
+                job = Job(p)
+                job.item = QTreeWidgetItem([job.name, "", ""])
+                job.item.setToolTip(0, p)
+                job.item.setIcon(0, icon("video-x-generic" if is_video(p) else "audio-x-generic"))
+                self.jobs.append(job)
+                self.queue.addTopLevelItem(job.item)
+                self._update_item(job)
+                added += 1
+        if added:
+            self.queue.setCurrentItem(self.jobs[-1].item)
+            self.main.message(f"Added {added} file{'s' if added > 1 else ''}: choose the options "
+                              "and press Transcribe" + (f" (skipped: {', '.join(skipped)})" if skipped else ""))
+        elif skipped:
+            self.main.message("Not added: " + ", ".join(skipped))
+        self._update_buttons()
+        return added
+
+    def start_ready(self) -> None:
+        ready = [j for j in self.jobs if j.state == "ready"]
+        if not ready:
+            self.browse()
+            return
+        opts = self.options()
+        self.main.settings.setValue("transcribe/model", opts["model"])
+        self.main.settings.setValue("transcribe/language", opts["language"])
+        self.main.settings.setValue("transcribe/translate", opts["translate"])
+        for job in ready:
+            job.model, job.language, job.translate = opts["model"], opts["language"], opts["translate"]
+            job.state = "queued"
+            self._update_item(job)
+        self._pump()
+
+    def running(self) -> Job | None:
+        return next((j for j in self.jobs if j.state == "running"), None)
+
+    def pending(self) -> int:
+        return sum(j.state in ("queued", "running") for j in self.jobs)
+
+    def _pump(self) -> None:
+        if self.running() is None:
+            job = next((j for j in self.jobs if j.state == "queued"), None)
+            if job is not None:
+                self._start(job)
+        self._update_buttons()
+        self.main.update_counts()
+
+    def _start(self, job: Job) -> None:
+        job.state, job.phase, job.started = "running", "Starting…", time.monotonic()
+        job.log.append(f"$ npu-transcribe {shlex.join(job.args())}")
+        proc = QProcess(self)
+        proc.setProgram(TRANSCRIBE)
+        proc.setArguments(job.args())
+        proc.readyReadStandardError.connect(lambda: self._read(job, err=True))
+        proc.readyReadStandardOutput.connect(lambda: self._read(job, err=False))
+        proc.finished.connect(lambda code, status: self._finished(job, code, status))
+        proc.errorOccurred.connect(lambda e: self._proc_error(job, e))
+        job.proc = proc
+        debug("transcribe", TRANSCRIBE, shlex.join(job.args()))
+        proc.start()
+        self.ticker.start()
+        if self._log_job is None or self._log_job.state != "running":
+            self.queue.setCurrentItem(job.item)
+        self._update_item(job)
+        self._update_run_panel()
+
+    def _read(self, job: Job, err: bool) -> None:
+        if job.proc is None:
+            return
+        if err:
+            job._err_buf += job.proc.readAllStandardError().data().decode(errors="replace")
+            *lines, job._err_buf = job._err_buf.split("\n")
+            for line in lines:
+                self._stderr_line(job, line)
+        else:
+            job._out_buf += job.proc.readAllStandardOutput().data().decode(errors="replace")
+            *lines, job._out_buf = job._out_buf.split("\n")
+            job.outputs += [ln.strip() for ln in lines if ln.strip()]
+        self._update_item(job)
+        self._update_run_panel()
+
+    def _stderr_line(self, job: Job, line: str) -> None:
+        if not line.strip():
+            return
+        job.log.append(line)
+        if self._log_job is job:
+            self.log_view.appendPlainText(line)
+        info = parse_transcribe_line(line)
+        kind = info["kind"]
+        if kind == "loading":
+            job.phase = ("Preparing the model (the first NPU run compiles it, up to a few minutes)…"
+                         if info["compile"] else "Loading the model…")
+        elif kind == "ready":
+            job.phase = "Transcribing…"
+        elif kind == "language":
+            job.language_found = info["language"]
+        elif kind == "progress":
+            job.fraction = info["fraction"]
+            job.phase = "Transcribing…"
+            if info["speed"] and info["total"]:
+                job.remaining = max(0.0, (info["total"] - info["done"]) / info["speed"])
+        elif kind == "error":
+            job.error = info["text"]
+            if job.error.startswith(job.name + ": "):
+                job.error = job.error[len(job.name) + 2:]
+        elif kind == "info" and not job.error and job.proc is not None:
+            job.phase = info["text"][:120]
+
+    def _proc_error(self, job: Job, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.FailedToStart:
+            job.error = f"could not start {TRANSCRIBE}"
+            job.log.append(job.error)
+            self._finished(job, -1, QProcess.ExitStatus.CrashExit)
+
+    def _finished(self, job: Job, code: int, status: QProcess.ExitStatus) -> None:
+        if job.state != "running":
+            return
+        if job.proc is not None:
+            self._read(job, err=True)
+            self._read(job, err=False)
+            last_err, last_out = job._err_buf, job._out_buf  # lines without a final newline
+            job._err_buf = job._out_buf = ""
+            if last_err.strip():
+                self._stderr_line(job, last_err)
+            if last_out.strip():
+                job.outputs.append(last_out.strip())
+            job.proc.deleteLater()
+            job.proc = None
+        if job.cancel_requested:
+            job.state = "cancelled"
+        elif status == QProcess.ExitStatus.NormalExit and code == 0:
+            job.state, job.fraction = "done", 1.0
+        else:
+            job.state = "failed"
+            job.error = job.error or (f"exit status {code}" if code >= 0 else "crashed")
+        job.log.append(f"[{job.state}, exit status {code}]")
+        if self._log_job is job:
+            self.log_view.appendPlainText(job.log[-1])
+        debug("job", job.state, job.path, job.outputs)
+        self._update_item(job)
+        if self.running() is None and not any(j.state == "queued" for j in self.jobs):
+            self.ticker.stop()
+        self._pump()
+        self._update_run_panel()
+        self.job_finished.emit(job)
+
+    def cancel_current(self) -> None:
+        job = self.running()
+        if job is None or job.proc is None:
+            return
+        job.cancel_requested = True
+        job.phase = "Cancelling…"
+        self._update_run_panel()
+        proc = job.proc
+        pid = proc.processId()
+        try:
+            os.kill(pid, signal.SIGINT)  # npu-transcribe stops ffmpeg and exits with 130
+        except OSError:
+            proc.terminate()
+        # SIGINT waits until the Python code runs again (not during an NPU compile).
+        QTimer.singleShot(4000, lambda: job.proc is proc and proc.terminate())
+        QTimer.singleShot(8000, lambda: job.proc is proc and proc.kill())
+
+    def stop_all(self, wait_ms: int = 3000) -> None:
+        """On quit: cancel the queue and stop the running process."""
+        for j in self.jobs:
+            if j.state == "queued":
+                j.state = "cancelled"
+        job = self.running()
+        if job and job.proc:
+            job.cancel_requested = True
+            try:
+                os.kill(job.proc.processId(), signal.SIGINT)
+            except OSError:
+                pass
+            if not job.proc.waitForFinished(wait_ms):
+                job.proc.kill()
+                job.proc.waitForFinished(1000)
+
+    def selected_jobs(self) -> list[Job]:
+        items = self.queue.selectedItems()
+        return [j for j in self.jobs if j.item in items]
+
+    def remove_selected(self) -> None:
+        for job in self.selected_jobs():
+            if job.state != "running":
+                self.queue.takeTopLevelItem(self.queue.indexOfTopLevelItem(job.item))
+                self.jobs.remove(job)
+                if self._log_job is job:
+                    self._log_job = None
+                    self.log_view.clear()
+        self._update_buttons()
+        self.main.update_counts()
+
+    def clear_finished(self) -> None:
+        for job in [j for j in self.jobs if j.state in ("done", "failed", "cancelled")]:
+            self.queue.takeTopLevelItem(self.queue.indexOfTopLevelItem(job.item))
+            self.jobs.remove(job)
+            if self._log_job is job:
+                self._log_job = None
+                self.log_view.clear()
+        self._update_buttons()
+
+    def show_result(self) -> None:
+        job = next((j for j in self.selected_jobs() if j.state == "done"), None)
+        if job is not None:
+            self.main.show_job_result(job)
+
+    # -- display
+    def _update_item(self, job: Job) -> None:
+        if job.item is None:
+            return
+        job.item.setText(1, job.options_text())
+        job.item.setText(2, job.status_text())
+        job.item.setToolTip(2, job.error or job.phase)
+        name = {"running": "media-playback-start", "done": "dialog-ok-apply", "failed": "dialog-error",
+                "cancelled": "dialog-cancel", "queued": "chronometer"}.get(job.state)
+        job.item.setIcon(2, icon(name) if name else QIcon())
+
+    def _update_run_panel(self) -> None:
+        job = self.running()
+        self.run_frame.setVisible(job is not None)
+        if job is None:
+            return
+        waiting = sum(j.state == "queued" for j in self.jobs)
+        self.run_title.setText(f"Transcribing {job.name}" + (f"  (+{waiting} waiting)" if waiting else ""))
+        if job.fraction is None:
+            self.progress.setRange(0, 0)  # busy indicator while the model loads
+        else:
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(int(job.fraction * 1000))
+        self._tick()
+
+    def _tick(self) -> None:
+        job = self.running()
+        if job is None:
+            return
+        parts = [job.phase or "Starting…", f"{fmt_duration(time.monotonic() - job.started)} elapsed"]
+        if job.remaining and job.fraction is not None and job.fraction < 1:
+            parts.append(f"about {fmt_duration(job.remaining)} left")
+        if job.language_found:
+            parts.append(f"language {job.language_found}")
+        self.run_phase.setText(" · ".join(parts))
+
+    def _update_buttons(self) -> None:
+        ready = sum(j.state == "ready" for j in self.jobs)
+        self.start_btn.setText(f"Transcribe {ready} file{'s' if ready != 1 else ''}" if ready else "Transcribe…")
+        self.start_btn.setToolTip("Start with the options above" if ready else "Choose files to transcribe")
+        sel = self.selected_jobs()
+        self.remove_btn.setEnabled(any(j.state != "running" for j in sel))
+        self.clear_btn.setEnabled(any(j.state in ("done", "failed", "cancelled") for j in self.jobs))
+        self.result_btn.setEnabled(any(j.state == "done" for j in sel))
+        self.start_btn.setEnabled(os.access(TRANSCRIBE, os.X_OK))
+
+    def _selection_changed(self) -> None:
+        sel = self.selected_jobs()
+        job = sel[0] if sel else self.running()
+        if job is not self._log_job:
+            self._log_job = job
+            self.log_view.setPlainText("\n".join(job.log) if job else "")
+            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self._update_buttons()
+
+    def _log_toggled(self, on: bool) -> None:
+        self.log_toggle.setArrowType(Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow)
+        self.log_view.setVisible(on)
+
+
+def is_video(path: str) -> bool:
+    global _MIME_DB
+    if _MIME_DB is None:
+        _MIME_DB = QMimeDatabase()
+    return _MIME_DB.mimeTypeForFile(path).name().startswith("video/")
+
+
+# ============================================================================ main window
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = QSettings(APP_ID, APP_ID)
+        self.force_quit = False
+        self.status: dict | None = None
+        self._status_error = CTL_ERROR
+        self._meeting_seen: float | None = None   # when we first saw the running meeting
+        self._pause_began: float | None = None
+        self._paused_total = 0.0
+        self._stop_pid: int | None = None
+        self._meeting_pending: tuple[str, float] | None = None   # ("starting", deadline)
+        self._lang_pending: tuple[str, float] | None = None      # (old language, deadline)
+        self._dictating_here = False
+        self._last_dictation = "idle"
+        self._sigs: dict[str, tuple] = {}
+
+        self._build_toolbar()
+        self.daemon_banner = Banner("warning")
+        self.daemon_banner.text.setText("Voxtype is not running: dictation and meeting recording are "
+                                        "unavailable.")
+        self.start_daemon_btn = self.daemon_banner.add_button("Start voxtype", self.start_daemon,
+                                                              "media-playback-start")
+        self.ctl_banner = Banner("error")
+        self.ctl_banner.text.setText(f"Live status is unavailable: {CTL_ERROR}" if CTL_ERROR else "")
+
+        # sidebar: search + pages
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search titles and text…")
+        self.search.setClearButtonEnabled(True)
+        self.search.addAction(QIcon.fromTheme("edit-find"), QLineEdit.ActionPosition.LeadingPosition)
+        self.search.setToolTip("Filter meetings and transcribed files by title and transcript text (Ctrl+F)")
+        self._search_timer = QTimer(self, singleShot=True, interval=250)
+        self._search_timer.timeout.connect(self.apply_search)
+        self.search.textChanged.connect(lambda _: self._search_timer.start())
+        self.nav = QListWidget()
+        self.nav.setIconSize(QSize(22, 22))
+        for name in PAGES:
+            item = QListWidgetItem(icon(PAGE_ICONS[name]), PAGE_TITLES[name])
+            item.setSizeHint(QSize(0, 34))
+            self.nav.addItem(item)
+        self.nav.currentRowChanged.connect(self._page_changed)
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(8, 8, 0, 8)
+        sl.addWidget(self.search)
+        sl.addWidget(self.nav, 1)
+
+        self.meetings_page = MeetingsPage(self)
+        self.files_page = FilesPage(self)
+        self.transcribe_page = TranscribePage(self)
+        self.transcribe_page.job_finished.connect(self._job_finished)
+        self.stack = QStackedWidget()
+        for page in (self.meetings_page, self.files_page, self.transcribe_page):
+            self.stack.addWidget(page)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 8, 8, 8)
+        rl.addWidget(self.stack)
+
+        self.split = QSplitter(Qt.Orientation.Horizontal)
+        self.split.addWidget(side)
+        self.split.addWidget(right)
+        self.split.setStretchFactor(1, 1)
+        self.split.setChildrenCollapsible(False)
+        self.split.setSizes([220, 900])
+
+        central = QWidget()
+        cl = QVBoxLayout(central)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        for banner, visible in ((self.ctl_banner, bool(CTL_ERROR)), (self.daemon_banner, False)):
+            wrap = QWidget()  # the margins around the banner hide with it
+            wl = QVBoxLayout(wrap)
+            wl.setContentsMargins(8, 6, 8, 0)
+            wl.addWidget(banner)
+            cl.addWidget(wrap)
+            banner.wrapper = wrap
+            wrap.setVisible(visible)
+        cl.addWidget(self.split, 1)
+        self.setCentralWidget(central)
+        self.statusBar()
+
+        for keys, slot in ((QKeySequence.StandardKey.Find, self.focus_search),
+                           (QKeySequence.StandardKey.Quit, self.close),
+                           (QKeySequence.StandardKey.Refresh, self.reload_all),
+                           (QKeySequence.StandardKey.Open, self.open_files)):
+            QShortcut(QKeySequence(keys), self, activated=slot)
+
+        self._restore_settings()
+        self.reload_all()
+        self.poll()
+        self.poll_timer = QTimer(self, interval=1000)
+        self.poll_timer.timeout.connect(self.poll)
+        self.poll_timer.start()
+
+    # -- toolbar ---------------------------------------------------------------
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Controls")
+        tb.setObjectName("controls")
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tb.toggleViewAction().setVisible(False)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+        self.toolbar = tb
+
+        w, self.dict_dot, self.dict_label = state_widget()
+        fm = self.dict_label.fontMetrics()  # fixed width: the bar must not jump when the state changes
+        self.dict_label.setMinimumWidth(max(fm.horizontalAdvance(t) for t in (
+            "Ready to dictate", "Listening…", "Transcribing…", "Voxtype is off", "Status unavailable")) + 4)
+        tb.addWidget(w)
+        self.act_dictate = QAction(icon("audio-input-microphone"), "Dictate to clipboard", self)
+        self.act_dictate.setCheckable(True)
+        self.act_dictate.triggered.connect(self.toggle_dictation)
+        self.act_cancel = QAction(icon("process-stop"), "Cancel", self)
+        self.act_cancel.setToolTip("Discard the current dictation")
+        self.act_cancel.triggered.connect(self.cancel_dictation)
+        self.act_lang = QAction(icon("preferences-desktop-locale"), "EN", self)
+        self.act_lang.triggered.connect(self.toggle_language)
+        tb.addAction(self.act_dictate)
+        tb.addAction(self.act_cancel)
+        tb.addAction(self.act_lang)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        tb.addSeparator()
+
+        w, self.meet_dot, self.meet_label = state_widget()
+        self.meet_label.setMinimumWidth(self.meet_label.fontMetrics().horizontalAdvance("Saving transcript…  "))
+        tb.addWidget(w)
+        self.act_meet_start = QAction(icon("media-record"), "Start meeting", self)
+        self.act_meet_start.setToolTip("Record the microphone + system audio and transcribe it in "
+                                       "30-second chunks (also Meta+Alt+M)")
+        self.act_meet_start.triggered.connect(self.start_meeting)
+        self.act_meet_pause = QAction(icon("media-playback-pause"), "Pause", self)
+        self.act_meet_pause.triggered.connect(self.pause_meeting)
+        self.act_meet_stop = QAction(icon("media-playback-stop"), "Stop", self)
+        self.act_meet_stop.setToolTip("Stop the meeting: the last chunk is transcribed and a Markdown "
+                                      f"copy is saved to {tilde(MEETING_MD_DIR)}")
+        self.act_meet_stop.triggered.connect(self.stop_meeting)
+        for act in (self.act_meet_start, self.act_meet_pause, self.act_meet_stop):
+            tb.addAction(act)
+
+    def createPopupMenu(self):  # the control bar cannot be hidden
+        return None
+
+    # -- polling ---------------------------------------------------------------
+    def poll(self) -> None:
+        st, err = None, CTL_ERROR
+        if ctl is not None:
+            try:
+                st = ctl.status()
+            except Exception as exc:  # keep polling; show why
+                err = f"status failed: {exc}"
+        self.apply_status(st, err)
+        self.check_data()
+
+    def apply_status(self, st: dict | None, error: str | None = None) -> None:
+        now = time.time()
+        self.status = st
+        if st is None:
+            self.dict_dot.set_color(COLORS["gray"])
+            self.dict_label.setText("Status unavailable")
+            self.dict_label.setToolTip(error or "")
+            for act in (self.act_dictate, self.act_cancel, self.act_lang, self.act_meet_start,
+                        self.act_meet_pause, self.act_meet_stop):
+                act.setEnabled(False)
+            self.meet_label.setText("")
+            return
+        daemon_on = st.get("daemon") == "active"
+        dictation = st.get("dictation") or "off"
+        if dictation == "streaming":
+            dictation = "recording"
+        self._set_banner(self.daemon_banner, not daemon_on)
+
+        # dictation
+        if not daemon_on:
+            color, text = COLORS["gray"], "Voxtype is off"
+        elif dictation == "recording":
+            color, text = COLORS["red"], "Listening…"
+        elif dictation == "transcribing":
+            color, text = COLORS["orange"], "Transcribing…"
+        else:
+            color, text = COLORS["green"], "Ready to dictate"
+        self.dict_dot.set_color(color)
+        self.dict_label.setText(text)
+        self.dict_label.setToolTip(f"Dictation: {dictation} · model {st.get('model') or '?'} "
+                                   f"on {st.get('device') or '?'}")
+        if self._dictating_here and self._last_dictation == "transcribing" and dictation == "idle":
+            self.message("Dictated text copied to the clipboard: paste it with Ctrl+V")
+            self._dictating_here = False
+        self._last_dictation = dictation
+        recording = dictation == "recording"
+        self.act_dictate.setEnabled(daemon_on and dictation in ("idle", "recording"))
+        self.act_dictate.setChecked(recording)
+        self.act_dictate.setText("Stop dictation" if recording else "Dictate to clipboard")
+        self.act_dictate.setIcon(icon("media-playback-stop" if recording else "audio-input-microphone"))
+        self.act_dictate.setToolTip(
+            "Stop listening; the text is transcribed and copied to the clipboard" if recording else
+            "Listen until you click again, then copy the text to the clipboard (paste with Ctrl+V).\n"
+            "To type straight into another app at its cursor, press Meta+H in that app "
+            "(Meta+Alt+H dictates to the clipboard from anywhere).")
+        self.act_cancel.setVisible(daemon_on and dictation in ("recording", "transcribing"))
+        self.act_cancel.setEnabled(True)
+
+        # meeting
+        meeting = (st.get("meeting") or "idle") if daemon_on else "idle"
+        if meeting not in ("recording", "paused"):
+            meeting = "idle"
+        stopping = pid_alive(self._stop_pid)
+        if self._stop_pid and not stopping:
+            self._stop_pid = None
+            self.meetings_page.reload()
+            self.meetings_page.select_newest()
+            self.message("Meeting saved")
+        if self._meeting_pending and (meeting != "idle" or now > self._meeting_pending[1]):
+            self._meeting_pending = None
+        if meeting == "idle":
+            self._meeting_seen = self._pause_began = None
+            self._paused_total = 0.0
+            elapsed = None
+        else:
+            if self._meeting_seen is None:
+                self._meeting_seen = now
+            if meeting == "paused" and self._pause_began is None:
+                self._pause_began = now
+            elif meeting == "recording" and self._pause_began is not None:
+                self._paused_total += now - self._pause_began
+                self._pause_began = None
+            started = st.get("meeting_started") or self._meeting_seen
+            elapsed = max(0.0, (self._pause_began or now) - started - self._paused_total)
+        if stopping:
+            color, text = COLORS["blue"], "Saving transcript…"
+        elif self._meeting_pending:
+            color, text = COLORS["gray"], "Starting…"
+        elif meeting == "recording":
+            color, text = COLORS["red"], f"Meeting {fmt_duration(elapsed)}"
+        elif meeting == "paused":
+            color, text = COLORS["orange"], f"Paused {fmt_duration(elapsed)}"
+        else:
+            color, text = COLORS["gray"], "No meeting"
+        self.meet_dot.set_color(color)
+        self.meet_label.setText(text)
+        self.meet_label.setToolTip(st.get("meeting_title") or "")
+        busy = stopping or bool(self._meeting_pending)
+        self.act_meet_start.setEnabled(daemon_on and meeting == "idle" and not busy)
+        self.act_meet_pause.setEnabled(daemon_on and meeting != "idle" and not busy)
+        self.act_meet_pause.setText("Resume" if meeting == "paused" else "Pause")
+        self.act_meet_pause.setIcon(icon("media-playback-start" if meeting == "paused" else "media-playback-pause"))
+        self.act_meet_pause.setToolTip("Continue recording" if meeting == "paused"
+                                       else "Pause recording (nothing is recorded until you resume)")
+        self.act_meet_stop.setEnabled(daemon_on and meeting != "idle" and not busy)
+        self.meetings_page.set_live(st.get("meeting_id"), meeting, elapsed)
+
+        # language
+        lang = (st.get("language") or "en").lower()
+        if self._lang_pending and (lang != self._lang_pending[0] or now > self._lang_pending[1]):
+            self._lang_pending = None
+        other = st.get("next_language") or ""
+        self.act_lang.setText("…" if self._lang_pending else lang.upper())
+        if meeting != "idle":
+            why = "Stop the meeting to switch the language"
+        elif dictation in ("recording", "transcribing"):
+            why = "Wait for the dictation to finish to switch the language"
+        elif not other:
+            why = (f"Dictation language: {language_name(lang)}. To switch here, list more languages "
+                   "in ~/.config/npu-voicenotes/languages (e.g. \"en de\").")
+        else:
+            why = ""
+        self.act_lang.setEnabled(not why and not self._lang_pending)
+        self.act_lang.setToolTip(why or f"Dictation language: {language_name(lang)}. Click to switch to "
+                                 f"{language_name(other)} (restarts voxtype, ~3 s; also Meta+Shift+H).")
+
+    @staticmethod
+    def _set_banner(banner: Banner, visible: bool) -> None:
+        if banner.wrapper.isHidden() == visible:
+            banner.wrapper.setVisible(visible)
+
+    def check_data(self) -> None:
+        """Reload a list when its source changed (cheap stat calls, every poll)."""
+        sigs = {"meetings": (stat_sig(MEETING_DB), stat_sig(f"{MEETING_DB}-wal"), stat_sig(MEETING_MD_DIR)),
+                "files": (stat_sig(FILE_HISTORY),)}
+        changed = False
+        for name, sig in sigs.items():
+            if self._sigs.get(name) != sig:
+                self._sigs[name] = sig
+                (self.meetings_page if name == "meetings" else self.files_page).reload()
+                changed = True
+        if changed:
+            self.update_counts()
+
+    def reload_all(self) -> None:
+        self._sigs.clear()
+        self.check_data()
+
+    # -- actions -----------------------------------------------------------------
+    def toggle_dictation(self) -> None:
+        recording = (self.status or {}).get("dictation") == "recording"
+        self.act_dictate.setChecked(recording)  # the daemon's state decides, not the click
+        self._dictating_here = True
+        self._side_effect([VOXTYPE, "record", "toggle", "--clipboard"], "Dictation")
+
+    def cancel_dictation(self) -> None:
+        self._dictating_here = False
+        self._side_effect([VOXTYPE, "record", "cancel"], "Cancel")
+
+    def toggle_language(self) -> None:
+        lang = ((self.status or {}).get("language") or "en").lower()
+        target = (self.status or {}).get("next_language")
+        if not target:
+            return
+        self._lang_pending = (lang, time.time() + 15)
+        run_detached([str(BIN / "voxtype-lang"), target])
+        self.act_lang.setText("…")
+        self.act_lang.setEnabled(False)
+
+    def start_meeting(self) -> None:
+        self._meeting_pending = ("starting", time.time() + 10)
+        run_detached([str(BIN / "voxtype-meeting-toggle"), "start"])
+        self.poll()
+
+    def stop_meeting(self) -> None:
+        # Detached: it waits for the last chunk (can take minutes) and must outlive the window.
+        self._stop_pid = run_detached([str(BIN / "voxtype-meeting-toggle"), "stop"])
+        self.poll()
+
+    def pause_meeting(self) -> None:
+        action = "resume" if (self.status or {}).get("meeting") == "paused" else "pause"
+        self._side_effect([VOXTYPE, "meeting", action], action.capitalize())
+
+    def start_daemon(self) -> None:
+        self.start_daemon_btn.setEnabled(False)
+        self.daemon_banner.text.setText("Starting voxtype…")
+
+        def done(code: int, _out: str, err: str) -> None:
+            self.start_daemon_btn.setEnabled(True)
+            if code == 0:
+                self.daemon_banner.set_kind("warning")
+                self.daemon_banner.text.setText("Voxtype is not running: dictation and meeting "
+                                                "recording are unavailable.")
+            else:
+                self.daemon_banner.set_kind("error")
+                self.daemon_banner.text.setText("Could not start voxtype: " + (err.strip() or f"status {code}")
+                                                + "\nDetails: journalctl --user -u voxtype")
+            self.poll()
+        if DRY_RUN:
+            debug("run (dry run)", "systemctl --user start voxtype")
+            QTimer.singleShot(0, lambda: done(0, "", ""))
+        else:
+            run_command(self, ["systemctl", "--user", "start", "voxtype"], done, timeout_ms=60_000)
+
+    def _side_effect(self, cmd: list[str], what: str) -> None:
+        """Quick voxtype command (records audio etc.): async; logged only in dry-run."""
+        if DRY_RUN:
+            debug("run (dry run)", shlex.join(cmd))
+            return
+
+        def done(code: int, _out: str, err: str) -> None:
+            if code != 0:
+                self.message(f"{what} failed: {err.strip() or f'status {code}'}")
+            self.poll()
+        run_command(self, cmd, done, timeout_ms=15_000)
+
+    # -- pages, search -------------------------------------------------------------
+    def set_page(self, name: str) -> None:
+        if name in PAGES:
+            self.nav.setCurrentRow(PAGES.index(name))
+
+    def page(self) -> str:
+        return PAGES[max(0, self.stack.currentIndex())]
+
+    def _page_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        self.stack.setCurrentIndex(row)
+        self.setWindowTitle(PAGE_TITLES[PAGES[row]])
+        self.settings.setValue("page", PAGES[row])
+
+    def focus_search(self) -> None:
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def open_files(self) -> None:
+        self.set_page("transcribe")
+        self.transcribe_page.browse()
+
+    def apply_search(self) -> None:
+        terms = search_terms(self.search.text())
+        self.meetings_page.set_filter(terms)
+        self.files_page.set_filter(terms)
+        self.update_counts()
+
+    def update_counts(self) -> None:
+        for row, page in ((0, self.meetings_page), (1, self.files_page)):
+            shown, total = page.counts()
+            base = PAGE_TITLES[PAGES[row]]
+            self.nav.item(row).setText(base if not total else
+                                       f"{base} ({shown}/{total})" if shown != total else f"{base} ({total})")
+        pending = self.transcribe_page.pending()
+        self.nav.item(2).setText(PAGE_TITLES["transcribe"] + (f" ({pending})" if pending else ""))
+
+    def message(self, text: str, ms: int = 8000) -> None:
+        debug("message:", text)
+        self.statusBar().showMessage(text, ms)
+
+    def error_box(self, title: str, text: str) -> None:
+        debug("error:", title, "-", text)
+        QMessageBox.warning(self, title, text)
+
+    # -- transcription results ---------------------------------------------------------
+    def _job_finished(self, job: Job) -> None:
+        self.files_page.reload()
+        self.update_counts()
+        if job.state == "done":
+            self.message(f"Transcribed {job.name}")
+            if not self.transcribe_page.pending():
+                self.show_job_result(job)
+            if not self.isActiveWindow():
+                notify("Transcription finished", job.name)
+        elif job.state == "failed":
+            self.message(f"Transcription of {job.name} failed: {job.error}")
+            if not self.isActiveWindow():
+                notify("Transcription failed", f"{job.name}: {job.error}", "dialog-error")
+
+    def show_job_result(self, job: Job) -> None:
+        key = self.files_page.find_for_job(job)
+        if key is not None:
+            if self.files_page.item_for(key) and self.files_page.item_for(key).isHidden():
+                self.search.clear()
+                self.apply_search()
+            self.set_page("files")
+            self.files_page.select_key(key)
+        elif job.outputs:
+            md = next((o for o in job.outputs if o.endswith(".md")), job.outputs[0])
+            open_path(md)
+
+    # -- requests from the command line / a second launch ---------------------------------
+    def handle_request(self, req: dict, initial: bool = False) -> None:
+        page = req.get("page") if req.get("page") in PAGES else None
+        mid, files = req.get("id"), list(req.get("files") or [])
+        debug("request", json.dumps({k: v for k, v in req.items() if k != "token"}))
+        if files or mid:
+            self.search.clear()
+            self.apply_search()
+        target, queue = page, []
+        for f in files:
+            if page == "transcribe" or (page is None and is_media(f)):
+                queue.append(f)
+            elif page in (None, "files") and self.files_page.select_path(f):
+                target = target or "files"
+            elif page in (None, "meetings") and self.meetings_page.select_md(f):
+                target = target or "meetings"
+            elif is_media(f):
+                queue.append(f)
+            else:
+                self.message(f"Not a recording or a transcript from the lists: {f}")
+        if queue:
+            self.transcribe_page.add_files(queue)
+            target = "transcribe"
+        if mid:
+            if self.meetings_page.select_key(mid):
+                target = target or "meetings"
+            else:
+                self.message(f"Meeting {mid} not found")
+                target = target or "meetings"
+        if target:
+            self.set_page(target)
+        elif initial:
+            self.set_page(self.settings.value("page", "meetings"))
+
+    def handle_remote(self, req: dict) -> None:
+        self.bring_to_front(req.get("token") or "")
+        self.handle_request(req)
+
+    def bring_to_front(self, token: str = "") -> None:
+        # Wayland: only an activation token from the launcher lets us take focus
+        # (Qt uses XDG_ACTIVATION_TOKEN on the next activation); otherwise KWin
+        # marks the window as demanding attention.
+        if token:
+            os.environ["XDG_ACTIVATION_TOKEN"] = token
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    # -- settings, closing ---------------------------------------------------------
+    def _restore_settings(self) -> None:
+        s = self.settings
+        if s.value("geometry") is not None:
+            self.restoreGeometry(s.value("geometry"))
+        else:
+            self.resize(1180, 780)
+        for key, splitter in (("split/main", self.split), ("split/meetings", self.meetings_page.splitter),
+                              ("split/files", self.files_page.splitter)):
+            if s.value(key) is not None:
+                splitter.restoreState(s.value(key))
+        for key, tree in (("header/meetings", self.meetings_page.tree), ("header/files", self.files_page.tree)):
+            if s.value(key) is not None:
+                tree.header().restoreState(s.value(key))
+        self.transcribe_page.set_options(s.value("transcribe/model", "turbo"),
+                                         s.value("transcribe/language", "auto"),
+                                         s.value("transcribe/translate", False, type=bool))
+        self.transcribe_page.log_toggle.setChecked(s.value("transcribe/log", False, type=bool))
+        self.nav.blockSignals(True)
+        self.nav.setCurrentRow(-1)
+        self.nav.blockSignals(False)
+
+    def save_settings(self) -> None:
+        s = self.settings
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("page", self.page())
+        s.setValue("split/main", self.split.saveState())
+        s.setValue("split/meetings", self.meetings_page.splitter.saveState())
+        s.setValue("split/files", self.files_page.splitter.saveState())
+        s.setValue("header/meetings", self.meetings_page.tree.header().saveState())
+        s.setValue("header/files", self.files_page.tree.header().saveState())
+        s.setValue("transcribe/log", self.transcribe_page.log_toggle.isChecked())
+        s.sync()
+
+    def closeEvent(self, event) -> None:
+        if not self.force_quit and self.transcribe_page.pending():
+            answer = QMessageBox.question(
+                self, "Transcription running",
+                "A transcription is still running. Quit and cancel it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self.shutdown()
+        event.accept()
+
+    def shutdown(self) -> None:
+        if getattr(self, "_shut", False):
+            return
+        self._shut = True
+        self.save_settings()
+        self.transcribe_page.stop_all()
+        for proc in self.findChildren(QProcess):  # exports still running: not needed any more
+            if proc.state() != QProcess.ProcessState.NotRunning:
+                proc.kill()
+                proc.waitForFinished(1000)
+
+
+# ============================================================================ single instance
+
+def socket_path() -> str:
+    if os.environ.get("VOICENOTES_SOCKET"):
+        return os.environ["VOICENOTES_SOCKET"]
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return os.path.join(base, f"voicenotes-{os.getuid()}.sock")
+
+
+class SingleInstance(QObject):
+    """One window per user: QLocalServer at a per-uid socket path. A second launch
+    sends its request as one JSON line and gets "ok" back. A flock on PATH.lock,
+    held by the running window, keeps two simultaneous first launches apart."""
+    received = pyqtSignal(dict)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+        self.server: QLocalServer | None = None
+        self._lock_fd: int | None = None
+        self._conns: list[tuple[QLocalSocket, bytearray]] = []
+
+    def forward(self, request: dict, timeout_ms: int = 1500) -> bool:
+        sock = QLocalSocket()
+        sock.connectToServer(self.path)
+        if not sock.waitForConnected(timeout_ms):
+            return False
+        sock.write(json.dumps(request).encode() + b"\n")
+        sock.waitForBytesWritten(timeout_ms)
+        reply = b""
+        for _ in range(20):  # up to ~5 s while the window is busy
+            if sock.waitForReadyRead(250) or sock.bytesAvailable():
+                reply += sock.readAll().data()
+            if b"\n" in reply or sock.state() == QLocalSocket.LocalSocketState.UnconnectedState:
+                break
+        sock.abort()
+        return reply.startswith(b"ok")
+
+    def lock(self) -> bool:
+        fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def listen(self) -> bool:
+        QLocalServer.removeServer(self.path)  # stale socket of a crashed instance
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        self.server.newConnection.connect(self._on_connection)
+        ok = self.server.listen(self.path)
+        if not ok:
+            print(f"voicenotes: cannot listen on {self.path}: {self.server.errorString()}", file=sys.stderr)
+        return ok
+
+    def _on_connection(self) -> None:
+        while self.server.hasPendingConnections():
+            conn = self.server.nextPendingConnection()
+            buf = bytearray()
+            entry = (conn, buf)
+            self._conns.append(entry)
+            conn.readyRead.connect(lambda e=entry: self._on_ready(e))
+            conn.disconnected.connect(lambda e=entry: self._drop(e))
+            if conn.bytesAvailable():
+                self._on_ready(entry)
+
+    def _on_ready(self, entry: tuple[QLocalSocket, bytearray]) -> None:
+        conn, buf = entry
+        buf += conn.readAll().data()
+        if b"\n" not in buf or entry not in self._conns:
+            return
+        try:
+            request = json.loads(bytes(buf).split(b"\n", 1)[0])
+        except ValueError:
+            request = None
+        ok = isinstance(request, dict)
+        conn.write(b"ok\n" if ok else b"error\n")
+        conn.flush()
+        conn.disconnectFromServer()
+        self._drop(entry)
+        if ok:
+            QTimer.singleShot(0, lambda: self.received.emit(request))
+
+    def _drop(self, entry) -> None:
+        if entry in self._conns:
+            self._conns.remove(entry)
+            entry[0].deleteLater()
+
+
+# ============================================================================ main
+
+def main(argv: list[str]) -> int:
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__.strip())
+        return 0
+    if "--version" in argv:
+        print(f"voicenotes {__version__}")
+        return 0
+    try:
+        request = parse_cli(argv)
+    except ValueError as exc:
+        print(f"voicenotes: {exc}\n\n{__doc__.strip()}", file=sys.stderr)
+        return 2
+    request["token"] = os.environ.get("XDG_ACTIVATION_TOKEN", "")
+
+    QGuiApplication.setDesktopFileName(APP_ID)  # Wayland app_id = voicenotes.desktop
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName(APP_ID)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setWindowIcon(QIcon.fromTheme("audio-input-microphone"))
+
+    instance = SingleInstance(socket_path())
+    if instance.forward(request):
+        debug("forwarded to the running window")
+        return 0
+    if not instance.lock():  # another first launch is just starting: wait for its server
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            if instance.forward(request):
+                debug("forwarded to the running window")
+                return 0
+        print("voicenotes: another instance holds the lock but does not answer", file=sys.stderr)
+        return 1
+
+    win = MainWindow()
+    instance.listen()
+    instance.received.connect(win.handle_remote)
+    app.aboutToQuit.connect(win.shutdown)
+
+    def on_signal(*_) -> None:  # SIGTERM/SIGINT: save settings, stop transcriptions, quit
+        win.force_quit = True
+        app.quit()
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    win.handle_request(request, initial=True)
+    if win.nav.currentRow() < 0:
+        win.set_page("meetings")
+    win.show()
+    debug("ready", instance.path)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

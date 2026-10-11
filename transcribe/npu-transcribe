@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""npu-transcribe - turn audio/video files into transcripts with Whisper on the Intel NPU.
+
+Uses openvino_genai.WhisperPipeline on the Intel NPU (Core Ultra) and falls back
+to the CPU when the NPU is missing or fails. The installer runs it in its own
+venv through a wrapper in ~/.local/bin. Audio is decoded by the
+ffmpeg CLI straight into memory (16 kHz mono float32, no temp files) and fed to
+Whisper in ~2 minute blocks cut at the quietest moment, so progress can be shown
+and memory stays flat for multi-hour recordings.
+
+Outputs (next to the input file unless --out is given):
+  NAME.srt  subtitles, one Whisper segment per cue
+  NAME.md   readable paragraphs with [hh:mm:ss] markers about every 30 s
+  NAME.txt  the same paragraphs without markers (only with --format ...,txt)
+Existing files are never overwritten (your own NAME.md notes, downloaded NAME.srt
+subtitles, an earlier transcript): the outputs then become NAME.2.*, NAME.3.*, ...
+unless --overwrite is given.
+
+Examples:
+  npu-transcribe meeting.m4a
+  npu-transcribe --model small --format srt,md,txt --out ~/transcripts *.mp4
+  npu-transcribe --language ru --translate interview.ogg   # Russian speech -> English text
+
+Notes:
+  * Models: turbo (default when installed) is the more accurate one and on the
+    NPU about as fast as small. small needs less RAM (~2.6 vs ~3.9 GB RSS), compiles faster and is
+    ~3x faster on the CPU, so it is the better choice without the NPU.
+  * The first NPU run compiles the model (small ~1 min, turbo ~4 min); the result
+    is cached in ~/.cache/npu-ov-cache and later loads take a few seconds.
+  * --translate always produces English. whisper-large-v3-turbo was not trained
+    for translation, so --translate switches to the small model unless --model
+    was given explicitly.
+  * --language auto detects the language once per file (first non-silent block).
+    On the NPU this needs a fresh pipeline per file (~3 s reload, see
+    Whisper.ready_for_detection); pass --language to skip that in big batches.
+  * Models live in ~/.local/share/npu-models (env NPU_MODELS_DIR).
+  * Exit status: 0 all files done, 1 some file failed, 2 usage error, 130 Ctrl+C.
+  * Every finished file (done or failed) is appended as one JSON line to
+    ~/.local/share/npu-transcribe/history.jsonl (env NPU_TRANSCRIBE_HISTORY),
+    which the Voice Notes app and panel widget list.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import html
+import itertools
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator
+
+# `import openvino` initialises Intel's telemetry module, which (with no consent
+# file in ~/intel) counts as opted *in*, sends a Google Analytics event from a
+# forked helper process and bumps ~/intel/stats. OpenVINO falls back to a no-op
+# stub when the module cannot be imported, so make it unimportable for us.
+sys.modules["openvino_telemetry"] = None
+
+try:
+    import numpy as np  # noqa: E402  (must come after the telemetry block above)
+except ImportError:
+    sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
+             "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
+
+__version__ = "0.1.0"
+MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
+                  or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
+MODELS = {
+    "turbo": MODELS_DIR / "whisper-large-v3-turbo-int8-ov",
+    "small": MODELS_DIR / "whisper-small-int8-ov",
+}
+CACHE_DIR = Path.home() / ".cache/npu-ov-cache"  # compiled NPU blobs
+HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
+               or Path.home() / ".local/share/npu-transcribe/history.jsonl")
+SAMPLE_RATE = 16_000          # what Whisper expects
+BLOCK_SECONDS = 120           # audio per generate() call = progress granularity
+CUT_SEARCH_SECONDS = 10       # cut each block at the quietest 100 ms of its last 10 s
+SILENCE_DBFS = -50.0          # blocks/segments with a lower peak are treated as silence
+SILENCE_AMPLITUDE = 10 ** (SILENCE_DBFS / 20)
+CUE_MARGIN = 0.2              # seconds kept around the audible part of a cue
+PARAGRAPH_SECONDS = 30       # Markdown/text paragraph length (approximate)
+FORMATS = ("srt", "md", "txt")
+PROG = "npu-transcribe"
+STDERR_LOCK = threading.Lock()  # log() and the progress ticker share stderr
+UMASK = os.umask(0o022)
+os.umask(UMASK)                 # read the umask once (still single-threaded here)
+
+
+def log(msg: str) -> None:
+    """Log to stderr; on a terminal, first clear a half-drawn progress line."""
+    prefix = "\r\x1b[K" if sys.stderr.isatty() else ""
+    with STDERR_LOCK:
+        print(f"{prefix}{PROG}: {msg}", file=sys.stderr, flush=True)
+
+
+def hms(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def srt_time(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    return f"{ms // 3_600_000:02d}:{ms % 3_600_000 // 60_000:02d}:{ms % 60_000 // 1000:02d},{ms % 1000:03d}"
+
+
+def peak_dbfs(samples: np.ndarray) -> float:
+    peak = float(np.abs(samples).max()) if samples.size else 0.0
+    return 20 * math.log10(peak) if peak > 0 else -math.inf
+
+
+def audible_span(samples: np.ndarray, s: float, e: float) -> tuple[float, float] | None:
+    """Shrink the cue [s, e] (seconds into `samples`) to its audible part plus
+    CUE_MARGIN; None if all of it is below SILENCE_DBFS.
+
+    Whisper starts a segment at the beginning of its 30 s window even after long
+    digital silence (20 s silent intro -> cue "00:00:00 --> 00:00:25", measured on
+    both models/devices; max_initial_timestamp_index does not change it).
+    Only true (digital) silence is trimmed; a normal noise floor is louder.
+    """
+    i = int(s * SAMPLE_RATE)
+    loud = np.flatnonzero(np.abs(samples[i:int(e * SAMPLE_RATE)]) >= SILENCE_AMPLITUDE)
+    if loud.size == 0:
+        return None
+    first, last = (i + loud[0]) / SAMPLE_RATE, (i + loud[-1]) / SAMPLE_RATE
+    return max(s, first - CUE_MARGIN), min(e, last + CUE_MARGIN)
+
+
+# --------------------------------------------------------------------------- audio
+
+def ff_input(path: Path) -> str:
+    """Input name for ffmpeg/ffprobe. The explicit file: protocol keeps a relative
+    name like "talk: part 1.ogg" from being read as protocol "talk" (measured:
+    "Protocol not found" without it)."""
+    return f"file:{path}"
+
+
+def probe_duration(path: Path) -> float | None:
+    """Duration in seconds for the progress percentage: the first audio stream's,
+    else the container's (Matroska/WebM often lack per-stream durations)."""
+    for args in (["-select_streams", "a:0", "-show_entries", "stream=duration"],
+                 ["-show_entries", "format=duration"]):
+        out = subprocess.run(["ffprobe", "-v", "error", *args, "-of", "csv=p=0", ff_input(path)],
+                             capture_output=True, text=True)
+        try:
+            return float(out.stdout.split()[0])
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
+def quietest_cut(samples: np.ndarray, search: int, frame: int = SAMPLE_RATE // 10) -> int:
+    """Sample index inside the last `search` samples with the least energy (between words)."""
+    start = max(0, len(samples) - search)
+    n = (len(samples) - start) // frame
+    if n == 0:
+        return len(samples)
+    energy = np.square(samples[start:start + n * frame].reshape(n, frame)).mean(axis=1)
+    return start + int(energy.argmin()) * frame + frame // 2
+
+
+def audio_blocks(path: Path) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield (start_seconds, samples) blocks of 16 kHz mono float32 decoded by ffmpeg."""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", ff_input(path),
+           "-map", "0:a:0", "-vn", "-sn", "-dn",
+           # Keep samples on the file's timeline: pad with silence when the audio
+           # track starts after the video (or has gaps). Without this a track that
+           # starts 3 s late gave cues 3 s early (measured on a test .mkv).
+           "-af", "aresample=async=1:first_pts=0",
+           "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1"]
+    block_bytes = BLOCK_SECONDS * SAMPLE_RATE * 4
+    # stderr goes to a temp file: a corrupt input can log more than a pipe buffer holds.
+    with tempfile.TemporaryFile() as err, \
+            subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err) as proc:
+        assert proc.stdout is not None
+        offset, pending, eof = 0, b"", False
+        try:
+            while not eof:
+                want = block_bytes - len(pending)
+                data = proc.stdout.read(want)  # blocks until `want` bytes or EOF
+                eof = len(data) < want
+                pending += data
+                samples = np.frombuffer(pending, np.float32, len(pending) // 4)
+                if samples.size == 0:
+                    break
+                cut = samples.size if eof else quietest_cut(samples, CUT_SEARCH_SECONDS * SAMPLE_RATE)
+                yield offset / SAMPLE_RATE, samples[:cut]
+                offset += cut
+                pending = pending[cut * 4:]
+        finally:
+            if proc.poll() is None:  # consumer stopped early (error, Ctrl+C)
+                proc.kill()
+        if proc.wait() != 0:
+            err.seek(0)
+            msg = err.read().decode(errors="replace").strip()
+            if "matches no streams" in msg:  # from -map 0:a:0
+                raise RuntimeError("no audio stream in this file")
+            last = msg.splitlines()[-1] if msg else f"exit status {proc.returncode}"
+            raise RuntimeError(f"ffmpeg failed: {last}")
+        if offset == 0:
+            raise RuntimeError("no audio decoded (empty file?)")
+
+
+# --------------------------------------------------------------------------- whisper
+
+class Whisper:
+    """WhisperPipeline on the first working device of `devices` (e.g. NPU, then CPU)."""
+
+    def __init__(self, model_dir: Path, devices: list[str]) -> None:
+        self.model_dir, self.devices = model_dir, devices
+        self.device = ""
+        self.used = False  # has generate() run since the last load?
+        self._load()
+
+    def _load(self) -> None:
+        import openvino_genai as ov_genai
+        while True:
+            dev = self.devices[0]
+            note = " (the first NPU run compiles the model: ~1 min small, ~4 min turbo;" \
+                " cached afterwards)" if dev == "NPU" and not self.device else ""
+            log(f"loading {self.model_dir.name} on {dev}{note}")
+            t0 = time.monotonic()
+            # CACHE_DIR only for the NPU: its compile is slow, CPU loads in seconds anyway.
+            kwargs = {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
+            try:
+                self.pipe = ov_genai.WhisperPipeline(str(self.model_dir), dev, **kwargs)
+            except Exception as exc:  # driver missing, compile error, out of memory, ...
+                self._fall_back(f"loading on {dev} failed: {exc}")
+                continue
+            self.device, self.used = dev, False
+            log(f"model ready on {dev} in {time.monotonic() - t0:.1f} s")
+            return
+
+    def ready_for_detection(self) -> None:
+        """Make sure the next generate() really auto-detects the language.
+
+        NPU bug (openvino_genai 2026.4.1, both models, measured 2026-10-11): with
+        language unset, only the first generate() of a pipeline detects the
+        language; later calls silently reuse the previous call's language, so a
+        Russian file after an English one came out as an English translation.
+        Forced languages work on every call. Workaround: reload (~3 s from the
+        compile cache) before detecting again. The CPU pipeline detects correctly.
+        """
+        if self.device == "NPU" and self.used:
+            log("reloading the NPU pipeline so language auto-detection starts fresh")
+            del self.pipe
+            self._load()
+
+    def _fall_back(self, reason: str) -> None:
+        reason = " ".join(reason.split())  # OpenVINO errors span several lines
+        if len(self.devices) < 2:
+            raise RuntimeError(reason)
+        log(f"WARNING: {reason}; falling back to {self.devices[1]}")
+        self.devices.pop(0)
+
+    def generate(self, samples: np.ndarray, **kwargs):
+        """pipe.generate(); on failure reload on the next device and retry this block.
+
+        Known NPU failure: openvino.genai issue #4222 ("invalid unordered_map<K, T> key"
+        at the first generate() with some Whisper exports on Lunar Lake).
+        """
+        while True:
+            try:
+                self.used = True
+                return self.pipe.generate(samples, **kwargs)
+            except Exception as exc:
+                self._fall_back(f"transcription on {self.device} failed: {exc}")
+                del self.pipe
+                self._load()
+
+
+@dataclass
+class Segment:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
+class Transcript:
+    segments: list[Segment]
+    duration: float
+    wall: float      # seconds spent decoding + transcribing
+    language: str    # given, or detected on the first non-silent block
+    dropped: int     # segments discarded as silence hallucinations
+
+
+# --------------------------------------------------------------------------- progress
+
+class Progress:
+    """Status line on stderr: percent done, position, elapsed time, speed.
+
+    On a terminal it is redrawn every second (also while Whisper is busy);
+    otherwise one line is printed per finished block.
+    """
+
+    def __init__(self, name: str, total: float | None) -> None:
+        self.name, self.total, self.done = name, total, 0.0
+        self.t0 = time.monotonic()
+        self.tty = sys.stderr.isatty()
+        self._stop = threading.Event()
+        if self.tty:
+            threading.Thread(target=self._tick, daemon=True).start()
+
+    def _line(self) -> str:
+        elapsed = time.monotonic() - self.t0
+        pct = f"{min(100.0, 100 * self.done / self.total):3.0f}%" if self.total else "  ?%"
+        speed = f"{self.done / elapsed:.1f}x" if self.done and elapsed > 0 else "-"
+        total = hms(self.total) if self.total else "?"
+        return f"{self.name}: {pct}  {hms(self.done)}/{total}  elapsed {hms(elapsed)}  speed {speed}"
+
+    def _draw(self) -> None:
+        with STDERR_LOCK:
+            sys.stderr.write("\r\x1b[K" + self._line()[:shutil.get_terminal_size().columns - 1])
+            sys.stderr.flush()
+
+    def _tick(self) -> None:
+        while not self._stop.wait(1.0):
+            self._draw()
+
+    def update(self, done: float) -> None:
+        self.done = done
+        if self.tty:
+            self._draw()
+        else:
+            print(self._line(), file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self.tty:
+            self._draw()
+            sys.stderr.write("\n")
+
+
+# --------------------------------------------------------------------------- transcription
+
+def transcribe(whisper: Whisper, path: Path, gen_kwargs: dict) -> Transcript:
+    """Transcribe one file block by block.
+
+    With --language auto the language is detected on the first non-silent block
+    and then pinned for the rest of the file (like the openai-whisper CLI does);
+    this keeps a file consistent and sidesteps the NPU detection bug above.
+    """
+    duration = probe_duration(path)
+    language = gen_kwargs.get("language", "").strip("<|>")
+    if not language:
+        whisper.ready_for_detection()
+    progress = Progress(path.name, duration)
+    segments: list[Segment] = []
+    dropped, done = 0, 0.0
+    t0 = time.monotonic()
+    blocks = audio_blocks(path)
+    try:
+        for start, block in blocks:
+            length = block.size / SAMPLE_RATE
+            # Whisper invents text ("Thank you.") for pure silence: skip silent
+            # blocks and drop segments whose audio is (digitally) silent.
+            if peak_dbfs(block) >= SILENCE_DBFS:
+                kwargs = dict(gen_kwargs, language=f"<|{language}|>") if language else gen_kwargs
+                result = whisper.generate(block, **kwargs)
+                if not language and result.language:
+                    language = result.language.strip("<|>")
+                    log(f"language: {language} (auto-detected from the first block)")
+                for chunk in result.chunks or []:
+                    text = " ".join(chunk.text.split())  # one line: a blank line would end the SRT cue
+                    if not text:
+                        continue
+                    s = min(max(float(chunk.start_ts), 0.0), length)
+                    e = min(max(float(chunk.end_ts), s + 0.5), length)  # end may be missing
+                    span = audible_span(block, s, e)
+                    if span is None:
+                        dropped += 1
+                        continue
+                    segments.append(Segment(start + span[0], start + span[1], text))
+            done = start + length
+            progress.update(done)
+    finally:
+        blocks.close()  # stops ffmpeg right away if we bail out early
+        progress.close()
+    return Transcript(segments, done, time.monotonic() - t0, language or "?", dropped)
+
+
+# --------------------------------------------------------------------------- output
+
+def paragraphs(segments: list[Segment]) -> list[tuple[float, str]]:
+    """Join segments into ~PARAGRAPH_SECONDS paragraphs, preferably at sentence ends."""
+    out: list[tuple[float, str]] = []
+    parts: list[str] = []
+    para_start = 0.0
+    for seg in segments:
+        age = seg.start - para_start
+        if parts and age >= PARAGRAPH_SECONDS and (
+                parts[-1].endswith((".", "!", "?", "…", "。", "？", "！")) or age >= 1.5 * PARAGRAPH_SECONDS):
+            out.append((para_start, " ".join(parts)))
+            parts = []
+        if not parts:
+            para_start = seg.start
+        parts.append(seg.text)
+    if parts:
+        out.append((para_start, " ".join(parts)))
+    return out
+
+
+def to_srt(t: Transcript) -> str:
+    cues = [f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text}\n"
+            for i, s in enumerate(t.segments, 1)]
+    return "\n".join(cues)
+
+
+def to_md(t: Transcript, src: Path, meta: dict[str, str]) -> str:
+    head = [f"# {src.stem}", ""] + [f"- **{k}:** {v}" for k, v in meta.items()]
+    body = [f"[{hms(start)}] {text}" for start, text in paragraphs(t.segments)]
+    return "\n".join(head) + "\n\n" + "\n\n".join(body or ["*(no speech detected)*"]) + "\n"
+
+
+def to_txt(t: Transcript) -> str:
+    return "\n\n".join(text for _, text in paragraphs(t.segments)) + "\n"
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Write via a temp file + rename so a crash never leaves half a transcript."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o666 & ~UMASK)  # mkstemp creates 0600; use normal file modes
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def notify(ok: bool, body: list[str]) -> None:
+    """Desktop notification (used by the Dolphin service menu)."""
+    if not shutil.which("notify-send"):
+        return
+    summary = "Transcription finished" if ok else "Transcription failed"
+    cmd = ["notify-send", f"--app-name={PROG}", "--icon=view-media-lyrics",
+           f"--urgency={'normal' if ok else 'critical'}", summary,
+           html.escape("\n".join(body[:10]), quote=False)]  # body allows simple markup
+    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def record_history(src: Path, outputs: list[Path], model: str, language: str,
+                   device: str, duration: float | None, ok: bool) -> None:
+    """Append one JSON line per finished file to HISTORY (read by the Voice Notes
+    app and voicenotes-ctl). Best effort: a failure here only logs a warning."""
+    try:
+        if duration is None:  # failed before/while decoding: ask ffprobe
+            duration = probe_duration(src) if src.is_file() else None
+        entry = {
+            "time": int(time.time()),
+            "input": os.path.abspath(src),
+            "outputs": [os.path.abspath(p) for p in outputs],
+            "model": model,
+            "language": language,
+            "device": device,
+            "duration": round(float(duration or 0.0), 3),
+            "status": "done" if ok else "failed",
+        }
+        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)  # the app rewrites the file under the same lock
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:  # never let the history break a transcription
+        log(f"WARNING: could not update {HISTORY}: {exc}")
+
+
+# --------------------------------------------------------------------------- main
+
+def output_dir(src: Path, out: Path | None) -> Path:
+    """--out, else the input's directory, else ~/Transcripts (read-only media, shares)."""
+    if out:
+        return out.expanduser()
+    if os.access(src.parent, os.W_OK):
+        return src.parent
+    fallback = Path.home() / "Transcripts"
+    fallback.mkdir(exist_ok=True)
+    log(f"WARNING: {src.parent} is not writable; writing to {fallback}")
+    return fallback
+
+
+def output_stem(out_dir: Path, src: Path, formats: list[str], overwrite: bool) -> str:
+    """NAME, or the first free NAME.2, NAME.3, ... unless --overwrite.
+
+    NAME.N.srt still sits next to NAME.mkv, so video players keep finding it.
+    """
+    if overwrite:
+        return src.stem
+    for n in itertools.count(1):
+        stem = src.stem if n == 1 else f"{src.stem}.{n}"
+        if not any((out_dir / f"{stem}.{fmt}").exists() for fmt in formats):
+            if n > 1:
+                log(f"{src.stem}.* already exists; writing {stem}.* (--overwrite to replace)")
+            return stem
+    raise AssertionError("unreachable")
+
+
+def resolve_model(value: str) -> Path:
+    path = MODELS.get(value) or Path(value).expanduser()
+    if not (path / "openvino_encoder_model.xml").is_file():
+        hint = " - install it with the npu-voicenotes installer (--with-turbo)" if value == "turbo" else ""
+        raise SystemExit(f"{PROG}: model not found: {path} (expected an OpenVINO Whisper export){hint}")
+    return path
+
+
+def model_languages(model_dir: Path) -> set[str] | None:
+    """Language codes the model knows, read from its generation_config.json so a
+    typo is rejected before a (possibly minutes long) NPU compile."""
+    try:
+        config = json.loads((model_dir / "generation_config.json").read_text(encoding="utf-8"))
+        return {k.strip("<|>") for k in config["lang_to_id"]}
+    except (OSError, ValueError, KeyError):
+        return None  # unusual export: let WhisperPipeline judge the language
+
+
+def pick_devices(requested: str) -> list[str]:
+    """Device order to try. Our own AUTO: NPU if present, else CPU.
+
+    (OpenVINO's "AUTO" plugin runs Whisper on the CPU here, measured 2026-10-11,
+    because the NPU needs the static Whisper pipeline that only "NPU" selects.)
+    """
+    if requested == "CPU":
+        return ["CPU"]
+    import openvino as ov
+    available = ov.Core().available_devices
+    if "NPU" in available:
+        return ["NPU", "CPU"]
+    if requested == "NPU":
+        log(f"WARNING: NPU not available (devices: {', '.join(available)}; "
+            "is the intel NPU driver installed?) - using CPU")
+    return ["CPU"]
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog=PROG, description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("files", nargs="+", type=Path, metavar="FILE", help="audio or video file(s)")
+    p.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    p.add_argument("--model", default=None, metavar="turbo|small|DIR",
+                   help="turbo (default if installed, else small), small, or a path to an "
+                        "OpenVINO Whisper model dir")
+    p.add_argument("--device", default="NPU", type=str.upper, choices=("NPU", "CPU", "AUTO"),
+                   help="NPU (default, falls back to CPU), CPU, or AUTO (NPU if present)")
+    p.add_argument("--language", default="auto", metavar="auto|en|ru|...",
+                   help="spoken language (default: detected from the first ~2 min of each file)")
+    p.add_argument("--translate", action="store_true", help="translate the speech to English")
+    p.add_argument("--format", default="srt,md", metavar="srt,md,txt",
+                   help="comma-separated output formats (default: srt,md)")
+    p.add_argument("--out", type=Path, metavar="DIR", help="output directory (default: next to each input)")
+    p.add_argument("--overwrite", action="store_true",
+                   help="replace existing NAME.srt/.md/.txt instead of writing NAME.2.* etc.")
+    p.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    args = p.parse_args(argv)
+    args.formats = [f.strip().lower() for f in args.format.split(",") if f.strip()]
+    if not args.formats or set(args.formats) - set(FORMATS):
+        p.error(f"--format: choose from {', '.join(FORMATS)}")
+    if args.model is None:
+        turbo_installed = (MODELS["turbo"] / "openvino_encoder_model.xml").is_file()
+        args.model = "small" if args.translate or not turbo_installed else "turbo"
+        if args.translate and turbo_installed:
+            log("--translate: using the small model (turbo was not trained to translate)")
+    elif args.translate and args.model == "turbo":
+        log("WARNING: whisper-large-v3-turbo was not trained to translate; output may stay untranslated")
+    args.language = args.language.lower().strip("<|>")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            raise SystemExit(f"{PROG}: {tool} not found in PATH")
+    model_dir = resolve_model(args.model)
+    gen_kwargs: dict = {"return_timestamps": True,
+                        "task": "translate" if args.translate else "transcribe"}
+    if args.language != "auto":
+        known = model_languages(model_dir)
+        if known is not None and args.language not in known:
+            raise SystemExit(f"{PROG}: unknown language {args.language!r}; "
+                             f"choose from: {' '.join(sorted(known))}")
+        gen_kwargs["language"] = f"<|{args.language}|>"
+    if args.out:
+        try:
+            args.out.expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit(f"{PROG}: cannot create --out directory: {exc}")
+
+    model_label = args.model if args.model in MODELS else str(model_dir)  # for the history
+    forced_language = args.language if args.language != "auto" else "?"
+    devices: list[str] = []
+    try:
+        devices = pick_devices(args.device)
+        whisper = Whisper(model_dir, devices)
+    except Exception as exc:  # every device failed to load the model
+        log(f"ERROR: {exc}")
+        for src in args.files:  # every file failed
+            record_history(src.expanduser(), [], model_label, forced_language,
+                           devices[0] if devices else args.device, None, ok=False)
+        if args.notify:
+            notify(False, [f"could not load {model_dir.name}: {exc}"])
+        return 1
+
+    report: list[str] = []
+    failed = 0
+    for i, src in enumerate(args.files, 1):
+        src = src.expanduser()
+        written: list[Path] = []
+        t: Transcript | None = None
+        if len(args.files) > 1:
+            log(f"[{i}/{len(args.files)}] {src}")
+        try:
+            if not src.is_file():
+                raise RuntimeError("no such file")
+            out_dir = output_dir(src, args.out)  # checked before the expensive part
+            t = transcribe(whisper, src, gen_kwargs)
+            speed = t.duration / t.wall if t.wall > 0 else 0.0
+            lang = f"{t.language} ({'given' if args.language != 'auto' else 'detected'})" \
+                if t.language != "?" else "- (no speech found)"
+            meta = {
+                "File": src.name,
+                "Duration": hms(t.duration),
+                "Language": lang + (", translated to English" if args.translate else ""),
+                "Model": f"{model_dir.name} on {whisper.device}, {speed:.1f}x realtime",
+                "Created": f"{datetime.now():%Y-%m-%d %H:%M} by {PROG}",
+            }
+            render = {"srt": lambda: to_srt(t), "md": lambda: to_md(t, src, meta),
+                      "txt": lambda: to_txt(t)}
+            stem = output_stem(out_dir, src, args.formats, args.overwrite)
+            for fmt in args.formats:
+                dest = out_dir / f"{stem}.{fmt}"
+                if dest.resolve() == src.resolve():
+                    raise RuntimeError(f"refusing to overwrite the input file with {fmt} output")
+                write_atomic(dest, render[fmt]())
+                written.append(dest)
+                print(dest, flush=True)  # stdout: just the paths, for scripting
+        except KeyboardInterrupt:
+            log("interrupted")
+            return 130
+        except Exception as exc:
+            failed += 1
+            log(f"ERROR: {src.name}: {exc}")
+            report.append(f"FAILED {src.name}: {exc}")
+            record_history(src, written, model_label, t.language if t else forced_language,
+                           whisper.device, t.duration if t else None, ok=False)
+            continue
+        record_history(src, written, model_label, t.language, whisper.device, t.duration, ok=True)
+        log(f"done: {src.name}: {hms(t.duration)} of audio in {t.wall:.1f} s on {whisper.device} "
+            f"({speed:.1f}x realtime), {len(t.segments)} segment(s), language {lang}"
+            + (f", dropped {t.dropped} segment(s) over silence" if t.dropped else ""))
+        report.append(f"{src.name} → {out_dir / stem}.{{{','.join(args.formats)}}} "
+                      f"({hms(t.duration)} in {t.wall:.0f} s, {whisper.device})")
+
+    if args.notify:
+        notify(failed == 0, report)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":  # guard also keeps multiprocessing re-imports harmless
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        log("interrupted")
+        sys.exit(130)

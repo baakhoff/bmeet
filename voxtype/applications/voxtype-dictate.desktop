@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Voxtype: Dictate
+GenericName=Voice typing (toggle)
+Comment=Start/stop dictation; the text is pasted at the cursor (Whisper on the Intel NPU)
+Exec=/usr/bin/voxtype record toggle
+Icon=audio-input-microphone
+Terminal=false
+StartupNotify=false
+Categories=Utility;Accessibility;
+Keywords=voice;speech;dictation;whisper;
+# KDE global shortcut (registered by kglobalaccel from this file; change it in
+# System Settings > Keyboard > Shortcuts). Meta+V is Klipper, Meta+Space is layout.
+X-KDE-Shortcuts=Meta+H
+Actions=ClipboardOnly;
+
+[Desktop Action ClipboardOnly]
+Name=Dictate to clipboard only (for terminals: then Ctrl+Shift+V)
+Exec=/usr/bin/voxtype record toggle --clipboard
+X-KDE-Shortcuts=Meta+Alt+H

@@ -1,0 +1,73 @@
+#!/usr/bin/python3 -I
+"""Stand-in for `voxtype` in the Voice Notes tests (VOICENOTES_VOXTYPE=this file).
+
+meeting export/delete work on the TEMPORARY test database $FAKE_VOXTYPE_DB (it
+refuses voxtype's real index.db); everything else (record, meeting pause, ...)
+is only logged. Every call is appended to $FAKE_VOXTYPE_LOG as a JSON list.
+"""
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+REAL_DB = Path.home() / ".local/share/voxtype/meetings/index.db"
+
+
+def main(args: list[str]) -> int:
+    if os.environ.get("FAKE_VOXTYPE_LOG"):
+        with open(os.environ["FAKE_VOXTYPE_LOG"], "a") as f:
+            f.write(json.dumps(args) + "\n")
+    db = Path(os.environ.get("FAKE_VOXTYPE_DB", ""))
+    if args[:1] != ["meeting"] or args[1:2] not in (["export"], ["delete"]):
+        return 0  # record toggle, meeting pause, ...: logged only
+    if not db.is_file() or db.resolve() == REAL_DB.resolve():
+        print("fake-voxtype: FAKE_VOXTYPE_DB must point to a test copy", file=sys.stderr)
+        return 3
+    rest = args[2:]
+    opts, positional = {}, []
+    while rest:
+        a = rest.pop(0)
+        if a == "--":
+            positional += rest
+            break
+        if a in ("--format", "-f", "--output", "-o"):
+            opts[a.lstrip("-")[0]] = rest.pop(0)
+        elif a.startswith("-"):
+            opts[a.lstrip("-")[0]] = True
+        else:
+            positional.append(a)
+    meeting_id = positional[0]
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT id, title, started_at FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    if row is None:
+        print(f"Error loading meeting: Meeting not found: {meeting_id}", file=sys.stderr)
+        return 1
+    if args[1] == "delete":
+        if not opts.get("f"):
+            print("fake-voxtype: delete without --force would prompt", file=sys.stderr)
+            return 4
+        con.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+        con.commit()
+        print(f"Deleted meeting {meeting_id}")
+        return 0
+    fmt = opts.get("f", "markdown")
+    words = f"Synthetic transcript of {row[1]}. Secret word zeppelin-{meeting_id[:8]}."
+    if fmt == "markdown":
+        out = f"# {row[1]}\n\n**[00:00:05] You:** {words}\n\n**[00:00:12] Remote:** Sounds good.\n"
+    elif fmt == "text":
+        out = f"{row[1]}\n\n[00:00:05] You: {words}\n[00:00:12] Remote: Sounds good.\n"
+    elif fmt == "json":
+        out = json.dumps({"id": row[0], "title": row[1], "segments": [{"speaker": "You", "text": words}]})
+    else:
+        print(f"error: invalid value '{fmt}' for '--format <FORMAT>'", file=sys.stderr)
+        return 2
+    if opts.get("o"):
+        Path(opts["o"]).write_text(out, encoding="utf-8")
+    else:
+        sys.stdout.write(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

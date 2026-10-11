@@ -1,0 +1,214 @@
+#!/usr/bin/python3 -I
+"""voicenotes-ctl - one JSON interface to voxtype + npu-transcribe for the Voice Notes
+panel widget and app. Stdlib only, runs on the system python3.
+
+  voicenotes-ctl status                     JSON: dictation/meeting state, language, ...
+  voicenotes-ctl recent [--limit N]         JSON list: meetings + transcribed files, newest first
+  voicenotes-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only)
+  voicenotes-ctl cancel                     cancel the current dictation
+  voicenotes-ctl lang [toggle|en|de|...]    switch dictation language (restarts the daemon)
+  voicenotes-ctl meeting start|stop|toggle|pause|resume
+  voicenotes-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
+  voicenotes-ctl version
+
+Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid},
+~/.config/voxtype/config.toml, ~/.config/npu-voicenotes/languages (the languages
+`lang toggle` cycles through, e.g. "en de"), ~/.local/share/voxtype/meetings/index.db,
+~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
+Actions that can take long (meeting stop waits for the last chunk) run detached.
+
+Path overrides for testing (env): VOICENOTES_RUN_DIR, VOICENOTES_MEETING_DB,
+VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, VOICENOTES_APP.
+"""
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+RUN = Path(os.environ.get("VOICENOTES_RUN_DIR")
+           or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+CONFIG = XDG_CONFIG / "voxtype/config.toml"
+LANGUAGES_FILE = XDG_CONFIG / "npu-voicenotes/languages"
+LANG_CODE = re.compile(r"^[a-z]{2,3}$")  # Whisper language codes ("en", "haw", ...)
+MEETING_DB = Path(os.environ.get("VOICENOTES_MEETING_DB")
+                  or HOME / ".local/share/voxtype/meetings/index.db")
+MEETING_MD_DIR = Path(os.environ.get("VOXTYPE_MEETING_DIR", HOME / "Documents/Meetings"))
+FILE_HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
+                    or HOME / ".local/share/npu-transcribe/history.jsonl")
+BIN = HOME / ".local/bin"
+APP = Path(os.environ.get("VOICENOTES_APP")
+           or Path(__file__).resolve().parent / "app" / "voicenotes")
+
+
+def read_first_line(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text().splitlines()[0].strip() or default
+    except (OSError, IndexError):
+        return default
+
+
+def daemon_running() -> bool:
+    try:
+        pid = int(read_first_line(RUN / "pid", "0"))
+    except ValueError:
+        return False
+    if pid <= 0:  # no pid file (os.kill(0, 0) would signal our own process group)
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def config() -> dict:
+    try:
+        with CONFIG.open("rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def languages() -> list[str]:
+    """Languages to cycle through with `lang toggle` (same file voxtype-lang reads)."""
+    try:
+        words = LANGUAGES_FILE.read_text().replace(",", " ").split()
+    except (OSError, ValueError):  # missing, unreadable, not UTF-8
+        words = ["en"]
+    codes = [w.lower() for w in words if LANG_CODE.match(w.lower())]
+    return list(dict.fromkeys(codes)) or ["en"]  # unique, order kept
+
+
+def next_language(current: str) -> str | None:
+    """The language `lang toggle` switches to, or None with only one configured."""
+    langs = languages()
+    if current not in langs:
+        return langs[0] if langs[0] != current else None
+    nxt = langs[(langs.index(current) + 1) % len(langs)]
+    return nxt if nxt != current else None
+
+
+def db() -> sqlite3.Connection | None:
+    if not MEETING_DB.exists():
+        return None
+    con = sqlite3.connect(f"file:{MEETING_DB}?mode=ro", uri=True, timeout=2)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def meeting_md(started_at: int) -> str | None:
+    """Markdown copy written by voxtype-meeting-toggle, named YYYY-MM-DD_HHMM-meeting*.md."""
+    import time
+    stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at))
+    for p in sorted(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")):
+        return str(p)
+    return None
+
+
+def status() -> dict:
+    ov = config().get("openvino", {})
+    language = str(ov.get("language", "en")).lower()
+    meeting = read_first_line(RUN / "meeting_state", "idle")
+    active = None
+    if meeting in ("recording", "paused") and (con := db()):  # open the DB only when needed
+        try:
+            active = con.execute("SELECT id, title, started_at FROM meetings WHERE ended_at IS NULL "
+                                 "ORDER BY started_at DESC LIMIT 1").fetchone()
+        finally:
+            con.close()
+    return {
+        "daemon": "active" if daemon_running() else "inactive",
+        "dictation": read_first_line(RUN / "state", "idle") if daemon_running() else "off",
+        "meeting": meeting,
+        "meeting_id": active["id"] if active else None,
+        "meeting_title": active["title"] if active else None,
+        "meeting_started": active["started_at"] if active else None,
+        "language": language,
+        "next_language": next_language(language),
+        "languages": languages(),
+        "model": Path(ov.get("model", "")).name or None,
+        "device": ov.get("device"),
+    }
+
+
+def recent(limit: int) -> list[dict]:
+    items: list[dict] = []
+    con = db()
+    if con:
+        for r in con.execute("SELECT id, title, started_at, duration_secs, status FROM meetings "
+                             "ORDER BY started_at DESC LIMIT ?", (limit,)):
+            items.append({"kind": "meeting", "id": r["id"], "title": r["title"] or "Meeting",
+                          "time": r["started_at"], "duration": r["duration_secs"],
+                          "status": r["status"], "path": meeting_md(r["started_at"])})
+        con.close()
+    try:
+        lines = FILE_HISTORY.read_text().splitlines()[-limit * 2:]
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            h = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        outputs = h.get("outputs") or []
+        md = next((o for o in outputs if o.endswith(".md")), outputs[0] if outputs else None)
+        items.append({"kind": "file", "id": None, "title": Path(h.get("input", "?")).name,
+                      "time": h.get("time"), "duration": h.get("duration"),
+                      "status": h.get("status", "done"), "path": md})
+    items.sort(key=lambda i: i.get("time") or 0, reverse=True)
+    return items[:limit]
+
+
+def detached(*cmd: str) -> None:
+    """Start and forget (meeting stop can take minutes; the caller must not block)."""
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def main(argv: list[str]) -> int:
+    cmd, args = (argv[0], argv[1:]) if argv else ("status", [])
+    if cmd == "status":
+        print(json.dumps(status()))
+    elif cmd == "recent":
+        limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 10
+        print(json.dumps(recent(limit)))
+    elif cmd == "dictate":
+        return subprocess.call(["voxtype", "record", "toggle"]
+                               + (["--clipboard"] if "--clipboard" in args else []))
+    elif cmd == "cancel":
+        return subprocess.call(["voxtype", "record", "cancel"])
+    elif cmd == "lang":
+        target = (args[:1] or ["toggle"])[0].lower()
+        if target != "toggle" and not LANG_CODE.match(target):
+            print(f"voicenotes-ctl: not a language code: {target!r}", file=sys.stderr)
+            return 2
+        detached(str(BIN / "voxtype-lang"), target)
+    elif cmd == "meeting":
+        action = args[0] if args else "toggle"
+        if action in ("start", "stop", "toggle"):
+            detached(str(BIN / "voxtype-meeting-toggle"), action)
+        elif action in ("pause", "resume"):
+            return subprocess.call(["voxtype", "meeting", action])
+        else:
+            print("usage: voicenotes-ctl meeting start|stop|toggle|pause|resume", file=sys.stderr)
+            return 2
+    elif cmd == "open":
+        detached(str(APP), *args)
+    elif cmd in ("version", "--version"):
+        print(f"voicenotes-ctl {__version__}")
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

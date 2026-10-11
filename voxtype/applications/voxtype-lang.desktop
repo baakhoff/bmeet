@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Voxtype: Switch Language
+GenericName=Next dictation language
+Comment=Switch to the next language in ~/.config/npu-voicenotes/languages (restarts voxtype)
+Exec=@HOME@/.local/bin/voxtype-lang
+Icon=preferences-desktop-locale
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+X-KDE-Shortcuts=Meta+Shift+H

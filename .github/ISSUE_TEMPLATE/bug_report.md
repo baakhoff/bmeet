@@ -13,9 +13,9 @@ labels: bug
 **System**
 - Distribution and version (e.g. Kubuntu 26.04):
 - CPU (e.g. Intel Core Ultra 5 125H):
-- npu-voicenotes version (`cat ~/.local/share/npu-voicenotes/src/VERSION`):
+- BMeet version (`cat ~/.local/share/bmeet/src/VERSION`):
 
-**Health check** (`bash ~/.local/share/npu-voicenotes/src/voxtype/verify.sh`)
+**Health check** (`bash ~/.local/share/bmeet/src/voxtype/verify.sh`)
 ```
 (paste here)
 ```

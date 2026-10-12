@@ -3,7 +3,7 @@ import QtQuick.Layouts
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 
-// Voice Notes panel widget: front end for voicenotes-ctl
+// BMeet panel widget: front end for bmeet-ctl
 // (voxtype dictation + meetings, npu-transcribe files). State and backend calls live
 // in Controller.qml; this file wires it to the Plasma applet.
 //   left click   popup
@@ -21,10 +21,10 @@ PlasmoidItem {
     }
 
     Plasmoid.icon: vn.iconName
-    Plasmoid.title: "Voice Notes"
+    Plasmoid.title: "BMeet"
     Plasmoid.status: PlasmaCore.Types.ActiveStatus
 
-    toolTipMainText: "Voice Notes: " + vn.stateText
+    toolTipMainText: "BMeet: " + vn.stateText
                      + ((vn.meetingActive || vn.saving) && vn.elapsed > 0 ? " " + vn.elapsedText : "")
     toolTipSubText: {
         const lines = [];
@@ -65,7 +65,7 @@ PlasmoidItem {
             onTriggered: vn.openApp("transcribe")
         },
         PlasmaCore.Action {
-            text: "Open Voice Notes"
+            text: "Open BMeet"
             icon.name: "window-new"
             onTriggered: vn.openApp("")
         }

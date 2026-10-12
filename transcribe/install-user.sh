@@ -7,22 +7,25 @@
 # Usage: ./install-user.sh [--venv DIR]     install / update (idempotent)
 #        ./install-user.sh --uninstall
 # The venv (openvino-genai, numpy) is made by the top-level install.sh; default
-# ~/.local/share/npu-voicenotes/venv.
+# ~/.local/share/bmeet/venv.
 set -euo pipefail
 
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 script="$here/npu-transcribe"
-venv="${NPU_VOICENOTES_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-voicenotes/venv}"
+venv="${BMEET_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/venv}"
 models="${NPU_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-models}"
 link="$HOME/.local/bin/npu-transcribe"
 menu_dir="${XDG_DATA_HOME:-$HOME/.local/share}/kio/servicemenus"
 menu="$menu_dir/npu-transcribe.desktop"
-marker="# npu-voicenotes wrapper"
+marker="# BMeet wrapper"
+old_marker="# npu-voicenotes wrapper"   # before 0.2.0
 
 case ${1:-} in
     --uninstall)
         # Only remove what this script wrote (a wrapper with our marker, or an old symlink).
-        if [[ -L $link ]] || { [[ -f $link ]] && grep -qF "$marker" "$link"; }; then rm -v "$link"; fi
+        if [[ -L $link ]] || { [[ -f $link ]] && grep -qF -e "$marker" -e "$old_marker" "$link"; }; then
+            rm -v "$link"
+        fi
         rm -fv "$menu"
         exit 0 ;;
     --venv) venv=${2:?--venv needs a directory} ;;
@@ -36,7 +39,7 @@ python="$venv/bin/python"
 for tool in ffmpeg ffprobe; do
     command -v "$tool" >/dev/null || { echo "error: $tool not found (sudo apt install ffmpeg)" >&2; exit 1; }
 done
-if [[ -e $link && ! -L $link ]] && ! grep -qF "$marker" "$link"; then
+if [[ -e $link && ! -L $link ]] && ! grep -qF -e "$marker" -e "$old_marker" "$link"; then
     echo "error: $link exists and was not written by this installer; not touching it" >&2
     exit 1
 fi

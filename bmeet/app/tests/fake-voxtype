@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Stand-in for `voxtype` in the Voice Notes tests (VOICENOTES_VOXTYPE=this file).
+"""Stand-in for `voxtype` in the BMeet tests (BMEET_VOXTYPE=this file).
 
 meeting export/delete work on the TEMPORARY test database $FAKE_VOXTYPE_DB (it
 refuses voxtype's real index.db); everything else (record, meeting pause, ...)

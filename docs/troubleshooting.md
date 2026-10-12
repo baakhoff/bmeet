@@ -3,7 +3,7 @@
 Start with the health check. It changes nothing except a temporary WAV file:
 
 ```bash
-bash ~/.local/share/npu-voicenotes/src/voxtype/verify.sh
+bash ~/.local/share/bmeet/src/voxtype/verify.sh
 ```
 
 | Symptom | What to check |
@@ -18,11 +18,11 @@ bash ~/.local/share/npu-voicenotes/src/voxtype/verify.sh
 | Permission denied on `/dev/accel/accel0` | `sudo usermod -aG render $USER`, then log out and in |
 | First dictation after install or upgrade takes ~60 s | One-time NPU compile. The installer normally does it ahead of time. |
 | Dictation comes out in the wrong language | Meta+Shift+H, the widget's language chip, or `voxtype-lang de`. The engine has no auto-detection. |
-| I want other languages on Meta+Shift+H | Edit `~/.config/npu-voicenotes/languages` (e.g. `en de fr`), or re-run the installer with `--languages "en de fr"`. |
+| I want other languages on Meta+Shift+H | Edit `~/.config/bmeet/languages` (e.g. `en de fr`), or re-run the installer with `--languages "en de fr"`. |
 | Meeting transcript missing after stopping | Stopping waits for the last chunk (up to a few minutes on a slow CPU). Afterwards: `voxtype meeting list`, then `voxtype meeting export latest -o FILE.md`. |
-| Widget shows "Backend error" | `~/.local/bin/voicenotes-ctl status` must print JSON. Re-run the installer if it doesn't. |
-| Widget not in the panel | Right-click the panel → Add or Manage Widgets → "Voice Notes". After an upgrade: `systemctl --user restart plasma-plasmashell`. |
-| Voice Notes window only flashes in the task bar | Wayland focus-stealing prevention when it's opened from another program. Click the task bar entry. |
+| Widget shows "Backend error" | `~/.local/bin/bmeet-ctl status` must print JSON. Re-run the installer if it doesn't. |
+| Widget not in the panel | Right-click the panel → Add or Manage Widgets → "BMeet". After an upgrade: `systemctl --user restart plasma-plasmashell`. |
+| BMeet window only flashes in the task bar | Wayland focus-stealing prevention when it's opened from another program. Click the task bar entry. |
 | npu-transcribe: "model not found … turbo" | It was installed with `--no-turbo`. Re-run the installer without it, or use `--model small`. |
 
 When you open an issue, include the output of `verify.sh` and

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# npu-voicenotes installer: voice typing, meeting transcripts and file transcription
+# BMeet installer: voice typing, meeting transcripts and file transcription
 # with Whisper on the Intel NPU, for Ubuntu/Kubuntu 26.04 with KDE Plasma 6.
 #
 # One line (downloads the release, asks for your sudo password once):
-#   curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
 # With options:
-#   curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/install.sh | bash -s -- --languages "en de"
+#   curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash -s -- --languages "en de"
 # From a checkout:
 #   ./install.sh [options]
 #
@@ -13,15 +13,15 @@
 #   --languages "en de"  dictation languages that Meta+Shift+H cycles through
 #                        (Whisper codes; default: English + your desktop language)
 #   --no-turbo           skip whisper-large-v3-turbo (~1 GB; best for file transcripts)
-#   --no-panel           do not add the Voice Notes widget to the panel
+#   --no-panel           do not add the BMeet widget to the panel
 #   --no-npu-driver      do not install Intel's NPU driver even if it is missing
 #   --skip-system        skip the sudo part (it must have run before)
 #   --reset-config       replace your voxtype config with the default one
 #   --force              try on something other than Ubuntu 26.04
 #   --version            print the version this installer installs
-# Env: NPU_VOICENOTES_REF=main installs the main branch instead of the release tag.
+# Env: BMEET_REF=main installs the main branch instead of the release tag.
 #
-# Installs into ~/.local/share/npu-voicenotes (program + Python venv),
+# Installs into ~/.local/share/bmeet (program + Python venv),
 # ~/.local/share/npu-models (Whisper models) and ~/.local/bin. Undo: uninstall.sh.
 
 # Everything is inside main(), so a download cut short by the network cannot run half
@@ -30,10 +30,10 @@ main() {
     set -euo pipefail
 
     local VERSION=0.1.0
-    local REPO=baakhoff/npu-voicenotes
+    local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
-    local ROOT="$data/npu-voicenotes"
-    local CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/npu-voicenotes"
+    local ROOT="$data/bmeet"
+    local CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/bmeet"
     local MODELS_DIR="${NPU_MODELS_DIR:-$data/npu-models}"
 
     if [ -t 1 ]; then
@@ -54,7 +54,7 @@ main() {
             --skip-system) system= ;;
             --reset-config) reset_config=--reset-config ;;
             --force) system_args+=(--force) ;;
-            --version) echo "npu-voicenotes installer $VERSION"; return 0 ;;
+            --version) echo "BMeet installer $VERSION"; return 0 ;;
             -h|--help)
                 if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,25p' "${BASH_SOURCE[0]}"
                 else echo "See https://github.com/$REPO#install"; fi
@@ -72,16 +72,16 @@ main() {
     if [ "$(basename -- "$self")" = install.sh ] && [ -f "$self" ] && [ -f "$(dirname "$self")/VERSION" ]; then
         src="$(cd "$(dirname "$self")" && pwd)"
     else
-        local ref="${NPU_VOICENOTES_REF:-v$VERSION}" tmp
+        local ref="${BMEET_REF:-v$VERSION}" tmp
         command -v curl >/dev/null || die "curl is needed (sudo apt install curl)"
         command -v tar >/dev/null || die "tar is needed"
-        say "Downloading npu-voicenotes $ref"
-        tmp="$(mktemp -d "${TMPDIR:-/tmp}/npu-voicenotes.XXXXXX")"
+        say "Downloading BMeet $ref"
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/bmeet.XXXXXX")"
         trap 'rm -rf "$tmp"' EXIT   # on failure; the real installer removes it when done
         curl -fsSL "https://github.com/$REPO/archive/$ref.tar.gz" | tar -xz -C "$tmp" --strip-components=1 \
             || die "could not download https://github.com/$REPO/archive/$ref.tar.gz"
-        [ -f "$tmp/install.sh" ] || die "the download does not look like npu-voicenotes"
-        export NPU_VOICENOTES_TMP="$tmp"   # the real installer removes it when done
+        [ -f "$tmp/install.sh" ] || die "the download does not look like BMeet"
+        export BMEET_TMP="$tmp"   # the real installer removes it when done
         trap - EXIT
         # stdin is the pipe from curl: give the real installer the terminal instead (if
         # there is one: not under ssh without -t, cloud-init or CI)
@@ -92,12 +92,12 @@ main() {
     fi
     local version
     version="$(cat "$src/VERSION")"
-    if [ -n "${NPU_VOICENOTES_TMP:-}" ] && [ "$src" = "$(cd "$NPU_VOICENOTES_TMP" && pwd)" ]; then
-        trap 'rm -rf "$NPU_VOICENOTES_TMP"' EXIT   # the downloaded release
+    if [ -n "${BMEET_TMP:-}" ] && [ "$src" = "$(cd "$BMEET_TMP" && pwd)" ]; then
+        trap 'rm -rf "$BMEET_TMP"' EXIT   # the downloaded release
     fi
 
     # --- preflight -------------------------------------------------------------------
-    say "npu-voicenotes $version"
+    say "BMeet $version"
     . /etc/os-release
     echo "  system:  ${PRETTY_NAME:-unknown}, $(uname -m)"
     echo "  desktop: ${XDG_CURRENT_DESKTOP:-unknown} (${XDG_SESSION_TYPE:-?})"
@@ -117,6 +117,13 @@ main() {
     free_gb=$(( $(df -Pk "$HOME" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
     [ "$free_gb" -ge 6 ] || die "only ${free_gb} GB free in $HOME; about 6 GB are needed"
 
+    # BMeet was called npu-voicenotes before 0.2.0: reuse its downloads (no second ~600 MB
+    # fetch); its program files and venv are removed at the end.
+    local old_root="$data/npu-voicenotes" old_cache="${XDG_CACHE_HOME:-$HOME/.cache}/npu-voicenotes"
+    if [ -d "$old_cache" ] && [ ! -e "$CACHE" ]; then
+        mv "$old_cache" "$CACHE"
+    fi
+
     # --- 1. system part (sudo) -----------------------------------------------------------
     if [ -n "$system" ]; then
         say "System part (sudo): packages, NPU driver, voxtype, OpenVINO GenAI SDK"
@@ -132,7 +139,7 @@ main() {
     mkdir -p "$stage"
     # the runtime tree only (no tests, docs, CI)
     tar -C "$src" --exclude='tests' --exclude='__pycache__' --exclude='.work' \
-        -cf - VERSION LICENSE install.sh uninstall.sh system voxtype transcribe voicenotes \
+        -cf - VERSION LICENSE install.sh uninstall.sh system voxtype transcribe bmeet \
         | tar -C "$stage" -xf -
     rm -rf "$ROOT/src.old"
     [ ! -d "$ROOT/src" ] || mv "$ROOT/src" "$ROOT/src.old"
@@ -180,30 +187,36 @@ import openvino_genai, numpy; print("  openvino-genai", openvino_genai.__version
 
     # --- 5. per-user parts -----------------------------------------------------------
     say "Dictation and meetings (voxtype)"
-    NPU_MODELS_DIR="$MODELS_DIR" NPU_VOICENOTES_LANGUAGES="$languages" \
+    NPU_MODELS_DIR="$MODELS_DIR" BMEET_LANGUAGES="$languages" \
         bash "$src/voxtype/user-setup.sh" $reset_config
 
     say "File transcription (npu-transcribe + Dolphin menu)"
     NPU_MODELS_DIR="$MODELS_DIR" bash "$src/transcribe/install-user.sh" --venv "$venv"
 
-    say "Voice Notes app"
-    bash "$src/voicenotes/app/install-user.sh"
+    say "BMeet app"
+    bash "$src/bmeet/app/install-user.sh"
 
-    say "Voice Notes panel widget"
+    say "BMeet panel widget"
     if command -v kpackagetool6 >/dev/null; then
-        bash "$src/voicenotes/plasmoid/install-user.sh" ${panel:+--add-to-panel}
+        bash "$src/bmeet/plasmoid/install-user.sh" ${panel:+--add-to-panel}
     else
         echo "  skipped: kpackagetool6 not found (the widget needs KDE Plasma 6)"
     fi
 
+    if [ -d "$old_root" ]; then
+        say "Removing the old npu-voicenotes install"
+        rm -rf "$old_root"
+        echo "  removed $old_root (BMeet replaces it; your settings and transcripts were moved or kept)"
+    fi
+
     # --- done --------------------------------------------------------------------------
-    say "Done - npu-voicenotes $version"
+    say "Done - BMeet $version"
     cat <<EOF
   Meta+H          dictate: press, speak, press again -> text is typed at the cursor
   Meta+Alt+H      dictate to the clipboard only (for terminals: then Ctrl+Shift+V)
   Meta+Alt+M      start / stop a meeting transcript (microphone + system audio)
-  Meta+Shift+H    next dictation language ($(cat "${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages" 2>/dev/null || echo en))
-  Voice Notes     app menu, or the microphone in the panel: meetings, transcripts, files
+  Meta+Shift+H    next dictation language ($(cat "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/languages" 2>/dev/null || echo en))
+  BMeet           app menu, or the microphone in the panel: meetings, transcripts, files
   Dolphin         right-click an audio/video file -> Transcribe (NPU)
 
   Check the setup:  bash $src/voxtype/verify.sh

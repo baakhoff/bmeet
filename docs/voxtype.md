@@ -1,7 +1,7 @@
 # Dictation and meetings: how the voxtype setup works
 
 [voxtype](https://github.com/peteonrails/voxtype) 1.1.0 does the dictation and meeting
-recording. npu-voicenotes installs it so that Whisper runs on the Intel NPU through
+recording. BMeet installs it so that Whisper runs on the Intel NPU through
 OpenVINO GenAI 2026.4.1. This page explains the choices behind that setup.
 
 - **System part:** [`system/install.sh`](../system/install.sh).
@@ -19,7 +19,7 @@ OpenVINO GenAI 2026.4.1. This page explains the choices behind that setup.
 | `OpenVINO/whisper-small-int8-ov`, `OpenVINO/whisper-large-v3-turbo-int8-ov` | Hugging Face | pinned commit (`5b831719…`, `b568445d…`) |
 
 **Where checks run:**
-- Downloads are fetched as you into `~/.cache/npu-voicenotes/downloads`.
+- Downloads are fetched as you into `~/.cache/bmeet/downloads`.
 - The root script first copies them into root-owned scratch space under `/var/tmp`, then checks and uses only those copies. That way, nothing running as you can swap a file between the check and its use as root.
 - The root script reads the downloads *as you*, so a symlink in that folder can't make root copy a file you couldn't read yourself.
 - Signatures are checked with `gpgv` against the two public keys in [`system/keys/`](../system/keys). No keyserver is contacted, and no key is imported anywhere.
@@ -32,7 +32,7 @@ OpenVINO GenAI 2026.4.1. This page explains the choices behind that setup.
    - **What `--no-remove` does:** apt aborts instead of removing anything.
    - **Waiting for apt:** if `unattended-upgrades` is busy, apt waits up to 10 minutes for the lock.
    - **Why `wtype` is skipped:** it is a voxtype Recommends, but it can't work on KWin (no virtual-keyboard protocol).
-   - **Install record:** `/var/lib/npu-voicenotes/preexisting` notes what was already installed, so `uninstall.sh` removes only what it added.
+   - **Install record:** `/var/lib/bmeet/preexisting` notes what was already installed, so `uninstall.sh` removes only what it added.
 2. **Binary variant:**
    - **The problem:** the voxtype package installs every build under `/usr/lib/voxtype/`, plus a `/usr/bin/voxtype` wrapper. On a CPU without AVX-512 that wrapper picks `voxtype-avx2` (whisper.cpp only). The OpenVINO engine is compiled only into the ONNX builds.
    - **What the installer does:** `/usr/bin/voxtype` becomes a symlink to `voxtype-onnx-avx2`, the same thing upstream's `voxtype setup variant --to voxtype-onnx-avx2` does. Before that, `dpkg-divert` moves the package's wrapper aside, so a later package upgrade can't silently put it back.
@@ -56,9 +56,9 @@ OpenVINO GenAI 2026.4.1. This page explains the choices behind that setup.
 
 - **Config:**
   - `~/.config/voxtype/config.toml` is rendered from [`config.toml`](../voxtype/config.toml) with your model path and first language.
-  - A config not written by npu-voicenotes is backed up first. Ours is kept on re-runs (`--reset-config` replaces it).
+  - A config not written by BMeet is backed up first. Ours is kept on re-runs (`--reset-config` replaces it).
 - **Languages:**
-  - `~/.config/npu-voicenotes/languages` holds the languages that Meta+Shift+H, the widget and the app cycle through.
+  - `~/.config/bmeet/languages` holds the languages that Meta+Shift+H, the widget and the app cycle through.
   - The default is English plus your desktop language.
 - **Commands and shortcuts:**
   - Helper commands go in `~/.local/bin`: `voxtype-meeting-toggle` and `voxtype-lang`.
@@ -124,8 +124,8 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
 ## Is it really on the NPU?
 
 ```bash
-bash ~/.local/share/npu-voicenotes/src/voxtype/verify.sh          # checks + one synthetic transcription
-bash ~/.local/share/npu-voicenotes/src/voxtype/verify.sh --watch  # then dictate with Meta+H
+bash ~/.local/share/bmeet/src/voxtype/verify.sh          # checks + one synthetic transcription
+bash ~/.local/share/bmeet/src/voxtype/verify.sh --watch  # then dictate with Meta+H
 ```
 
 **Watch the busy counter.** `/sys/class/accel/accel0/device/npu_busy_time_us` counts the microseconds the NPU was busy:

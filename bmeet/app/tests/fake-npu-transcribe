@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Stand-in for npu-transcribe in the Voice Notes GUI tests (VOICENOTES_TRANSCRIBE).
+"""Stand-in for npu-transcribe in the BMeet GUI tests (BMEET_TRANSCRIBE).
 
 Prints the same stderr lines as the real tool without a terminal (log lines plus
 one progress line per block), writes NAME.srt/NAME.md next to the input, prints

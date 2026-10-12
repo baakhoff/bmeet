@@ -1,10 +1,10 @@
 #!/bin/bash
-# npu-voicenotes, system part (root). The top-level install.sh runs it with sudo;
+# BMeet, system part (root). The top-level install.sh runs it with sudo;
 # idempotent, safe to run again. Undo with system/uninstall.sh.
 #
 #   sudo bash system/install.sh [--cache DIR] [--no-npu-driver] [--force]
 #
-#   --cache DIR       where downloads are kept (default: ~/.cache/npu-voicenotes/downloads
+#   --cache DIR       where downloads are kept (default: ~/.cache/bmeet/downloads
 #                     of the user who ran sudo; files are fetched as that user)
 #   --no-npu-driver   do not install Intel's NPU user-space driver even if it is missing
 #   --force           run on something other than Ubuntu 26.04 (untested)
@@ -29,7 +29,7 @@
 #   /etc/udev/rules.d/70-voxtype-uinput.rules   /dev/uinput for the seat user (uaccess)
 #   /etc/systemd/user/ydotool.service.d/10-voxtype.conf   keyboard-only ydotoold
 #   ydotool.service is NOT enabled globally (voxtype.service pulls it in for you only)
-#   /var/lib/npu-voicenotes/   what was already there before, so uninstall.sh only
+#   /var/lib/bmeet/   what was already there before, so uninstall.sh only
 #                              removes what this script added
 # Nothing here touches GPU drivers, Mesa, firmware or kernel parameters.
 set -eu
@@ -41,7 +41,7 @@ TARGET_USER="${SUDO_USER:-}"
 TARGET_UID="$(id -u "$TARGET_USER")"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 
-DL="$TARGET_HOME/.cache/npu-voicenotes/downloads"
+DL="$TARGET_HOME/.cache/bmeet/downloads"
 NPU_DRIVER=1
 FORCE=
 while [ $# -gt 0 ]; do
@@ -86,8 +86,8 @@ BASE_PKGS="ffmpeg python3-venv python3-pyqt6 wl-clipboard libnotify-bin desktop-
            libespeak-ng1 libtbb12 libze1 curl"
 UDEV_RULE=/etc/udev/rules.d/70-voxtype-uinput.rules
 YDO_DROPIN=/etc/systemd/user/ydotool.service.d/10-voxtype.conf
-STATE_DIR=/var/lib/npu-voicenotes
-OLD_STATE_DIR=/var/lib/voxtype-npu-setup   # name used before the first release
+STATE_DIR=/var/lib/bmeet
+OLD_STATE_DIRS="/var/lib/npu-voicenotes /var/lib/voxtype-npu-setup"   # names used before 0.2.0
 
 step() { echo; echo "=== $* ==="; }
 as_user() {  # run a command as the desktop user inside their session environment
@@ -116,7 +116,7 @@ echo "  user: $TARGET_USER, downloads: $DL"
 
 # Scratch space on disk, not in /tmp: /tmp is often a RAM-backed tmpfs and the .deb
 # alone is 375 MB. Removed on any exit, including errors.
-WORK="$(mktemp -d /var/tmp/npu-voicenotes-install.XXXXXX)"
+WORK="$(mktemp -d /var/tmp/bmeet-install.XXXXXX)"
 chmod 0755 "$WORK"   # apt's _apt user must reach $WORK/dl
 SDK_TMP=""           # set in step 5; removed here too if the unpack fails half-way
 cleanup() {
@@ -214,9 +214,11 @@ verify_sig "$VOXTYPE_SIGNER" voxtype-release.asc "$VDL/$VOXTYPE_DEB"
 step "2/8 apt: dependencies, voxtype $VOXTYPE_VER, ydotool, libgtk4-layer-shell0${want_npu_driver:+, NPU driver}"
 # Remember what was NOT installed before the first run (never overwritten by later
 # runs), and whether ydotoold was enabled for all users, so uninstall.sh can restore it.
-if [ -d "$OLD_STATE_DIR" ] && [ ! -e "$STATE_DIR" ]; then
-    mv "$OLD_STATE_DIR" "$STATE_DIR"
-fi
+for old in $OLD_STATE_DIRS; do
+    if [ -d "$old" ] && [ ! -e "$STATE_DIR" ]; then
+        mv "$old" "$STATE_DIR"
+    fi
+done
 install -d -m 0755 "$STATE_DIR"
 if [ ! -e "$STATE_DIR/preexisting" ]; then
     {
@@ -311,7 +313,7 @@ step "6/8 /dev/uinput for the logged-in seat user (ydotoold sends the paste keys
 # (inject keystrokes).
 cat > "$UDEV_RULE" <<'EOF'
 # voxtype: let the active seat user's ydotoold create its virtual keyboard.
-# Installed by npu-voicenotes (system/install.sh), removed by system/uninstall.sh
+# Installed by BMeet (system/install.sh), removed by system/uninstall.sh
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 EOF
 udevadm control --reload-rules
@@ -323,7 +325,7 @@ step "7/8 ydotoold: keyboard only, started on demand by voxtype.service"
 install -d -m 0755 "$(dirname "$YDO_DROPIN")"
 cat > "$YDO_DROPIN" <<'EOF'
 # voxtype only needs key events (Ctrl+V); no virtual mouse.
-# Installed by npu-voicenotes (system/install.sh), removed by system/uninstall.sh
+# Installed by BMeet (system/install.sh), removed by system/uninstall.sh
 [Service]
 ExecStart=
 ExecStart=/usr/bin/ydotoold --mouse-off

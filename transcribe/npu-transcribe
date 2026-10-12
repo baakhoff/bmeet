@@ -37,7 +37,7 @@ Notes:
   * Exit status: 0 all files done, 1 some file failed, 2 usage error, 130 Ctrl+C.
   * Every finished file (done or failed) is appended as one JSON line to
     ~/.local/share/npu-transcribe/history.jsonl (env NPU_TRANSCRIBE_HISTORY),
-    which the Voice Notes app and panel widget list.
+    which the BMeet app and panel widget list.
 """
 from __future__ import annotations
 
@@ -451,8 +451,8 @@ def notify(ok: bool, body: list[str]) -> None:
 
 def record_history(src: Path, outputs: list[Path], model: str, language: str,
                    device: str, duration: float | None, ok: bool) -> None:
-    """Append one JSON line per finished file to HISTORY (read by the Voice Notes
-    app and voicenotes-ctl). Best effort: a failure here only logs a warning."""
+    """Append one JSON line per finished file to HISTORY (read by the BMeet
+    app and bmeet-ctl). Best effort: a failure here only logs a warning."""
     try:
         if duration is None:  # failed before/while decoding: ask ffprobe
             duration = probe_duration(src) if src.is_file() else None
@@ -507,7 +507,7 @@ def output_stem(out_dir: Path, src: Path, formats: list[str], overwrite: bool) -
 def resolve_model(value: str) -> Path:
     path = MODELS.get(value) or Path(value).expanduser()
     if not (path / "openvino_encoder_model.xml").is_file():
-        hint = " - install it with the npu-voicenotes installer (--with-turbo)" if value == "turbo" else ""
+        hint = " - install it with the BMeet installer (--with-turbo)" if value == "turbo" else ""
         raise SystemExit(f"{PROG}: model not found: {path} (expected an OpenVINO Whisper export){hint}")
     return path
 

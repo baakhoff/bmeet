@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# npu-voicenotes uninstaller. Removes the per-user parts, then (with sudo) the system part.
+# BMeet uninstaller. Removes the per-user parts, then (with sudo) the system part.
 #
-#   bash ~/.local/share/npu-voicenotes/src/uninstall.sh [--keep-system] [--purge]
+#   bash ~/.local/share/bmeet/src/uninstall.sh [--keep-system] [--purge]
 #
 #   --keep-system   leave voxtype, the OpenVINO GenAI SDK etc. installed (no sudo)
 #   --purge         also delete the Whisper models (~/.local/share/npu-models/whisper-*),
@@ -13,7 +13,7 @@ set -euo pipefail
 
 src="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
-root="$data/npu-voicenotes"
+root="$data/bmeet"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}"
 models="${NPU_MODELS_DIR:-$data/npu-models}"
 system=1 purge=
@@ -29,10 +29,10 @@ done
 
 say() { printf '\n==> %s\n' "$*"; }
 
-say "Voice Notes panel widget"
-bash "$src/voicenotes/plasmoid/install-user.sh" --uninstall || true
-say "Voice Notes app"
-bash "$src/voicenotes/app/install-user.sh" --uninstall || true
+say "BMeet panel widget"
+bash "$src/bmeet/plasmoid/install-user.sh" --uninstall || true
+say "BMeet app"
+bash "$src/bmeet/app/install-user.sh" --uninstall || true
 say "npu-transcribe"
 bash "$src/transcribe/install-user.sh" --uninstall || true
 say "voxtype (per-user)"
@@ -41,7 +41,7 @@ bash "$src/voxtype/user-setup.sh" --uninstall || true
 if [ -n "$purge" ]; then
     say "Models and caches"
     rm -rf "$models/whisper-small-int8-ov" "$models/whisper-large-v3-turbo-int8-ov" \
-           "$cache/npu-ov-cache" "$cache/npu-voicenotes"
+           "$cache/npu-ov-cache" "$cache/bmeet"
     rmdir "$models" 2>/dev/null || true
 fi
 

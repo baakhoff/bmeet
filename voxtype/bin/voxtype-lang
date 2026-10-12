@@ -4,14 +4,14 @@
 # switching = `voxtype config set openvino.language XX` + restart (~3 s, model blob is
 # cached). A running meeting or dictation is NOT interrupted - the script refuses then.
 #
-#   voxtype-lang            next language from ~/.config/npu-voicenotes/languages
+#   voxtype-lang            next language from ~/.config/bmeet/languages
 #                           (e.g. "en de"; bound to Meta+Shift+H)
 #   voxtype-lang de|en|...  set explicitly (any Whisper language code)
 #   voxtype-lang --show     print current language
 set -eu
 
 STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype/meeting_state"
-LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages"
+LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/languages"
 
 notify() { notify-send -a "Voxtype" -i preferences-desktop-locale "$1" "${2:-}" 2>/dev/null || true; }
 

@@ -19,12 +19,12 @@ npu-transcribe --help
   - `NAME.txt` (only with `--format …,txt`): the same paragraphs without markers.
 - **Existing files are never overwritten:** the outputs become `NAME.2.*`, `NAME.3.*` and so on, unless you pass `--overwrite`.
 - **Read-only input folders:** output goes to `~/Transcripts`.
-- **History:** every finished file is appended to `~/.local/share/npu-transcribe/history.jsonl`, which the Voice Notes app and the widget list.
+- **History:** every finished file is appended to `~/.local/share/npu-transcribe/history.jsonl`, which the BMeet app and the widget list.
 - **Exit status:** 0 all done, 1 some file failed, 2 usage error, 130 Ctrl+C.
 
 **Other ways to start it:**
 - **Dolphin:** right-click audio or video → **Transcribe (NPU)**. It runs in a Konsole window and sends a notification when done.
-- **Voice Notes app:** the **Transcribe a file** page has a queue and progress display.
+- **BMeet app:** the **Transcribe a file** page has a queue and progress display.
 
 ## Models
 
@@ -79,7 +79,7 @@ transcribe/tests/run-tests.sh /tmp/npt-work "NPU CPU"
 3. **OpenVINO telemetry is on by default:**
    - **What happens:** `import openvino` loads Intel's telemetry module. Without a consent file it counts as opted *in*, sends a Google Analytics event from a helper process and writes `~/intel/openvino_ga_cid`.
    - **What npu-transcribe does:** it makes the module unimportable (`sys.modules["openvino_telemetry"] = None`), and OpenVINO then falls back to its built-in no-op stub. The installer does the same for its one import check.
-   - **To opt out for every tool:** `~/.local/share/npu-voicenotes/venv/bin/opt_in_out --opt_out`.
+   - **To opt out for every tool:** `~/.local/share/bmeet/venv/bin/opt_in_out --opt_out`.
 4. **Whisper invents text for silence:** for example "Thank you." over trailing digital silence. Blocks and segments whose peak level is below -50 dBFS are skipped or dropped.
 5. **Audio that starts after the video:** without a fix, cues came out early by the gap. ffmpeg runs with `aresample=async=1:first_pts=0`, which pads the start (and any gaps) with silence.
 6. **File names with a colon**, such as `talk: part 1.ogg`, were read by ffmpeg as a protocol. Inputs are passed as `file:PATH`.

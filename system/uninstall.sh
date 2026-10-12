@@ -1,12 +1,12 @@
 #!/bin/bash
-# npu-voicenotes, undo the system part (root). Idempotent. The top-level uninstall.sh
+# BMeet, undo the system part (root). Idempotent. The top-level uninstall.sh
 # runs it with sudo after removing the per-user parts.
 #   sudo bash system/uninstall.sh
 #
 # Removes: the /usr/bin/voxtype diversion, the voxtype package, ydotool and
 # libgtk4-layer-shell0 (each only if system/install.sh added it and nothing else needs
 # it), the udev rule, the ydotool drop-in, the OpenVINO GenAI SDK under /opt/intel
-# (unless it was there before) and /var/lib/npu-voicenotes.
+# (unless it was there before) and /var/lib/bmeet.
 # Kept: general packages (ffmpeg, python3-pyqt6, ...) and Intel's NPU driver, which
 # other programs can use. Remove the driver with:
 #   sudo apt purge intel-level-zero-npu intel-driver-compiler-npu
@@ -21,8 +21,10 @@ SDK_DIR=/opt/intel/openvino_genai_ubuntu26_2026.4.1.0_x86_64
 SDK_LINK=/opt/intel/openvino_genai
 UDEV_RULE=/etc/udev/rules.d/70-voxtype-uinput.rules
 YDO_DROPIN=/etc/systemd/user/ydotool.service.d/10-voxtype.conf
-STATE_DIR=/var/lib/npu-voicenotes
-[ -e "$STATE_DIR" ] || [ ! -d /var/lib/voxtype-npu-setup ] || STATE_DIR=/var/lib/voxtype-npu-setup  # pre-release name
+STATE_DIR=/var/lib/bmeet
+for old in /var/lib/npu-voicenotes /var/lib/voxtype-npu-setup; do  # names used before 0.2.0
+    [ -e "$STATE_DIR" ] || [ ! -d "$old" ] || STATE_DIR=$old
+done
 
 step() { echo; echo "=== $* ==="; }
 # system/install.sh wrote $STATE_DIR/preexisting before its first apt run: "pkg <name>"

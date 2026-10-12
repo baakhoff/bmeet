@@ -5,11 +5,11 @@
         "Category": "Multimedia",
         "Description": "Dictation and meeting transcription on the Intel NPU (voxtype + npu-transcribe)",
         "Icon": "audio-input-microphone",
-        "Id": "io.github.baakhoff.voicenotes",
+        "Id": "io.github.baakhoff.bmeet",
         "License": "MIT",
-        "Name": "Voice Notes",
+        "Name": "BMeet",
         "Version": "0.1.0",
-        "Website": "https://github.com/baakhoff/npu-voicenotes"
+        "Website": "https://github.com/baakhoff/bmeet"
     },
     "X-Plasma-API-Minimum-Version": "6.0"
 }

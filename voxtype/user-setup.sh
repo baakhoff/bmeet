@@ -5,8 +5,8 @@
 #     bash voxtype/user-setup.sh --uninstall      (meeting transcripts are kept)
 # What it touches (all under your home, all undone by --uninstall):
 #   ~/.config/voxtype/config.toml            written if missing; a config not written by
-#                                            npu-voicenotes is kept as config.toml.bak-<time>
-#   ~/.config/npu-voicenotes/languages       dictation languages for Meta+Shift+H
+#                                            BMeet is kept as config.toml.bak-<time>
+#   ~/.config/bmeet/languages       dictation languages for Meta+Shift+H
 #   ~/.local/bin/voxtype-meeting-toggle, voxtype-lang
 #   ~/.local/share/applications/voxtype-*.desktop  (+ links in ~/.local/share/kglobalaccel/)
 #   ~/.local/share/voxtype/models/gtcrn_simple.onnx (meeting echo cancel, sha256-pinned)
@@ -15,16 +15,16 @@
 #   ~/.config/systemd/user/voxtype.service.d/10-npu-setup.conf  (log level, software OSD)
 #   systemd user unit voxtype.service enabled + started
 # Env: NPU_MODELS_DIR (default ~/.local/share/npu-models),
-#      NPU_VOICENOTES_LANGUAGES (e.g. "en de"; written to the languages file).
+#      BMEET_LANGUAGES (e.g. "en de"; written to the languages file).
 set -eu
 
 [ "$(id -u)" -ne 0 ] || { echo "Run this as your normal user, not as root."; exit 1; }
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/voxtype"
-LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages"
+LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/languages"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/npu-voicenotes/downloads"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/bmeet/downloads"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$DATA_DIR/applications"
 KGA_DIR="$DATA_DIR/kglobalaccel"
@@ -36,7 +36,9 @@ SDK_LIB=/opt/intel/openvino_genai/runtime/lib/intel64/libopenvino_genai_c.so
 GTCRN_URL=https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx
 GTCRN_SHA256=e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534
 NPU_BUSY=/sys/class/accel/accel0/device/npu_busy_time_us
-CONFIG_MARKER="# npu-voicenotes:"
+CONFIG_MARKER="# BMeet:"
+OLD_CONFIG_MARKER="# npu-voicenotes:"   # before 0.2.0 (BMeet was called npu-voicenotes)
+OLD_LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages"
 DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voxtype.service.d"
 DROPIN="$DROPIN_DIR/10-npu-setup.conf"
 APPS="voxtype-dictate voxtype-meeting voxtype-lang"
@@ -76,7 +78,8 @@ uninstall() {
     rmdir "$KGA_DIR" 2>/dev/null || true
     refresh_kde
     # Our config: kept if you changed it (renamed, so voxtype starts clean next time).
-    if [ -f "$CONF_DIR/config.toml" ] && head -n1 "$CONF_DIR/config.toml" | grep -qF "$CONFIG_MARKER"; then
+    if [ -f "$CONF_DIR/config.toml" ] \
+       && head -n1 "$CONF_DIR/config.toml" | grep -qF -e "$CONFIG_MARKER" -e "$OLD_CONFIG_MARKER"; then
         mv "$CONF_DIR/config.toml" "$CONF_DIR/config.toml.uninstalled-$(date +%Y%m%d-%H%M%S)"
         echo "  your voxtype config was kept as $CONF_DIR/config.toml.uninstalled-*"
     fi
@@ -119,8 +122,12 @@ voxtype --version
 
 step "2/8 dictation languages -> $LANG_FILE"
 mkdir -p "$(dirname "$LANG_FILE")"
-if [ -n "${NPU_VOICENOTES_LANGUAGES:-}" ]; then
-    langs="$(printf '%s\n' "$NPU_VOICENOTES_LANGUAGES" | tr 'A-Z,' 'a-z ' | xargs -n1 \
+if [ ! -e "$LANG_FILE" ] && [ -f "$OLD_LANG_FILE" ]; then
+    mv "$OLD_LANG_FILE" "$LANG_FILE"
+    rmdir "$(dirname "$OLD_LANG_FILE")" 2>/dev/null || true
+fi
+if [ -n "${BMEET_LANGUAGES:-}" ]; then
+    langs="$(printf '%s\n' "$BMEET_LANGUAGES" | tr 'A-Z,' 'a-z ' | xargs -n1 \
              | grep -xE '[a-z]{2,3}' | awk '!seen[$0]++' | xargs || true)"
     [ -n "$langs" ] || fail "--languages: expected Whisper language codes like \"en de\""
     echo "$langs" > "$LANG_FILE"
@@ -143,8 +150,9 @@ new="$(mktemp)"
 trap 'rm -f "$new"' EXIT
 render_config "${first_lang:-en}" > "$new"
 if [ -f "$CONF_DIR/config.toml" ] && [ -z "$reset_config" ] \
-   && head -n1 "$CONF_DIR/config.toml" | grep -qF "$CONFIG_MARKER"; then
-    echo "  keeping your npu-voicenotes config (--reset-config to replace it)"
+   && head -n1 "$CONF_DIR/config.toml" | grep -qF -e "$CONFIG_MARKER" -e "$OLD_CONFIG_MARKER"; then
+    sed -i "1s|^$OLD_CONFIG_MARKER|$CONFIG_MARKER|" "$CONF_DIR/config.toml"
+    echo "  keeping your BMeet config (--reset-config to replace it)"
     # ... but make sure it points at a model that exists (e.g. after NPU_MODELS_DIR moved).
     if [ ! -f "$(voxtype config get openvino.model 2>/dev/null)/openvino_encoder_model.xml" ]; then
         voxtype config set openvino.model "$MODEL" >/dev/null
@@ -230,7 +238,7 @@ rm -f "$DROPIN_DIR/10-log-warn.conf"   # older name of this drop-in
 #   line to GDK_DISABLE=dmabuf and run
 #   `systemctl --user daemon-reload && systemctl --user restart voxtype`.
 cat > "$DROPIN" <<'EOF'
-# Installed by npu-voicenotes (voxtype/user-setup.sh), removed by its uninstall.sh
+# Installed by BMeet (voxtype/user-setup.sh), removed by its uninstall.sh
 [Service]
 Environment=RUST_LOG=voxtype=warn,warn
 Environment=GSK_RENDERER=cairo GDK_DISABLE=gl,vulkan,dmabuf

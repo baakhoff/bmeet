@@ -57,12 +57,12 @@ else
     ok "no NPU->GPU/CPU fallback logged by the daemon this boot"
 fi
 
-echo "== npu-transcribe and Voice Notes"
+echo "== npu-transcribe and BMeet"
 v=$("$HOME/.local/bin/npu-transcribe" --version 2>/dev/null) && ok "$v" || bad "npu-transcribe missing or broken (~/.local/bin/npu-transcribe)"
-v=$("$HOME/.local/bin/voicenotes-ctl" version 2>/dev/null) && ok "$v" || bad "voicenotes-ctl missing (~/.local/bin/voicenotes-ctl)"
-[ -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/voicenotes.desktop" ] && ok "Voice Notes app in the menu" || bad "voicenotes.desktop missing"
-kpackagetool6 -t Plasma/Applet -s io.github.baakhoff.voicenotes >/dev/null 2>&1 \
-    && ok "panel widget installed (io.github.baakhoff.voicenotes)" || bad "panel widget not installed"
+v=$("$HOME/.local/bin/bmeet-ctl" version 2>/dev/null) && ok "$v" || bad "bmeet-ctl missing (~/.local/bin/bmeet-ctl)"
+[ -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/bmeet.desktop" ] && ok "BMeet app in the menu" || bad "bmeet.desktop missing"
+kpackagetool6 -t Plasma/Applet -s io.github.baakhoff.bmeet >/dev/null 2>&1 \
+    && ok "panel widget installed (io.github.baakhoff.bmeet)" || bad "panel widget not installed"
 for m in whisper-small-int8-ov whisper-large-v3-turbo-int8-ov; do
     d="${NPU_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-models}/$m"
     [ -f "$d/openvino_encoder_model.xml" ] && ok "model $m" || info "model $m not installed"
@@ -86,5 +86,5 @@ delta=$(( (after - before) / 1000 ))
 printf '%s\n' "$out" | grep -E "fell back|ERROR|Error" | cut -c1-200 | sed 's/^/         /'
 
 echo
-[ "$FAILED" -eq 0 ] && echo "All checks passed." || echo "Some checks failed - see https://github.com/baakhoff/npu-voicenotes/blob/main/docs/troubleshooting.md"
+[ "$FAILED" -eq 0 ] && echo "All checks passed." || echo "Some checks failed - see https://github.com/baakhoff/bmeet/blob/main/docs/troubleshooting.md"
 exit "$FAILED"

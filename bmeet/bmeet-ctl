@@ -1,24 +1,24 @@
 #!/usr/bin/python3 -I
-"""voicenotes-ctl - one JSON interface to voxtype + npu-transcribe for the Voice Notes
+"""bmeet-ctl - one JSON interface to voxtype + npu-transcribe for the BMeet
 panel widget and app. Stdlib only, runs on the system python3.
 
-  voicenotes-ctl status                     JSON: dictation/meeting state, language, ...
-  voicenotes-ctl recent [--limit N]         JSON list: meetings + transcribed files, newest first
-  voicenotes-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only)
-  voicenotes-ctl cancel                     cancel the current dictation
-  voicenotes-ctl lang [toggle|en|de|...]    switch dictation language (restarts the daemon)
-  voicenotes-ctl meeting start|stop|toggle|pause|resume
-  voicenotes-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
-  voicenotes-ctl version
+  bmeet-ctl status                     JSON: dictation/meeting state, language, ...
+  bmeet-ctl recent [--limit N]         JSON list: meetings + transcribed files, newest first
+  bmeet-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only)
+  bmeet-ctl cancel                     cancel the current dictation
+  bmeet-ctl lang [toggle|en|de|...]    switch dictation language (restarts the daemon)
+  bmeet-ctl meeting start|stop|toggle|pause|resume
+  bmeet-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
+  bmeet-ctl version
 
 Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid},
-~/.config/voxtype/config.toml, ~/.config/npu-voicenotes/languages (the languages
+~/.config/voxtype/config.toml, ~/.config/bmeet/languages (the languages
 `lang toggle` cycles through, e.g. "en de"), ~/.local/share/voxtype/meetings/index.db,
 ~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
 Actions that can take long (meeting stop waits for the last chunk) run detached.
 
-Path overrides for testing (env): VOICENOTES_RUN_DIR, VOICENOTES_MEETING_DB,
-VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, VOICENOTES_APP.
+Path overrides for testing (env): BMEET_RUN_DIR, BMEET_MEETING_DB,
+VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP.
 """
 import json
 import os
@@ -32,20 +32,20 @@ from pathlib import Path
 __version__ = "0.1.0"
 
 HOME = Path.home()
-RUN = Path(os.environ.get("VOICENOTES_RUN_DIR")
+RUN = Path(os.environ.get("BMEET_RUN_DIR")
            or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
 CONFIG = XDG_CONFIG / "voxtype/config.toml"
-LANGUAGES_FILE = XDG_CONFIG / "npu-voicenotes/languages"
+LANGUAGES_FILE = XDG_CONFIG / "bmeet/languages"
 LANG_CODE = re.compile(r"^[a-z]{2,3}$")  # Whisper language codes ("en", "haw", ...)
-MEETING_DB = Path(os.environ.get("VOICENOTES_MEETING_DB")
+MEETING_DB = Path(os.environ.get("BMEET_MEETING_DB")
                   or HOME / ".local/share/voxtype/meetings/index.db")
 MEETING_MD_DIR = Path(os.environ.get("VOXTYPE_MEETING_DIR", HOME / "Documents/Meetings"))
 FILE_HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
                     or HOME / ".local/share/npu-transcribe/history.jsonl")
 BIN = HOME / ".local/bin"
-APP = Path(os.environ.get("VOICENOTES_APP")
-           or Path(__file__).resolve().parent / "app" / "voicenotes")
+APP = Path(os.environ.get("BMEET_APP")
+           or Path(__file__).resolve().parent / "app" / "bmeet")
 
 
 def read_first_line(path: Path, default: str = "") -> str:
@@ -188,7 +188,7 @@ def main(argv: list[str]) -> int:
     elif cmd == "lang":
         target = (args[:1] or ["toggle"])[0].lower()
         if target != "toggle" and not LANG_CODE.match(target):
-            print(f"voicenotes-ctl: not a language code: {target!r}", file=sys.stderr)
+            print(f"bmeet-ctl: not a language code: {target!r}", file=sys.stderr)
             return 2
         detached(str(BIN / "voxtype-lang"), target)
     elif cmd == "meeting":
@@ -198,12 +198,12 @@ def main(argv: list[str]) -> int:
         elif action in ("pause", "resume"):
             return subprocess.call(["voxtype", "meeting", action])
         else:
-            print("usage: voicenotes-ctl meeting start|stop|toggle|pause|resume", file=sys.stderr)
+            print("usage: bmeet-ctl meeting start|stop|toggle|pause|resume", file=sys.stderr)
             return 2
     elif cmd == "open":
         detached(str(APP), *args)
     elif cmd in ("version", "--version"):
-        print(f"voicenotes-ctl {__version__}")
+        print(f"bmeet-ctl {__version__}")
     else:
         print(__doc__, file=sys.stderr)
         return 2

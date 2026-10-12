@@ -1,14 +1,14 @@
-# npu-voicenotes
+# BMeet
 
 Voice typing, meeting transcripts and file transcription for **KDE Plasma 6**. Whisper
 runs locally on the **Intel NPU** of Core Ultra laptops. It's fast, it stays on your
 machine, and the CPU and GPU are left alone.
 
-[![CI](https://github.com/baakhoff/npu-voicenotes/actions/workflows/ci.yml/badge.svg)](https://github.com/baakhoff/npu-voicenotes/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/baakhoff/npu-voicenotes)](https://github.com/baakhoff/npu-voicenotes/releases)
+[![CI](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml/badge.svg)](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/baakhoff/bmeet)](https://github.com/baakhoff/bmeet/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-![Voice Notes app](docs/screenshot.png)
+![BMeet app](docs/screenshot.png)
 
 ## What you get
 
@@ -22,7 +22,7 @@ machine, and the CPU and GPU are left alone.
 - **File transcription:**
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - Whisper large-v3-turbo runs at ~25x realtime on the NPU.
-- **Voice Notes app:**
+- **BMeet app:**
   - Meeting history, transcribed files and a transcription queue, with search.
   - Export, copy and delete transcripts.
 - **Panel widget:** a microphone icon that shows what is happening (ready, listening, transcribing, recording). Click it for dictation, meeting and language controls and your recent transcripts.
@@ -30,7 +30,7 @@ machine, and the CPU and GPU are left alone.
 
 It builds on [voxtype](https://github.com/peteonrails/voxtype) (dictation and meetings) and
 [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai) (Whisper on the NPU).
-npu-voicenotes adds:
+BMeet adds:
 - the NPU setup,
 - the KDE integration,
 - the file transcriber,
@@ -49,7 +49,7 @@ npu-voicenotes adds:
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
 ```
 
 The installer asks for your sudo password once. It then:
@@ -62,13 +62,13 @@ The installer asks for your sudo password once. It then:
 4. **Adds the KDE integration:**
    - the keyboard shortcuts and the `voxtype` user service,
    - the Dolphin menu,
-   - the Voice Notes app,
+   - the BMeet app,
    - the panel widget, added to the bottom panel.
 
 To pass options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/install.sh | bash -s -- --languages "en de"
+curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash -s -- --languages "en de"
 ```
 
 | Option | |
@@ -80,7 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/instal
 | `--skip-system` | skip the sudo part (it must have run before) |
 | `--reset-config` | replace your voxtype config with the default |
 
-**From a checkout:** run `git clone https://github.com/baakhoff/npu-voicenotes && cd npu-voicenotes && ./install.sh`.
+**From a checkout:** run `git clone https://github.com/baakhoff/bmeet && cd bmeet && ./install.sh`.
 
 **Upgrading:** run the same command again. The installer is idempotent and keeps your settings.
 
@@ -93,13 +93,13 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/npu-voicenotes/main/instal
 | **Meta+Alt+M** | start or stop a meeting transcript |
 | **Meta+Shift+H** | next dictation language (restarts the engine, ~3 s) |
 | Panel widget | click for controls; middle-click starts or stops a meeting |
-| **Voice Notes** (app menu) | meetings, transcribed files, *Transcribe a file* |
-| Dolphin | right-click audio or video → *Transcribe (NPU)*, or *Open With → Voice Notes* |
+| **BMeet** (app menu) | meetings, transcribed files, *Transcribe a file* |
+| Dolphin | right-click audio or video → *Transcribe (NPU)*, or *Open With → BMeet* |
 
 ```bash
 npu-transcribe interview.m4a                  # interview.srt + interview.md
 npu-transcribe --language de --translate a.ogg  # German speech -> English text
-voicenotes-ctl status                         # JSON state (what the widget shows)
+bmeet-ctl status                         # JSON state (what the widget shows)
 voxtype meeting list                          # all meetings
 ```
 
@@ -107,7 +107,7 @@ voxtype meeting list                          # all meetings
 
 ## Configure
 
-- **Dictation languages:** `~/.config/npu-voicenotes/languages`, for example `en de fr`.
+- **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.
 
@@ -121,7 +121,7 @@ voxtype meeting list                          # all meetings
 ## Uninstall
 
 ```bash
-bash ~/.local/share/npu-voicenotes/src/uninstall.sh
+bash ~/.local/share/bmeet/src/uninstall.sh
 ```
 
 - **What it removes:** everything the installer added, including the packages it installed, unless they were there before.
@@ -131,8 +131,8 @@ bash ~/.local/share/npu-voicenotes/src/uninstall.sh
 
 ```
  Meta+H / Meta+Alt+M ─┐
- panel widget (QML) ──┼─> voicenotes-ctl ──> voxtype daemon ──> OpenVINO GenAI ──> NPU
- Voice Notes (PyQt6) ─┘        (JSON)        (systemd --user)    (C SDK, /opt/intel)
+ panel widget (QML) ──┼─> bmeet-ctl ──> voxtype daemon ──> OpenVINO GenAI ──> NPU
+ BMeet (PyQt6) ─┘        (JSON)        (systemd --user)    (C SDK, /opt/intel)
          │
          └──────────────> npu-transcribe ──> OpenVINO GenAI (Python venv) ──> NPU, CPU fallback
                           (+ Dolphin menu)
@@ -144,15 +144,15 @@ bash ~/.local/share/npu-voicenotes/src/uninstall.sh
 | [`system/`](system) | the sudo part: packages, NPU driver, voxtype binary, OpenVINO SDK, uinput |
 | [`voxtype/`](voxtype) | voxtype config, shortcuts, meeting and language helpers, `verify.sh` |
 | [`transcribe/`](transcribe) | `npu-transcribe` and its tests |
-| [`voicenotes/`](voicenotes) | `voicenotes-ctl`, the Voice Notes app and the Plasma widget |
+| [`bmeet/`](bmeet) | `bmeet-ctl`, the BMeet app and the Plasma widget |
 | [`docs/`](docs) | design notes, benchmarks, troubleshooting |
 
 ## Development
 
 ```bash
-voicenotes/app/tests/run-tests.sh --quick     # app + voicenotes-ctl, offscreen, no NPU needed
-voicenotes/app/tests/run-tests.sh             # + real Whisper runs on the NPU
-voicenotes/plasmoid/tests/check_qml.py --strict voicenotes/plasmoid/*/contents/ui/*.qml
+bmeet/app/tests/run-tests.sh --quick     # app + bmeet-ctl, offscreen, no NPU needed
+bmeet/app/tests/run-tests.sh             # + real Whisper runs on the NPU
+bmeet/plasmoid/tests/check_qml.py --strict bmeet/plasmoid/*/contents/ui/*.qml
 transcribe/tests/run-tests.sh /tmp/npt "NPU CPU"   # npu-transcribe benchmark / regression
 bash voxtype/verify.sh                        # health check of an installed system
 ```

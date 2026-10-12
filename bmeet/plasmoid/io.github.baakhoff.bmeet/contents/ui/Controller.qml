@@ -1,8 +1,8 @@
 import QtQuick
 import org.kde.plasma.plasma5support as P5Support
 
-// State and backend calls of the Voice Notes widget. Everything goes through
-// voicenotes-ctl (JSON on stdout). Kept free of Plasmoid.* so both representations
+// State and backend calls of the BMeet widget. Everything goes through
+// bmeet-ctl (JSON on stdout). Kept free of Plasmoid.* so both representations
 // can also be loaded outside plasmashell for testing: main.qml feeds in
 // expanded/horizontal/vertical/inTray and listens to expandRequested().
 Item {
@@ -16,12 +16,12 @@ Item {
     property bool inTray: false
     property bool polling: true      // false = no backend calls at all (tests inject state)
     // Runs via /bin/sh -c, so $HOME is expanded by the shell. The installer links
-    // voicenotes-ctl here; ~/.local/bin is not always in plasmashell's PATH.
-    property string ctl: '"$HOME/.local/bin/voicenotes-ctl"'
+    // bmeet-ctl here; ~/.local/bin is not always in plasmashell's PATH.
+    property string ctl: '"$HOME/.local/bin/bmeet-ctl"'
 
     signal expandRequested(bool expand)
 
-    // ---- backend state (voicenotes-ctl status) ------------------------------
+    // ---- backend state (bmeet-ctl status) ------------------------------
     property bool haveStatus: false
     property string daemon: ""
     property string dictation: "off"
@@ -35,7 +35,7 @@ Item {
     property string device: ""
     property string statusError: ""
 
-    // ---- voicenotes-ctl recent ----------------------------------------------
+    // ---- bmeet-ctl recent ----------------------------------------------
     property var recentItems: []
     property bool recentLoaded: false
     property string recentError: ""
@@ -174,7 +174,7 @@ Item {
     // shell comment (the engine runs the string with /bin/sh -c).
     function run(args, cb) {
         if (!vn.polling) {
-            console.log("voicenotes: not running (polling off):", args);
+            console.log("bmeet: not running (polling off):", args);
             return;
         }
         vn.seq += 1;
@@ -222,7 +222,7 @@ Item {
                 // warning icon; two in a row, or no status yet, is.
                 vn.statusFailures += 1;
                 if (vn.statusFailures >= 2 || !vn.haveStatus)
-                    vn.statusError = "voicenotes-ctl status: " + problem;
+                    vn.statusError = "bmeet-ctl status: " + problem;
                 return;
             }
             vn.statusFailures = 0;
@@ -389,7 +389,7 @@ Item {
     }
 
     function openApp(args) {
-        vn.act("open" + (args ? " " + args : ""), "Opening Voice Notes", ok => {
+        vn.act("open" + (args ? " " + args : ""), "Opening BMeet", ok => {
             if (ok)
                 vn.expandRequested(false);
         });

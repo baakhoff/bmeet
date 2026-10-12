@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .work/
-voicenotes/app/tests/.work/
+bmeet/app/tests/.work/
 *.part
 /dl/
 .venv/

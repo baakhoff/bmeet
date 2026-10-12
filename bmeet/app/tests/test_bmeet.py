@@ -1,18 +1,18 @@
 #!/usr/bin/python3 -I
-"""Offscreen tests for the Voice Notes app: data functions, every page of the window,
+"""Offscreen tests for the BMeet app: data functions, every page of the window,
 single-instance forwarding and (REAL_TRANSCRIBE=1) the npu-transcribe history change.
 
 Safety: works on a TEMPORARY meetings DB with voxtype 1.1.0's schema and synthetic
 rows (voxtype's real index.db is never opened); voxtype is replaced
 by tests/fake-voxtype (export/delete on that copy only) and npu-transcribe by
 tests/fake-npu-transcribe for the GUI flow; state files, history.jsonl, settings
-and the Trash all live in the work dir. VOICENOTES_DRY_RUN=1 keeps the app from
+and the Trash all live in the work dir. BMEET_DRY_RUN=1 keeps the app from
 recording, starting meetings, switching language or opening files on the desktop.
 Speech for the real run is synthesised with the espeak-ng library
 (transcribe/tests/make_speech.py).
 
-Run: tests/run-tests.sh [--quick]     (or: tests/test_voicenotes.py -v)
-Env: VOICENOTES_TEST_WORK (default tests/.work; must be on the home filesystem so
+Run: tests/run-tests.sh [--quick]     (or: tests/test_bmeet.py -v)
+Env: BMEET_TEST_WORK (default tests/.work; must be on the home filesystem so
 the Trash tests use $XDG_DATA_HOME/Trash), REAL_TRANSCRIBE=1, KEEP_WORK=1,
 NPU_PYTHON (Python with openvino-genai for the real runs; default: the installer's venv).
 """
@@ -36,14 +36,14 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
-APP_PATH = HERE.parent / "voicenotes"
-CTL_PATH = HERE.parent.parent / "voicenotes-ctl"
+APP_PATH = HERE.parent / "bmeet"
+CTL_PATH = HERE.parent.parent / "bmeet-ctl"
 REPO = HERE.parents[2]
 NPU_TRANSCRIBE = REPO / "transcribe/npu-transcribe"
 MAKE_SPEECH = REPO / "transcribe/tests/make_speech.py"
 NPU_PYTHON = os.environ.get("NPU_PYTHON") or str(
-    Path.home() / ".local/share/npu-voicenotes/venv/bin/python")
-WORK = Path(os.environ.get("VOICENOTES_TEST_WORK") or HERE / ".work").resolve()
+    Path.home() / ".local/share/bmeet/venv/bin/python")
+WORK = Path(os.environ.get("BMEET_TEST_WORK") or HERE / ".work").resolve()
 REAL = bool(os.environ.get("REAL_TRANSCRIBE"))
 # voxtype 1.1.0's meetings index (sqlite3 index.db .schema)
 MEETINGS_SCHEMA = """
@@ -95,13 +95,13 @@ def make_fixture() -> dict:
     db = WORK / "index.db"
     dst = sqlite3.connect(db)
     dst.executescript(MEETINGS_SCHEMA)
-    # dictation config the app reads through voicenotes-ctl (under the test XDG_CONFIG_HOME)
+    # dictation config the app reads through bmeet-ctl (under the test XDG_CONFIG_HOME)
     (WORK / "config/voxtype").mkdir()
     (WORK / "config/voxtype/config.toml").write_text(
         'engine = "openvino"\n\n[openvino]\nmodel = "/x/whisper-small-int8-ov"\n'
         'device = "NPU"\nlanguage = "en"\n')
-    (WORK / "config/npu-voicenotes").mkdir()
-    (WORK / "config/npu-voicenotes/languages").write_text("en de\n")
+    (WORK / "config/bmeet").mkdir()
+    (WORK / "config/bmeet/languages").write_text("en de\n")
     ids = {k: str(uuid.uuid4()) for k in "ABCD"}
     t = {"A": epoch(2026, 10, 1, 10, 0, 5), "B": epoch(2026, 10, 2, 14, 30, 58),
          "C": epoch(2026, 10, 3, 9, 15, 0), "D": int(time.time()) - 125}
@@ -164,28 +164,28 @@ ENV = {
     "QT_QPA_PLATFORM": "offscreen",
     "XDG_CONFIG_HOME": str(WORK / "config"),
     "XDG_DATA_HOME": str(WORK / "data"),
-    "VOICENOTES_MEETING_DB": str(WORK / "index.db"),
+    "BMEET_MEETING_DB": str(WORK / "index.db"),
     "VOXTYPE_MEETING_DIR": str(WORK / "Meetings"),
     "NPU_TRANSCRIBE_HISTORY": str(WORK / "history.jsonl"),
-    "VOICENOTES_RUN_DIR": str(WORK / "run"),
-    "VOICENOTES_VOXTYPE": str(HERE / "fake-voxtype"),
-    "VOICENOTES_TRANSCRIBE": str(HERE / "fake-npu-transcribe"),
+    "BMEET_RUN_DIR": str(WORK / "run"),
+    "BMEET_VOXTYPE": str(HERE / "fake-voxtype"),
+    "BMEET_TRANSCRIBE": str(HERE / "fake-npu-transcribe"),
     "FAKE_VOXTYPE_DB": str(WORK / "index.db"),
     "FAKE_VOXTYPE_LOG": str(WORK / "voxtype-calls.log"),
-    "VOICENOTES_DRY_RUN": "1",
-    "VOICENOTES_SOCKET": str(WORK / "voicenotes.sock"),
+    "BMEET_DRY_RUN": "1",
+    "BMEET_SOCKET": str(WORK / "bmeet.sock"),
 }
 os.environ.update(ENV)
 os.environ.pop("XDG_ACTIVATION_TOKEN", None)
 
-_loader = importlib.machinery.SourceFileLoader("voicenotes_app", str(APP_PATH))
+_loader = importlib.machinery.SourceFileLoader("bmeet_app", str(APP_PATH))
 _spec = importlib.util.spec_from_loader(_loader.name, _loader)
 vn = importlib.util.module_from_spec(_spec)
 sys.modules[_loader.name] = vn  # dataclasses look the module up
 _loader.exec_module(vn)
 QApplication = vn.QApplication
-app = QApplication.instance() or QApplication(["voicenotes-test"])
-vn.QGuiApplication.setDesktopFileName("voicenotes")
+app = QApplication.instance() or QApplication(["bmeet-test"])
+vn.QGuiApplication.setDesktopFileName("bmeet")
 
 
 def wait_until(cond, timeout: float = 10.0) -> bool:
@@ -219,7 +219,7 @@ class A_DataTests(unittest.TestCase):
         self.assertEqual(vn.MEETING_MD_DIR, WORK / "Meetings")
         self.assertEqual(vn.FILE_HISTORY, WORK / "history.jsonl")
         self.assertEqual(vn.RUN_DIR, WORK / "run")
-        self.assertFalse((CTL_PATH.parent / "__pycache__" / "voicenotes-ctl.cpython-314.pyc").exists())
+        self.assertFalse((CTL_PATH.parent / "__pycache__" / "bmeet-ctl.cpython-314.pyc").exists())
 
     def test_format_helpers(self):
         self.assertEqual(vn.fmt_duration(None), "–")
@@ -802,7 +802,7 @@ class B_WindowTests(unittest.TestCase):
         w.set_page("files")
         w.transcribe_page.log_toggle.setChecked(True)
         w.save_settings()
-        conf = WORK / "config/voicenotes/voicenotes.conf"
+        conf = WORK / "config/bmeet/bmeet.conf"
         self.assertTrue(conf.exists())
         self.assertIn("page=files", conf.read_text())
         w2 = vn.MainWindow()
@@ -837,7 +837,7 @@ class LogReader:
 
 
 class C_SingleInstanceTests(unittest.TestCase):
-    env = dict(os.environ, VOICENOTES_DEBUG="1", VOICENOTES_SOCKET=str(WORK / "si.sock"))
+    env = dict(os.environ, BMEET_DEBUG="1", BMEET_SOCKET=str(WORK / "si.sock"))
 
     def launch(self, *args, cwd=None) -> tuple[subprocess.Popen, LogReader]:
         p = subprocess.Popen([sys.executable, "-I", str(APP_PATH), *args], env=self.env, cwd=cwd,
@@ -862,7 +862,7 @@ class C_SingleInstanceTests(unittest.TestCase):
         ids = FIX["ids"]
         p1, log1 = self.launch("files")
         try:
-            self.assertTrue(log1.wait_for("voicenotes: ready"), log1.lines)
+            self.assertTrue(log1.wait_for("bmeet: ready"), log1.lines)
             self.assertTrue(any('"page": "files"' in x for x in log1.lines))
             t0 = time.monotonic()
             r = self.second("meetings", "--id", ids["B"])
@@ -875,13 +875,13 @@ class C_SingleInstanceTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(log1.wait_for(json.dumps(FIX["files"]["clip.ogg"])), log1.lines)
             self.assertTrue(log1.wait_for("message: Added 1 file"), log1.lines)
-            # voicenotes-ctl open (as the panel widget calls it) reaches the same window; the
+            # bmeet-ctl open (as the panel widget calls it) reaches the same window; the
             # app runs with this test's Python (CI has PyQt6 only there, not in /usr/bin/python3)
-            app = WORK / "voicenotes-app"
+            app = WORK / "bmeet-app"
             app.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{APP_PATH}" "$@"\n')
             app.chmod(0o755)
             r = subprocess.run([str(CTL_PATH), "open", "transcribe", "--file", FIX["files"]["a.ogg"]],
-                               env=dict(self.env, VOICENOTES_APP=str(app)), capture_output=True,
+                               env=dict(self.env, BMEET_APP=str(app)), capture_output=True,
                                text=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(log1.wait_for(f'"page": "transcribe", "id": null, "files": ["{FIX["files"]["a.ogg"]}"]'),
@@ -893,13 +893,13 @@ class C_SingleInstanceTests(unittest.TestCase):
 
     def test_stale_socket_and_race(self):
         p1, log1 = self.launch()
-        self.assertTrue(log1.wait_for("voicenotes: ready"), log1.lines)
+        self.assertTrue(log1.wait_for("bmeet: ready"), log1.lines)
         p1.kill()  # crash: the socket file stays behind
         self.stop(p1)
-        self.assertTrue(Path(self.env["VOICENOTES_SOCKET"]).exists())
+        self.assertTrue(Path(self.env["BMEET_SOCKET"]).exists())
         p2, log2 = self.launch("meetings")
         try:
-            self.assertTrue(log2.wait_for("voicenotes: ready"), log2.lines)
+            self.assertTrue(log2.wait_for("bmeet: ready"), log2.lines)
         finally:
             self.assertEqual(self.stop(p2), 0)
         # two launches at the same time: exactly one window
@@ -913,7 +913,7 @@ class C_SingleInstanceTests(unittest.TestCase):
             self.assertEqual(len(exited), 1, (loga.lines, logb.lines))
             self.assertEqual(exited[0].returncode, 0)
             winner, winlog = (pb, logb) if exited[0] is pa else (pa, loga)
-            self.assertTrue(winlog.wait_for("voicenotes: ready"))
+            self.assertTrue(winlog.wait_for("bmeet: ready"))
             loser_log = loga if exited[0] is pa else logb
             self.assertTrue(loser_log.wait_for("forwarded"), loser_log.lines)
         finally:

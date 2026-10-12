@@ -1,14 +1,15 @@
 #!/bin/bash
-# Voice Notes panel widget (io.github.baakhoff.voicenotes) for the current user - no sudo.
+# BMeet panel widget (io.github.baakhoff.bmeet) for the current user - no sudo.
 #   install-user.sh                  install, or upgrade if already installed (idempotent)
 #   install-user.sh --add-to-panel   also put it on the bottom panel - only when it is newly
 #                                    installed (an upgrade never re-adds a removed widget)
 #   install-user.sh --uninstall      remove it again (and from every panel)
 # Installs into ~/.local/share/plasma/plasmoids/. Without --add-to-panel: right-click the
-# panel > Add or Manage Widgets > "Voice Notes".
+# panel > Add or Manage Widgets > "BMeet".
 set -eu
 
-ID=io.github.baakhoff.voicenotes
+ID=io.github.baakhoff.bmeet
+OLD_ID=io.github.baakhoff.voicenotes   # the same widget before 0.2.0 (BMeet was npu-voicenotes)
 D=$(dirname "$(readlink -f "$0")")
 PKG="$D/$ID"
 KPT=(kpackagetool6 -t Plasma/Applet)
@@ -46,6 +47,31 @@ add_to_panel() {
     " || true
 }
 
+replace_old_widget() {
+    # Put the new widget where the old one was (same panel; same place in its AppletOrder,
+    # which Plasma applies on its next start), remove the old one, uninstall its package.
+    "${KPT[@]}" -s "$OLD_ID" >/dev/null 2>&1 || return 0
+    echo "Replacing the old $OLD_ID widget"
+    shell_script "
+        var ps = panels(), n = 0;
+        for (var i = 0; i < ps.length; ++i) {
+            var p = ps[i], olds = p.widgets('$OLD_ID');
+            if (olds.length === 0) continue;
+            p.currentConfigGroup = ['General'];
+            var before = String(p.readConfig('AppletOrder', '')).split(';');
+            var at = before.indexOf(String(olds[0].id));
+            var w = p.widgets('$ID').length ? p.widgets('$ID')[0] : p.addWidget('$ID');
+            for (var j = 0; j < olds.length; ++j) olds[j].remove();
+            var ids = String(p.readConfig('AppletOrder', '')).split(';').filter(function (x) {
+                return x !== '' && x !== String(w.id) && x !== String(olds[0].id); });
+            if (at >= 0) { ids.splice(Math.min(at, ids.length), 0, String(w.id)); p.writeConfig('AppletOrder', ids.join(';')); }
+            ++n;
+        }
+        print('replaced on ' + n + ' panel(s)');
+    " || true
+    "${KPT[@]}" -r "$OLD_ID" >/dev/null 2>&1 || true
+}
+
 remove_from_panels() {
     shell_script "
         var ps = panels(), n = 0;
@@ -70,10 +96,11 @@ case "${1:-}" in
             fresh=1
         fi
         "${KPT[@]}" -s "$ID" | sed -n '1,4p'
+        replace_old_widget
         if [ "${1:-}" = --add-to-panel ] && [ -n "$fresh" ]; then
             add_to_panel
         fi
-        echo "Note: a Voice Notes widget that is already on a panel keeps running the old QML"
+        echo "Note: a BMeet widget that is already on a panel keeps running the old QML"
         echo "until plasmashell restarts:  systemctl --user restart plasma-plasmashell"
         ;;
     --uninstall)

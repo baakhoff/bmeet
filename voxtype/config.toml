@@ -1,8 +1,8 @@
-# npu-voicenotes: voxtype 1.1.0 config for Whisper on the Intel NPU
+# BMeet: voxtype 1.1.0 config for Whisper on the Intel NPU
 # (Ubuntu/Kubuntu 26.04, KDE Plasma 6 Wayland, PipeWire).
 #
 # Installed to ~/.config/voxtype/config.toml by voxtype/user-setup.sh. A config that
-# was not written by npu-voicenotes is backed up first; this one is kept on re-runs
+# was not written by BMeet is backed up first; this one is kept on re-runs
 # (so your changes stay). Change single values later with:
 #     voxtype config set <key> <value>      (keeps comments)
 #     systemctl --user restart voxtype     (openvino.* keys need a restart)
@@ -51,7 +51,7 @@ device = "NPU"
 
 # One language per daemon run with this engine (no auto-detect, no ["en","de"] list).
 # Switch with `voxtype-lang` (Meta+Shift+H: next language from
-# ~/.config/npu-voicenotes/languages) or `voxtype-lang de`; both restart the daemon.
+# ~/.config/bmeet/languages) or `voxtype-lang de`; both restart the daemon.
 language = "@LANGUAGE@"
 translate = false
 

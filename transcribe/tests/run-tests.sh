@@ -12,12 +12,12 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-python=${NPU_PYTHON:-$HOME/.local/share/npu-voicenotes/venv/bin/python}
+python=${NPU_PYTHON:-$HOME/.local/share/bmeet/venv/bin/python}
 tool() { "$python" -I "$here/../npu-transcribe" "$@"; }
 work=${1:?usage: run-tests.sh WORKDIR [DEVICES]}
 devices=${2:-NPU CPU}
 clips="$work/clips"
-# Keep test runs out of the user's transcript history (Voice Notes "Transcribed files").
+# Keep test runs out of the user's transcript history (BMeet "Transcribed files").
 export NPU_TRANSCRIBE_HISTORY="$work/history.jsonl"
 
 [ -f "$clips/en_long.mp4" ] || "$here/make_speech.py" "$clips"

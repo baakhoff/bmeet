@@ -1,9 +1,9 @@
 #!/usr/bin/python3 -I
-"""Voice Notes - dictation, meeting transcripts and file transcripts in one window.
+"""BMeet - dictation, meeting transcripts and file transcripts in one window.
 
 Usage:
-  voicenotes [meetings|files|transcribe] [--id MEETING_ID] [--file PATH]... [FILE...]
-  voicenotes --version
+  bmeet [meetings|files|transcribe] [--id MEETING_ID] [--file PATH]... [FILE...]
+  bmeet --version
 
   meetings|files|transcribe   page to show (default: the page used last)
   --id ID                     select this meeting (voxtype meeting id)
@@ -16,14 +16,14 @@ One window per user: a second launch hands its arguments to the running window
 
 A front end for voxtype (dictation daemon + meetings on the Intel NPU) and
 npu-transcribe (Whisper on the NPU for audio/video files). Live state comes from
-voicenotes-ctl (imported, not spawned); meetings are read from voxtype's SQLite
+bmeet-ctl (imported, not spawned); meetings are read from voxtype's SQLite
 index (read-only); exports and deletes go through voxtype's CLI. Runs on the
 system PyQt6, so it gets the Breeze style and the KDE file dialogs.
 
-Environment (testing): VOICENOTES_CTL, VOICENOTES_VOXTYPE, VOICENOTES_TRANSCRIBE,
-VOICENOTES_SOCKET, VOICENOTES_DEBUG=1, VOICENOTES_DRY_RUN=1 (log instead of
+Environment (testing): BMEET_CTL, BMEET_VOXTYPE, BMEET_TRANSCRIBE,
+BMEET_SOCKET, BMEET_DEBUG=1, BMEET_DRY_RUN=1 (log instead of
 recording, starting meetings, switching language, opening files/folders,
-notifying), plus voicenotes-ctl's VOICENOTES_MEETING_DB, VOICENOTES_RUN_DIR,
+notifying), plus bmeet-ctl's BMEET_MEETING_DB, BMEET_RUN_DIR,
 VOXTYPE_MEETING_DIR and NPU_TRANSCRIBE_HISTORY.
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-sys.dont_write_bytecode = True  # importing voicenotes-ctl must not drop a __pycache__ next to it
+sys.dont_write_bytecode = True  # importing bmeet-ctl must not drop a __pycache__ next to it
 
 from PyQt6.QtCore import (QDateTime, QFile, QLocale, QMimeDatabase, QObject,  # noqa: E402
                           QProcess, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal)
@@ -61,18 +61,18 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 __version__ = "0.1.0"
-APP_ID = "voicenotes"
-APP_NAME = "Voice Notes"
+APP_ID = "bmeet"
+APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
 HOME = Path.home()
 PAGES = ("meetings", "files", "transcribe")
 PAGE_TITLES = {"meetings": "Meetings", "files": "Transcribed files", "transcribe": "Transcribe a file"}
 PAGE_ICONS = {"meetings": "meeting-attending", "files": "view-media-lyrics",
               "transcribe": "document-import"}
-DEBUG = bool(os.environ.get("VOICENOTES_DEBUG"))
-DRY_RUN = bool(os.environ.get("VOICENOTES_DRY_RUN"))
-CTL_PATH = Path(os.environ.get("VOICENOTES_CTL") or APP_FILE.parent.parent / "voicenotes-ctl")
-VOXTYPE = os.environ.get("VOICENOTES_VOXTYPE") or "voxtype"
+DEBUG = bool(os.environ.get("BMEET_DEBUG"))
+DRY_RUN = bool(os.environ.get("BMEET_DRY_RUN"))
+CTL_PATH = Path(os.environ.get("BMEET_CTL") or APP_FILE.parent.parent / "bmeet-ctl")
+VOXTYPE = os.environ.get("BMEET_VOXTYPE") or "voxtype"
 COLORS = {"red": "#da4453", "orange": "#f67400", "green": "#27ae60", "blue": "#3daee9",
           "gray": "#7f8c8d"}
 KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -90,7 +90,7 @@ EXPORT_FORMATS = (("Markdown (*.md)", "markdown", ".md"), ("Plain text (*.txt)",
 
 def debug(*args) -> None:
     if DEBUG:
-        print("voicenotes:", *args, file=sys.stderr, flush=True)
+        print("bmeet:", *args, file=sys.stderr, flush=True)
 
 
 def _find_transcribe() -> str:
@@ -101,16 +101,16 @@ def _find_transcribe() -> str:
     return shutil.which("npu-transcribe") or "npu-transcribe"
 
 
-TRANSCRIBE = os.environ.get("VOICENOTES_TRANSCRIBE") or _find_transcribe()
+TRANSCRIBE = os.environ.get("BMEET_TRANSCRIBE") or _find_transcribe()
 
 
-# ============================================================================ voicenotes-ctl
+# ============================================================================ bmeet-ctl
 
 def load_ctl():
-    """Import voicenotes-ctl (a script without .py) as a module. Its status() only reads
+    """Import bmeet-ctl (a script without .py) as a module. Its status() only reads
     a few small files, so the window can poll it every second without spawning anything."""
     try:
-        loader = importlib.machinery.SourceFileLoader("voicenotes_ctl", str(CTL_PATH))
+        loader = importlib.machinery.SourceFileLoader("bmeet_ctl", str(CTL_PATH))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
@@ -123,18 +123,18 @@ ctl, CTL_ERROR = load_ctl()
 
 
 def _ctl_path(name: str, env: str, default: Path) -> Path:
-    """Data paths come from voicenotes-ctl (one source of truth, incl. its env overrides)."""
+    """Data paths come from bmeet-ctl (one source of truth, incl. its env overrides)."""
     if ctl is not None and hasattr(ctl, name):
         return Path(getattr(ctl, name))
     return Path(os.environ.get(env) or default)
 
 
-MEETING_DB = _ctl_path("MEETING_DB", "VOICENOTES_MEETING_DB",
+MEETING_DB = _ctl_path("MEETING_DB", "BMEET_MEETING_DB",
                        HOME / ".local/share/voxtype/meetings/index.db")
 MEETING_MD_DIR = _ctl_path("MEETING_MD_DIR", "VOXTYPE_MEETING_DIR", HOME / "Documents/Meetings")
 FILE_HISTORY = _ctl_path("FILE_HISTORY", "NPU_TRANSCRIBE_HISTORY",
                          HOME / ".local/share/npu-transcribe/history.jsonl")
-RUN_DIR = _ctl_path("RUN", "VOICENOTES_RUN_DIR",
+RUN_DIR = _ctl_path("RUN", "BMEET_RUN_DIR",
                     Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
 BIN = Path(getattr(ctl, "BIN", HOME / ".local/bin"))
 
@@ -156,7 +156,7 @@ def fmt_date(epoch: float | None, long: bool = False) -> str:
 
 
 def configured_languages() -> list[str]:
-    """Dictation languages from ~/.config/npu-voicenotes/languages (via voicenotes-ctl)."""
+    """Dictation languages from ~/.config/bmeet/languages (via bmeet-ctl)."""
     if ctl is not None and hasattr(ctl, "languages"):
         try:
             return ctl.languages()
@@ -1514,7 +1514,7 @@ class TranscribePage(QWidget):
 
         self.missing = Banner("error")
         self.missing.text.setText(f"npu-transcribe was not found ({TRANSCRIBE}). Run the "
-                                  "npu-voicenotes installer again to set it up.")
+                                  "BMeet installer again to set it up.")
         if os.access(TRANSCRIBE, os.X_OK):
             self.missing.hide()  # (never show() a widget before it has a parent: it becomes a window)
 
@@ -2223,7 +2223,7 @@ class MainWindow(QMainWindow):
             why = "Wait for the dictation to finish to switch the language"
         elif not other:
             why = (f"Dictation language: {language_name(lang)}. To switch here, list more languages "
-                   "in ~/.config/npu-voicenotes/languages (e.g. \"en de\").")
+                   "in ~/.config/bmeet/languages (e.g. \"en de\").")
         else:
             why = ""
         self.act_lang.setEnabled(not why and not self._lang_pending)
@@ -2506,10 +2506,10 @@ class MainWindow(QMainWindow):
 # ============================================================================ single instance
 
 def socket_path() -> str:
-    if os.environ.get("VOICENOTES_SOCKET"):
-        return os.environ["VOICENOTES_SOCKET"]
+    if os.environ.get("BMEET_SOCKET"):
+        return os.environ["BMEET_SOCKET"]
     base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return os.path.join(base, f"voicenotes-{os.getuid()}.sock")
+    return os.path.join(base, f"bmeet-{os.getuid()}.sock")
 
 
 class SingleInstance(QObject):
@@ -2558,7 +2558,7 @@ class SingleInstance(QObject):
         self.server.newConnection.connect(self._on_connection)
         ok = self.server.listen(self.path)
         if not ok:
-            print(f"voicenotes: cannot listen on {self.path}: {self.server.errorString()}", file=sys.stderr)
+            print(f"bmeet: cannot listen on {self.path}: {self.server.errorString()}", file=sys.stderr)
         return ok
 
     def _on_connection(self) -> None:
@@ -2602,16 +2602,16 @@ def main(argv: list[str]) -> int:
         print(__doc__.strip())
         return 0
     if "--version" in argv:
-        print(f"voicenotes {__version__}")
+        print(f"bmeet {__version__}")
         return 0
     try:
         request = parse_cli(argv)
     except ValueError as exc:
-        print(f"voicenotes: {exc}\n\n{__doc__.strip()}", file=sys.stderr)
+        print(f"bmeet: {exc}\n\n{__doc__.strip()}", file=sys.stderr)
         return 2
     request["token"] = os.environ.get("XDG_ACTIVATION_TOKEN", "")
 
-    QGuiApplication.setDesktopFileName(APP_ID)  # Wayland app_id = voicenotes.desktop
+    QGuiApplication.setDesktopFileName(APP_ID)  # Wayland app_id = bmeet.desktop
     app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_ID)
     app.setApplicationDisplayName(APP_NAME)
@@ -2628,7 +2628,7 @@ def main(argv: list[str]) -> int:
             if instance.forward(request):
                 debug("forwarded to the running window")
                 return 0
-        print("voicenotes: another instance holds the lock but does not answer", file=sys.stderr)
+        print("bmeet: another instance holds the lock but does not answer", file=sys.stderr)
         return 1
 
     win = MainWindow()

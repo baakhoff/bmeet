@@ -93,7 +93,7 @@ PlasmaExtras.Representation {
                             ? "The language cannot change during a meeting (the engine restart would cut it short)."
                         : full.app.dictBusy ? "The language cannot change while dictating."
                         : full.app.nextLanguage === "" ? "Dictation language: " + full.app.languageCode
-                          + ". Add more in ~/.config/npu-voicenotes/languages to switch here."
+                          + ". Add more in ~/.config/bmeet/languages to switch here."
                         : "Dictation language: " + full.app.languageCode + ". Click to switch to "
                           + full.app.otherLanguageCode + " (restarts the engine, ~3 s). Shortcut: Meta+Shift+H"
                 }
@@ -353,7 +353,7 @@ PlasmaExtras.Representation {
 
             PlasmaComponents3.ToolButton {
                 icon.name: "window-new"
-                text: "Open Voice Notes"
+                text: "Open BMeet"
                 onClicked: full.app.openApp("")
             }
         }

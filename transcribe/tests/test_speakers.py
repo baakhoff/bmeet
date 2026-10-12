@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -155,7 +156,6 @@ class Voices(unittest.TestCase):
 
     def test_voices_file(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
         import json
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir()
         try:
@@ -244,9 +244,9 @@ class Output(unittest.TestCase):
         self.assertNotIn(":", nt.to_srt(t).split("\n")[2])
 
 
+@unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg (npu-transcribe decodes with it)")
 class MeetingFolder(unittest.TestCase):
     def test_parts_stay_in_step(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
-        import shutil
         import wave
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir()

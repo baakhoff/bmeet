@@ -15,7 +15,8 @@ npu-transcribe --help
 
 **What it does:**
 - **Decoding:** the `ffmpeg` CLI decodes the audio straight into memory (16 kHz mono float32, no temp files).
-- **Blocks:** Whisper gets ~2 minute blocks, each cut at the quietest moment, so progress can be shown and memory stays flat for multi-hour recordings.
+- **Blocks:** Whisper gets blocks of at most 30 s, one Whisper window each, cut at the quietest moment, so memory stays flat for multi-hour recordings. See *Block length* below for why not longer.
+- **Stock phrases:** a segment that is only one of the phrases Whisper writes over silence ("Продолжение следует…", "Субтитры сделал DimaTorzok", "Thanks for watching!", …) is dropped.
 - **Outputs**, written next to the input (or into `--out`):
   - `NAME.srt`: subtitles, one Whisper segment per cue.
   - `NAME.md`: readable paragraphs with `[hh:mm:ss]` markers about every 30 s.
@@ -28,6 +29,21 @@ npu-transcribe --help
 **Other ways to start it:**
 - **Dolphin:** right-click audio or video → **Transcribe (NPU)**. It runs in a Konsole window and sends a notification when done.
 - **BMeet app:** the **Transcribe a file** page has a queue and progress display.
+
+## Block length
+
+npu-transcribe used to give Whisper 2-minute blocks and let OpenVINO GenAI chain the 30 s windows inside them. On a real Russian call (10 min, the system-audio track, turbo on the NPU) that cost a lot:
+
+| block | punctuation marks per 100 words | segments without any | speed |
+|---|---|---|---|
+| 120 s | 18.4 | 19 of 74 | 33 s |
+| **30 s** | **29.0** | **11 of 84** | 33 s |
+
+- **Same for Whisper small (20.1 vs 29.2):** word timestamps made no difference.
+- **What went wrong with 2-minute blocks:** after its first window the text often ran on without commas, full stops or capitals for minutes. It also misheard more: "если учили здесь минут" for "если через 10 минут", "наличку" for "аналитику", "поэмов" for "ПМов".
+- **Why not small:** with 30 s blocks small punctuated as well, but it garbled more words than turbo.
+- **Why no prompt:** a punctuated Russian `initial_prompt` removed the unpunctuated segments. It also left out filler words ("типа", "короче"), and over a quiet "Угу" it wrote "Да, всё понятно, всё понятно, …". So it isn't used.
+- **English:** 30 s blocks kept the long English test clip at 0.5 % WER, and it ran faster (30.7x vs 25.4x).
 
 ## Speakers
 
@@ -47,6 +63,13 @@ the voices in the system audio become **Person 1**, **Person 2**, …
    - A word on your track is cut when the microphone is less than 2x louder than that predicted echo at that moment.
    - With headphones the predicted echo is ~0, so nothing is cut. When you talk over the other side, your voice is far louder than the echo and stays.
 4. **Output:** Speaker labels in `.srt` cues (`Speaker 1: …`), `.md` and `.txt` paragraphs (which never mix two speakers), and a `speakers` count in the history line. Meetings get voxtype's Markdown layout: a `### Person 1` heading per change of speaker and a `*[mm:ss]*` mark per paragraph.
+
+**Cleaning up the clustering on real calls.** Real calls are harder than clean test voices: background noise, the conferencing app's noise suppression, laughter and codec glitches. On one 49-minute Russian 1:1 call, the clustering made 30 "voices": one real person, plus fragments of 1-114 words. Of those fragments, the ones long enough to compare were 0.14-0.87 similar to that person. So after the clustering:
+- **Fragments:** a voice with under 15 s of speech, and under 5 % of the system audio's speech, joins the voice it sounds most like. If it has no turn long enough to compare, it joins the voice nearest in time.
+- **One person split in two:** a voice at least 0.65 similar to a bigger voice joins it. Two different readers were never more than 0.41 similar; the two people on a real call scored 0.41.
+- **Unassigned words:** short replies ("Угу", "Да", "Пока") often get no turn of their own. They go to the nearest speaker within 30 s, not *Remote*.
+
+On 10 minutes of a real three-person call, the old pass made You, Remote and Person 1-7. The new one makes You, Person 1 and Person 2, taking turns as in the conversation.
 
 **Memory:** the whole recording is held as one array (~230 MB per hour), because diarization needs all of it at once.
 

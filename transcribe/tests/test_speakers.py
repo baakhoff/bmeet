@@ -78,6 +78,14 @@ class Labelling(unittest.TestCase):
         self.assertEqual([p.speaker for p in parts], ["Person 1", "Viktor", "Person 1", "Person 2"])
         self.assertEqual(labels, {0: "Person 1", 1: "Viktor", 2: "Person 2"})
 
+    def test_short_replies_without_a_turn_go_to_the_nearest_speaker(self):
+        # "Угу" at 20 s: the segmentation gave it no turn; voice 1 spoke last, 11 s before
+        parts, _ = nt.number_speakers([Seg(4.5, 8, "hello"), Seg(20, 20.4, "Угу.")],
+                                      [Turn(0, 3, 0), Turn(4.2, 9, 1)], "Person", "Remote")
+        self.assertEqual([p.speaker for p in parts], ["Person 1", "Person 1"])
+        far, _ = nt.number_speakers([Seg(60, 61, "late")], [Turn(0, 3, 0)], "Person", "Remote")
+        self.assertEqual(far[0].speaker, "Remote")  # more than NEAREST_SECONDS away
+
     def test_words_between_turns_take_a_neighbour(self):
         seg = Seg(3, 6, "a b c", words("a@3.0-3.5 b@4.05-4.15 c@4.4-5.0"))
         parts, _ = nt.number_speakers([seg], [Turn(0, 3.6, 0), Turn(5.5, 9, 1)], "P", "?")
@@ -146,6 +154,19 @@ class Voices(unittest.TestCase):
             {"Boris": boris})                      # someone not remembered: left to the clustering
         self.assertEqual(unknown, [Turn(0, 10, 0)])
 
+    def test_merge_fragments_and_split_people(self):
+        a, b = self.vec(1, 0, 0), self.vec(0, 1, 0)
+        turns, vecs = self.turns_and_vecs(
+            (0, 30, 0, a), (31, 60, 1, b), (61, 90, 0, a),
+            (91, 95, 2, self.vec(0, 0, 1)),     # 4 s of something else: a fragment
+            (96, 96.5, 3, None),                # too short to compare: nearest in time
+            (100, 130, 4, self.vec(0.9, 0.2, 0)))  # 30 s, 0.98 like voice 0: the same person
+        merged, _ = nt.merge_voices(turns, vecs)
+        self.assertEqual([t.speaker for t in merged], [0, 1, 0, 0, 0, 0])
+        # two people who just sound different stay apart, however much each says
+        turns, vecs = self.turns_and_vecs((0, 20, 0, a), (21, 40, 1, self.vec(0.4, 0.9, 0)))
+        self.assertEqual([t.speaker for t in nt.merge_voices(turns, vecs)[0]], [0, 1])  # 0.41
+
     def test_voice_prints_weight_the_longest_turns(self):
         turns, vecs = self.turns_and_vecs((0, 4, 0, self.vec(1, 0)), (5, 6, 0, self.vec(0, 1)),
                                           (7, 9, 1, self.vec(0, 0, 1)), (9, 9.5, 1, None))
@@ -174,6 +195,15 @@ class Voices(unittest.TestCase):
             self.assertEqual((tmp / "v").stat().st_mode & 0o777, 0o700)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class Hallucinations(unittest.TestCase):
+    def test_stock_phrases_only(self):
+        for text in ("Продолжение следует...", "Субтитры сделал DimaTorzok", "Thanks for watching!",
+                     "Продолжение следует. Продолжение следует.", "СПАСИБО ЗА ПРОСМОТР!"):
+            self.assertTrue(nt.hallucination(text), text)
+        for text in ("Продолжение следует в четверг, после релиза.", "Спасибо!", "", "Thank you."):
+            self.assertFalse(nt.hallucination(text), text)
 
 
 class Echo(unittest.TestCase):

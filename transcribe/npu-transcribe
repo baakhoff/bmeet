@@ -5,8 +5,8 @@ Uses openvino_genai.WhisperPipeline on the Intel NPU (Core Ultra) and falls back
 to the CPU when the NPU is missing or fails. The installer runs it in its own
 venv through a wrapper in ~/.local/bin. Audio is decoded by the
 ffmpeg CLI straight into memory (16 kHz mono float32, no temp files) and fed to
-Whisper in ~2 minute blocks cut at the quietest moment, so progress can be shown
-and memory stays flat for multi-hour recordings.
+Whisper in blocks of at most 30 s (one Whisper window) cut at the quietest moment, so
+memory stays flat for multi-hour recordings.
 
 Outputs (next to the input file unless --out is given):
   NAME.srt  subtitles, one Whisper segment per cue
@@ -86,7 +86,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -97,11 +97,23 @@ CACHE_DIR = Path.home() / ".cache/npu-ov-cache"  # compiled NPU blobs
 HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
                or Path.home() / ".local/share/npu-transcribe/history.jsonl")
 SAMPLE_RATE = 16_000          # what Whisper expects
-BLOCK_SECONDS = 120           # audio per generate() call = progress granularity
+# Audio per generate() call: one Whisper window. Longer blocks let OpenVINO GenAI chain
+# 30 s windows itself, and on real Russian calls that lost most punctuation and capitals
+# after the first window and misheard more words (docs/npu-transcribe.md), at no speed gain.
+BLOCK_SECONDS = 30
 CUT_SEARCH_SECONDS = 10       # cut each block at the quietest 100 ms of its last 10 s
 SILENCE_DBFS = -50.0          # blocks/segments with a lower peak are treated as silence
 SILENCE_AMPLITUDE = 10 ** (SILENCE_DBFS / 20)
 CUE_MARGIN = 0.2              # seconds kept around the audible part of a cue
+# What Whisper writes over silence and noise (from the subtitles it was trained on). A
+# segment that is only these words is dropped (letters and digits compared, any case).
+HALLUCINATIONS = (
+    "продолжение следует", "спасибо за просмотр", "подписывайтесь на канал",
+    "субтитры сделал dimatorzok", "субтитры создавал dimatorzok", "субтитры делал dimatorzok",
+    "редактор субтитров а синецкая корректор а кулакова", "субтитры подготовлены сообществом amara org",
+    "thank you for watching", "thanks for watching", "please subscribe",
+    "subtitles by the amara org community",
+)
 PARAGRAPH_SECONDS = 30       # Markdown/text paragraph length (approximate)
 FORMATS = ("srt", "md", "txt")
 # Speaker diarization (sherpa-onnx): pyannote segmentation-3.0 finds who speaks when in
@@ -121,6 +133,15 @@ WORD_SMOOTH_SECONDS = 0.6     # a speaker change shorter than this inside a sent
 # Opus, fingerprints from different recordings: the same person >= 0.80, others <= 0.40.
 VOICE_SIMILARITY = 0.55
 VOICE_MARGIN = 0.1            # ... and at least this much more similar than to anyone else remembered
+# On real calls the clustering also makes "voices" of fragments (a laugh, a cough, codec
+# glitches; one 1:1 call came out as 30 voices) and splits a person in two. A voice with
+# less speech than MIN_VOICE_SECONDS and MIN_VOICE_SHARE of all joins the voice it sounds
+# most like (or the nearest one in time); a voice at least SAME_VOICE similar to a bigger
+# one joins it.
+MIN_VOICE_SECONDS = 15
+MIN_VOICE_SHARE = 0.05
+SAME_VOICE = 0.65
+NEAREST_SECONDS = 30          # words no turn covers go to the nearest speaker within this
 VOICE_WINDOW = 2.0            # long turns are also checked in windows this long ...
 VOICE_HOP = 0.5               # ... this far apart, and split where a remembered person
 VOICE_MIN_RUN = 1.5           # changes for at least this long (similar voices share a turn)
@@ -150,6 +171,15 @@ def hms(seconds: float) -> str:
 def srt_time(seconds: float) -> str:
     ms = int(round(seconds * 1000))
     return f"{ms // 3_600_000:02d}:{ms % 3_600_000 // 60_000:02d}:{ms % 60_000 // 1000:02d},{ms % 1000:03d}"
+
+
+def hallucination(text: str) -> bool:
+    """Is this segment only one of Whisper's stock phrases (HALLUCINATIONS), maybe repeated?"""
+    words = " ".join(re.findall(r"\w+", text.lower()))
+    for phrase in HALLUCINATIONS:
+        if words and words.replace(phrase, " ").strip() == "":
+            return True
+    return False
 
 
 def peak_dbfs(samples: np.ndarray) -> float:
@@ -453,7 +483,7 @@ def transcribe(whisper: Whisper, name: str, blocks: Generator[tuple[float, np.nd
                         sum(1 for _ in itertools.takewhile(lambda w: (w.start + w.end) / 2 <= e, words))
                     mine, words = words[:n], words[n:]
                     span = audible_span(block, s, e)
-                    if span is None:
+                    if span is None or hallucination(text):
                         dropped += 1
                         continue
                     segments.append(Segment(start + span[0], start + span[1], text,
@@ -518,7 +548,7 @@ def diarize(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = Fal
     turns = [Turn(r.start, r.end, order.setdefault(r.speaker, len(order))) for r in result]
     prints: dict[int, list[float]] = {}
     names: dict[int, str] = {}
-    if (fingerprints or known) and turns:
+    if turns:
         extractor = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(
             model=str(EMBEDDING_MODEL), num_threads=threads))
 
@@ -536,12 +566,52 @@ def diarize(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = Fal
                 mid = (t.start + t.end) / 2
                 start, end = max(t.start, mid - 7.5), min(t.end, mid + 7.5)  # at most 15 s
                 vecs[i] = (embed(start, end), end - start)
+        turns, vecs = merge_voices(turns, vecs)
         if known:
             turns, names = identify(turns, vecs, known)
         prints = voice_prints(turns, vecs)
     log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s"
         + (f", recognised: {', '.join(sorted(set(names.values())))}" if names else ""))
     return turns, prints, names
+
+
+def merge_voices(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]
+                 ) -> tuple[list[Turn], dict[int, tuple[np.ndarray, float]]]:
+    """Fold the voices the clustering made too much of into the voices they belong to
+    (MIN_VOICE_SECONDS and MIN_VOICE_SHARE, SAME_VOICE), smallest first. vecs: {turn index: (embedding, seconds)}.
+    Returns the turns with their new voices (and vecs, unchanged: indexes stay)."""
+    turns = list(turns)
+    fragment = min(MIN_VOICE_SECONDS, MIN_VOICE_SHARE * sum(t.end - t.start for t in turns))
+    while True:
+        speech: dict[int, float] = {}
+        sums: dict[int, np.ndarray] = {}
+        for i, t in enumerate(turns):
+            speech[t.speaker] = speech.get(t.speaker, 0.0) + t.end - t.start
+            if i in vecs:
+                v, seconds = vecs[i]
+                sums[t.speaker] = sums.get(t.speaker, 0.0) + v * seconds
+        centroid = {v: unit(c) for v, c in sums.items()}
+        target = None
+        for voice in sorted(speech, key=speech.__getitem__):
+            bigger = [u for u in speech if u != voice and speech[u] >= speech[voice]]
+            if not bigger:
+                continue
+            similar = {u: float(centroid[voice] @ centroid[u]) for u in bigger
+                       if voice in centroid and u in centroid}
+            closest = max(similar, key=similar.__getitem__) if similar else None
+            if speech[voice] < fragment:
+                if closest is None:  # no turn long enough to compare: the nearest voice in time
+                    first = next(t for t in turns if t.speaker == voice)
+                    closest = min((t for t in turns if t.speaker in bigger),
+                                  key=lambda t: max(t.start - first.end, first.start - t.end)).speaker
+                target = (voice, closest)
+            elif closest is not None and similar[closest] >= SAME_VOICE:
+                target = (voice, closest)
+            if target:
+                break
+        if target is None:
+            return turns, vecs
+        turns = [Turn(t.start, t.end, target[1]) if t.speaker == target[0] else t for t in turns]
 
 
 def remembered_voices(known: dict[str, list[list[float]]]) -> dict[str, np.ndarray]:
@@ -659,8 +729,9 @@ def diarize_aside(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool
 
 
 def speaker_at(turns: list[Turn], start: float, end: float) -> int | None:
-    """The speaker who talks most during [start, end]; else the nearest one within 1 s."""
-    best, best_overlap, near, near_gap = None, 0.0, None, 1.0
+    """The speaker who talks most during [start, end]; else the nearest one within
+    NEAREST_SECONDS (short replies like "Угу" or "Yes" often get no turn of their own)."""
+    best, best_overlap, near, near_gap = None, 0.0, None, NEAREST_SECONDS
     for t in turns:  # sorted by start
         if t.start >= end + near_gap:
             break
@@ -1036,7 +1107,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--device", default="NPU", type=str.upper, choices=("NPU", "CPU", "AUTO"),
                    help="NPU (default, falls back to CPU), CPU, or AUTO (NPU if present)")
     p.add_argument("--language", default="auto", metavar="auto|en|ru|...",
-                   help="spoken language (default: detected from the first ~2 min of each file)")
+                   help="spoken language (default: detected from the first 30 s with speech of each file)")
     p.add_argument("--translate", action="store_true", help="translate the speech to English")
     p.add_argument("--format", default="srt,md", metavar="srt,md,txt",
                    help="comma-separated output formats (default: srt,md)")

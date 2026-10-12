@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-10-12
+
+Better Russian text and far fewer phantom speakers, tuned on a real Russian call.
+
+### Fixed
+- **Punctuation and accuracy:** npu-transcribe gives Whisper one 30 s window at a time instead of 2-minute blocks. On a real Russian call the old blocks lost most punctuation and capitals after the first window and misheard more words. English accuracy is unchanged and files transcribe faster.
+- **Phantom speakers:** a 1:1 call came out with 24 "people". Voices with under 15 s of speech (and under 5 % of all) now join the voice they sound most like, voices at least 0.65 similar to a bigger one are merged, and short replies with no turn of their own go to the nearest speaker instead of *Remote*.
+- **Stock phrases:** Whisper's stock phrases over silence ("Продолжение следует…", "Субтитры сделал DimaTorzok", "Thanks for watching!") are dropped.
+
 ## [0.3.0] - 2026-10-12
 
 Meeting speakers get names, and BMeet can recognise them in later meetings.
@@ -59,6 +68,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.3.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.1
 [0.3.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.0
 [0.2.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.2.0
 [0.1.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.1.0

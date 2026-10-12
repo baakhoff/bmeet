@@ -20,6 +20,7 @@ machine, and the CPU and GPU are left alone.
   - When you stop, a Markdown transcript is saved to `~/Documents/Meetings` right away.
   - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. About 1/7 of the meeting's length on a Core Ultra 7 258V (a 1-hour meeting takes ~8 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
+  - **Names:** *Name speakers…* in the app turns *Person 1* into *Viktor*. If you let it remember voices, later meetings call Viktor by name on their own.
 - **File transcription:**
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - `--speakers` (or *Transcribe with speakers* in Dolphin) labels the lines Speaker 1, Speaker 2, …
@@ -113,6 +114,7 @@ voxtype meeting list                            # all meetings
 
 - **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
 - **Meeting speakers:** `~/.config/bmeet/speakers` says `on` or `off`. When two people end up as one, or one person is split in two, see [docs/troubleshooting.md](docs/troubleshooting.md#meeting-speakers).
+- **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`).
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.
 
@@ -123,6 +125,11 @@ voxtype meeting list                            # all meetings
   - To tell the speakers apart, the meeting audio is recorded into RAM (`$XDG_RUNTIME_DIR`, a tmpfs; ~230 MB per hour) while the meeting runs. It is deleted as soon as the speaker pass ends, whether it succeeds, fails or is stopped. A logout or reboot clears it too.
   - Nothing is recorded while a meeting is paused.
   - `--no-speakers` turns this off.
+- **Remembered voices (off unless you turn them on):**
+  - BMeet then keeps a voice fingerprint per person, 192 numbers from which no audio or words can be recovered, in `~/.local/share/bmeet/voices` (only your user can read it).
+  - That covers each meeting's people, plus the people you named, under their names (at most their last 10 meetings).
+  - Fingerprints are biometric data about other people: turn it on only where that is fine.
+  - *Remembered voices…* in the app forgets one person. Unticking the option forgets everyone, and so does the uninstaller.
 - **Telemetry:** OpenVINO's telemetry is blocked in npu-transcribe (it's on by default upstream; see [docs/npu-transcribe.md](docs/npu-transcribe.md)). Hugging Face telemetry is turned off for the model download.
 - **Clipboard:** dictation goes through the clipboard (that's how text gets into every app on KWin), so it shows up in Klipper's history.
 
@@ -180,7 +187,7 @@ database, and never open your real one.
 - **Speakers:**
   - Only the system audio is split by voice. Everyone on your microphone (people in the same room) is *You*.
   - When two people talk at the same time, the words go to whoever is louder.
-  - People are numbered, not named: rename *Person 1* in the Markdown file yourself.
+  - People are numbered until you name them in the app; only remembered voices are named automatically.
 - **Opening the app from the widget** may only flash it in the task bar (Wayland focus-stealing prevention).
 - **Only Ubuntu/Kubuntu 26.04 has been tested;** the pinned packages are built for it.
 

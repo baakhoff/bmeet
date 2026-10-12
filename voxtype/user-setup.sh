@@ -87,7 +87,7 @@ uninstall() {
         mv "$CONF_DIR/config.toml" "$CONF_DIR/config.toml.uninstalled-$(date +%Y%m%d-%H%M%S)"
         echo "  your voxtype config was kept as $CONF_DIR/config.toml.uninstalled-*"
     fi
-    rm -f "$LANG_FILE" "$(dirname "$LANG_FILE")/speakers"
+    rm -f "$LANG_FILE" "$(dirname "$LANG_FILE")/speakers" "$(dirname "$LANG_FILE")/remember-voices"
     rmdir "$(dirname "$LANG_FILE")" 2>/dev/null || true
     rm -f "$DROPIN" "$DROPIN_DIR/10-log-warn.conf"
     rmdir "$DROPIN_DIR" 2>/dev/null || true

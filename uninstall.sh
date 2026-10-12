@@ -65,7 +65,7 @@ if [ "$src" = "$root/src" ]; then
     rm -rf "$root"
     echo "  removed $root"
 else
-    rm -rf "$root/venv" "$root/src"
+    rm -rf "$root/venv" "$root/src" "$root/voices"   # (voices: remembered voice fingerprints)
     rmdir "$root" 2>/dev/null || true
     echo "  removed $root/{src,venv} (this checkout in $src stays)"
 fi

@@ -54,13 +54,14 @@ from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFontDatabase,  # no
                          QShortcut, QTextCharFormat, QTextCursor)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa: E402
-                             QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+                             QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+                             QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                              QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -349,6 +350,151 @@ def export_cmd(meeting_id: str, fmt: str = "markdown", output: str | None = None
     if output:
         cmd += ["--output", output]
     return cmd + ["--", meeting_id]
+
+
+# ============================================================================ data: speaker names
+
+# Remembered voices (opt-in): npu-transcribe --voices keeps each meeting's voice
+# fingerprints in VOICES_DIR/meetings/<transcript>.json; naming people here copies theirs
+# to VOICES_DIR/voices.json, and later meetings call them by name.
+VOICES_DIR = Path(os.environ.get("BMEET_VOICES_DIR")
+                  or Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "bmeet/voices")
+REMEMBER_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet/remember-voices"
+NOT_A_NAME = re.compile(r"^(You|Remote|Person \d+|Speaker \d+|Speaker \?)$|[\n#*,\[\]`<>|]")
+MAX_FINGERPRINTS = 10      # per person: the latest meetings they were named in
+SPEAKERS_LINE = "- **Speakers:** "
+
+
+def remember_voices_on() -> bool:
+    try:
+        return REMEMBER_FILE.read_text().split()[0] == "on"
+    except (OSError, IndexError):
+        return False
+
+
+def set_remember_voices(on: bool) -> None:
+    """Switch remembered voices; off forgets every fingerprint as well."""
+    REMEMBER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REMEMBER_FILE.write_text("on\n" if on else "off\n")
+    if not on:
+        shutil.rmtree(VOICES_DIR, ignore_errors=True)
+
+
+def name_problem(name: str) -> str | None:
+    """Why `name` cannot be a speaker's name, or None."""
+    if not name:
+        return "empty"
+    if len(name) > 40:
+        return "longer than 40 characters"
+    if NOT_A_NAME.search(name):
+        return "reserved, or contains one of # * , [ ] ` < > |"
+    return None
+
+
+def md_speakers(text: str) -> list[tuple[str, str]]:
+    """(label, the first thing they said) for each speaker heading of a meeting transcript
+    ("### Person 1"), in order of appearance, without You."""
+    out: dict[str, str] = {}
+    label = None
+    for line in text.splitlines():
+        if line.startswith("### "):
+            label = line[4:].strip()
+            if label != "You":
+                out.setdefault(label, "")
+        elif label in out and not out[label] and line.strip():
+            out[label] = re.sub(r"^\*\[[\d:]+\]\*\s*", "", line.strip())
+    return list(out.items())
+
+
+def rename_speakers(text: str, names: dict[str, str]) -> str:
+    """Rename speakers in a meeting transcript: the headings and the Speakers line, nothing
+    else. Two labels may get the same name (one person the pass split in two)."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        end = line[len(line.rstrip("\r\n")):]
+        body = line[:len(line) - len(end)]
+        if body.startswith("### ") and body[4:].strip() in names:
+            line = f"### {names[body[4:].strip()]}{end}"
+        elif body.startswith(SPEAKERS_LINE):
+            items = [names.get(x.strip(), x.strip()) for x in body[len(SPEAKERS_LINE):].split(",")]
+            line = SPEAKERS_LINE + ", ".join(dict.fromkeys(i for i in items if i)) + end
+        out.append(line)
+    return "".join(out)
+
+
+def meeting_voices_path(md_path: str) -> Path:
+    return VOICES_DIR / "meetings" / f"{Path(md_path).stem}.json"
+
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_private(path: Path, data: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)  # 0600
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def remembered_voices() -> dict[str, int]:
+    """{name: how many meetings their voice comes from}"""
+    data = _load_json(VOICES_DIR / "voices.json") or {}
+    return {name: len(v.get("fingerprints") or []) for name, v in (data.get("voices") or {}).items()}
+
+
+def forget_voice(name: str) -> None:
+    path = VOICES_DIR / "voices.json"
+    if (data := _load_json(path)) and name in (data.get("voices") or {}):
+        del data["voices"][name]
+        _write_private(path, data)
+
+
+def remember_named(md_path: str, names: dict[str, str]) -> list[str]:
+    """After naming the speakers of a meeting: their voice fingerprints from this meeting go
+    to voices.json under the new names (replacing this meeting's fingerprint under an old
+    name), and the meeting's own file follows the new labels. Returns the names remembered.
+    Nothing happens when the meeting has no fingerprints (remembered voices were off)."""
+    side = meeting_voices_path(md_path)
+    meeting = _load_json(side)
+    if not meeting or not isinstance(meeting.get("people"), dict):
+        return []
+    key = side.stem
+    voices_path = VOICES_DIR / "voices.json"
+    store = _load_json(voices_path) or {}
+    if store.get("model") != meeting.get("model"):  # another model's fingerprints don't compare
+        store = {"version": 1, "model": meeting.get("model"), "voices": {}}
+    voices = store.setdefault("voices", {})
+    remembered, people = [], {}
+    for label, fingerprint in meeting["people"].items():
+        new = names.get(label, label)
+        people.setdefault(new, fingerprint)
+        if new == label:
+            continue
+        if label in voices:  # this meeting's fingerprint no longer belongs to the old name
+            old = voices[label]
+            keep = [i for i, m in enumerate(old.get("meetings") or []) if m != key]
+            old["fingerprints"] = [old["fingerprints"][i] for i in keep]
+            old["meetings"] = [old["meetings"][i] for i in keep]
+            if not old["fingerprints"]:
+                del voices[label]
+        if name_problem(new) is None:
+            entry = voices.setdefault(new, {"fingerprints": [], "meetings": []})
+            pairs = [(f, m) for f, m in zip(entry["fingerprints"], entry["meetings"]) if m != key]
+            pairs = (pairs + [(fingerprint, key)])[-MAX_FINGERPRINTS:]
+            entry["fingerprints"], entry["meetings"] = [f for f, _ in pairs], [m for _, m in pairs]
+            entry["updated"] = int(time.time())
+            if new not in remembered:
+                remembered.append(new)
+    _write_private(voices_path, store)
+    meeting["people"] = people
+    _write_private(side, meeting)
+    return remembered
 
 
 # ============================================================================ data: file history
@@ -1011,6 +1157,123 @@ class ListDetailPage(QWidget):
             self.main.message("Copied the transcript to the clipboard")
 
 
+class NameSpeakersDialog(QDialog):
+    """Names for the speakers of one meeting, and the "remember voices" switch."""
+
+    def __init__(self, parent: QWidget, speakers: list[tuple[str, str]], has_fingerprints: bool) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Name speakers")
+        layout = QVBoxLayout(self)
+        intro = QLabel("Who is who? Leave a field empty to keep the label. Give two labels the "
+                       "same name when they are one person.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        grid = QGridLayout()
+        self.fields: dict[str, QLineEdit] = {}
+        for row, (label, said) in enumerate(speakers):
+            grid.addWidget(QLabel(f"<b>{html.escape(label)}</b>"), row * 2, 0)
+            edit = QLineEdit("" if NOT_A_NAME.search(label) else label)
+            edit.setPlaceholderText("Name")
+            grid.addWidget(edit, row * 2, 1)
+            sample = QLabel(html.escape(said[:140] + ("…" if len(said) > 140 else "")) or "–")
+            sample.setWordWrap(True)
+            sample.setEnabled(False)  # greyed: a hint, not a field
+            grid.addWidget(sample, row * 2 + 1, 1)
+            self.fields[label] = edit
+        layout.addLayout(grid)
+        self.remember = QCheckBox("Recognise them by voice in later meetings")
+        self.remember.setChecked(remember_voices_on())
+        self.remember.setToolTip(
+            "Keeps a voice fingerprint of each person you name on this computer "
+            f"({tilde(VOICES_DIR)}), and later meetings call them by name.\n"
+            "Unticking it forgets all fingerprints.")
+        self.remember.toggled.connect(self._remember_toggled)
+        layout.addWidget(self.remember)
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+        self.has_fingerprints = has_fingerprints
+        self.error = QLabel()
+        self.error.setStyleSheet("color: #da4453")
+        self.error.hide()
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.voices_btn = buttons.addButton("Remembered voices…", QDialogButtonBox.ButtonRole.ResetRole)
+        self.voices_btn.clicked.connect(lambda: VoicesDialog(self).exec())
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_note()
+
+    def _update_note(self) -> None:
+        on = self.remember.isChecked()
+        self.voices_btn.setVisible(on and bool(remembered_voices()))
+        self.note.setText("" if not on or self.has_fingerprints else
+                          "Recognition starts with the next meeting: this one was transcribed "
+                          "before remembering voices was on, so it has no fingerprints.")
+        self.note.setVisible(bool(self.note.text()))
+
+    def _remember_toggled(self, on: bool) -> None:
+        if not on and remembered_voices() and QMessageBox.question(
+                self, "Forget voices", "Forget all remembered voices?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            self.remember.blockSignals(True)
+            self.remember.setChecked(True)
+            self.remember.blockSignals(False)
+        self._update_note()
+
+    def names(self) -> dict[str, str]:
+        """{label: new name} for the fields that changed."""
+        return {label: edit.text().strip() for label, edit in self.fields.items()
+                if edit.text().strip() and edit.text().strip() != label}
+
+    def problems(self) -> list[str]:
+        return [f"“{name}”: {why}" for name in self.names().values() if (why := name_problem(name))]
+
+    def accept(self) -> None:
+        if problems := self.problems():
+            self.error.setText("Not a name: " + "; ".join(problems))
+            self.error.show()
+            return
+        super().accept()
+
+
+class VoicesDialog(QDialog):
+    """The remembered voices, to forget one or all."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Remembered voices")
+        layout = QVBoxLayout(self)
+        info = QLabel(f"Voice fingerprints kept in {tilde(VOICES_DIR)}. Later meetings call these "
+                      "people by name.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.list = QListWidget()
+        layout.addWidget(self.list)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.forget_btn = buttons.addButton("Forget", QDialogButtonBox.ButtonRole.ActionRole)
+        self.forget_btn.clicked.connect(self.forget)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.fill()
+
+    def fill(self) -> None:
+        self.list.clear()
+        for name, n in sorted(remembered_voices().items(), key=lambda x: x[0].casefold()):
+            item = QListWidgetItem(f"{name}  ({n} meeting{'s' if n != 1 else ''})")
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            self.list.addItem(item)
+        self.forget_btn.setEnabled(self.list.count() > 0)
+
+    def forget(self) -> None:
+        item = self.list.currentItem() or self.list.item(0)
+        if item:
+            forget_voice(item.data(Qt.ItemDataRole.UserRole))
+            self.fill()
+
+
 class MeetingsPage(ListDetailPage):
     COLUMNS = ("Title", "Date", "Duration", "Status")
     EMPTY = ("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
@@ -1038,6 +1301,9 @@ class MeetingsPage(ListDetailPage):
                                           "Save the transcript as Markdown, plain text or JSON")
         self.act_folder = self.add_action("document-open-folder", "Open folder", self.open_folder,
                                           "Show the Markdown copy in the file manager")
+        self.act_names = self.add_action("im-user", "Name speakers…", self.name_speakers,
+                                         "Put names on Person 1, Person 2, …; optionally recognise "
+                                         "them by voice in later meetings")
         self.act_delete = self.add_action("edit-delete", "Delete…", self.delete,
                                           "Delete this meeting from voxtype", QKeySequence.StandardKey.Delete)
 
@@ -1119,6 +1385,55 @@ class MeetingsPage(ListDetailPage):
         self.speakers_pending = pending
         if m := self.current():
             self.meta.setText(self.meta_text(m))
+            self.update_names_action(m)
+
+    def update_names_action(self, m: Meeting) -> None:
+        busy = self.is_live(m) or bool(m.stamps() & self.speakers_pending)
+        has_people = bool(m.md_path and md_speakers(self.texts.get(m.md_path) or ""))
+        self.act_names.setEnabled(has_people and not busy)
+        self.act_names.setToolTip(
+            "Wait until the speakers are told apart" if busy and has_people else
+            "Put names on Person 1, Person 2, …; optionally recognise them by voice in later meetings"
+            if has_people else "This transcript has no speakers to name")
+
+    def ask_names(self, speakers: list[tuple[str, str]], has_fingerprints: bool) -> tuple[dict[str, str], bool] | None:
+        """({label: name}, remember voices?) from the dialog, or None if cancelled."""
+        dlg = NameSpeakersDialog(self, speakers, has_fingerprints)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.names(), dlg.remember.isChecked()
+
+    def name_speakers(self) -> None:
+        m = self.current()
+        if m is None or not m.md_path or self.is_live(m) or m.stamps() & self.speakers_pending:
+            return
+        text = read_text(m.md_path)
+        speakers = md_speakers(text or "")
+        if not speakers:
+            return
+        answer = self.ask_names(speakers, meeting_voices_path(m.md_path).exists())
+        if answer is None:
+            return
+        names, remember = answer
+        if remember != remember_voices_on():
+            set_remember_voices(remember)
+        if not names:
+            return
+        try:
+            path = Path(m.md_path)
+            fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(rename_speakers(text or "", names))
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.main.error_box("Could not rename the speakers", str(exc))
+            return
+        remembered = remember_named(m.md_path, names) if remember else []
+        self.main.message("Renamed " + ", ".join(f"{a} → {b}" for a, b in names.items())
+                          + (f"; {', '.join(remembered)} will be recognised in later meetings"
+                             if remembered else ""))
+        self.reload()
 
     def show_detail(self, key: str) -> None:
         m = self.meetings.get(key)
@@ -1128,6 +1443,7 @@ class MeetingsPage(ListDetailPage):
         self.title.setText(m.title)
         self.meta.setText(self.meta_text(m))
         self.act_refresh.setVisible(live or not m.md_path)
+        self.update_names_action(m)
         self.act_delete.setEnabled(not live)
         self.act_delete.setToolTip("Stop the meeting before deleting it" if live
                                    else "Delete this meeting from voxtype")
@@ -1288,6 +1604,8 @@ class MeetingsPage(ListDetailPage):
                 self.main.error_box("Delete failed", err.strip() or f"voxtype exited with status {code}")
                 return
             self.export_cache.pop(m.id, None)
+            if m.md_path:  # its voice fingerprints, if any (remembered names stay)
+                meeting_voices_path(m.md_path).unlink(missing_ok=True)
             text = f"Deleted “{m.title}”"
             if trash_md and m.md_path:
                 if move_to_trash(m.md_path):
@@ -2261,7 +2579,10 @@ class MainWindow(QMainWindow):
 
     def check_data(self) -> None:
         """Reload a list when its source changed (cheap stat calls, every poll)."""
-        sigs = {"meetings": (stat_sig(MEETING_DB), stat_sig(f"{MEETING_DB}-wal"), stat_sig(MEETING_MD_DIR)),
+        shown = self.meetings_page.current()
+        sigs = {"meetings": (stat_sig(MEETING_DB), stat_sig(f"{MEETING_DB}-wal"), stat_sig(MEETING_MD_DIR),
+                             # the open transcript, also when it is edited in place
+                             stat_sig(shown.md_path) if shown and shown.md_path else None),
                 "files": (stat_sig(FILE_HISTORY),)}
         changed = False
         for name, sig in sigs.items():

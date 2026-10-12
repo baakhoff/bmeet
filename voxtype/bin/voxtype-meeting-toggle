@@ -8,6 +8,9 @@
 # Person 2, ...) and replaces the Markdown copy; then the audio is deleted. Both run as
 # systemd user units (bmeet-meeting-audio, bmeet-speakers-STAMP), so this script never
 # waits for them. Off when ~/.config/bmeet/speakers does not say "on".
+# Remembered voices (opt-in, ~/.config/bmeet/remember-voices "on"): the pass also names
+# people the BMeet app was told about, and keeps this meeting's voice fingerprints in
+# ~/.local/share/bmeet/voices so you can name its people afterwards.
 #
 # Bound to Meta+Alt+M via voxtype-meeting.desktop (see docs/voxtype.md).
 #   voxtype-meeting-toggle            toggle
@@ -22,6 +25,8 @@ STAMP_FILE="$RUN_DIR/meeting-toggle.started"  # our own: start time for the file
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype-meeting-toggle.lock"
 BIN_DIR="$HOME/.local/bin"
 SPEAKERS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
+REMEMBER_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices"
+VOICES_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices"
 AUDIO_ROOT="${XDG_RUNTIME_DIR:-/tmp}/bmeet/meeting-audio"
 REC_UNIT=bmeet-meeting-audio
 
@@ -71,12 +76,14 @@ speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
         rm -rf "$dir"
         return 0
     fi
+    local voices=()
+    [ "$(head -n1 "$REMEMBER_FILE" 2>/dev/null)" = on ] && voices=(--voices "$VOICES_DIR")
     # ExecStopPost deletes the audio however the pass ends (done, failed, stopped, logout).
     # The marker tells bmeet-ctl (and so the app) that the pass is running.
     touch "$dir/speaker-pass"
     if systemd-run --user --quiet --collect --unit="bmeet-speakers-$1" -p Nice=10 \
             -p "ExecStopPost=/usr/bin/rm -rf $dir" \
-            "$BIN_DIR/npu-transcribe" --meeting "$dir" --output "$2" --notify; then
+            "$BIN_DIR/npu-transcribe" --meeting "$dir" --output "$2" "${voices[@]}" --notify; then
         return 0
     fi
     rm -rf "$dir"

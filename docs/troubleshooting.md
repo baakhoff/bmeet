@@ -39,6 +39,9 @@ speakers apart…" until it is done.
 | Your own words are missing | The echo filter cuts words where your microphone is less than 2x louder than the echo of the system audio. It can happen if you talk very quietly while the other side is loud. Headphones avoid the echo altogether. |
 | Their words appear under *You* | Usually loud speakers next to a sensitive microphone. Headphones help. |
 | A "-speakers.md" file appeared next to the transcript | You edited the transcript while the pass ran, so your edit was kept and the speaker version was saved next to it. |
+| Someone got the wrong name | Rename them in that meeting with *Name speakers…*. Their fingerprint from that meeting then moves to the right name. Or forget the name in *Remembered voices…*. |
+| A remembered person is not recognised | Their voice sounded different, for example through another microphone or connection. Name them again in that meeting: up to 10 meetings per person are kept, and their mean is compared. |
+| *Name speakers…* is greyed out | The meeting is still recording, its speaker pass is running, or the transcript has no speakers (voxtype's *You* / *Remote* version). |
 
 When you open an issue, include the output of `verify.sh` and
 `journalctl --user -u voxtype -b -n 50`.

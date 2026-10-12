@@ -9,6 +9,7 @@ npu-transcribe --model small --format srt,md,txt --out ~/transcripts *.mp4
 npu-transcribe --language de --translate interview.ogg      # German speech -> English text
 npu-transcribe --speakers interview.m4a                     # Speaker 1: ... Speaker 2: ...
 npu-transcribe --meeting DIR --output MEETING.md            # BMeet's meeting speaker pass
+npu-transcribe --meeting DIR --output MEETING.md --voices ~/.local/share/bmeet/voices
 npu-transcribe --help
 ```
 
@@ -73,6 +74,16 @@ the voices in the system audio become **Person 1**, **Person 2**, …
 - 244 echo words were cut, and none of yours.
 
 `tests/meeting_test.py` builds the same kind of meeting from espeak-ng voices in Russian and English and checks it. espeak's voices are much more alike than people (similarity ~0.35 between its variants), so the test sets a stricter threshold (0.7).
+
+**Remembered voices** (`--meeting … --voices DIR`; BMeet passes it when *remember voices* is on):
+- **Fingerprints:** each voice's fingerprint is the duration-weighted mean of the TitaNet embeddings of its longest turns, up to 60 s of speech, at unit length. They go to `DIR/meetings/<transcript>.json` (0600, folders 0700). Naming people in the BMeet app copies theirs to `DIR/voices.json`, at most 10 per person.
+- **Recognising, turn by turn:** a turn (or, inside a turn of 4 s or more, a 2 s window every 0.5 s) belongs to a remembered person when its embedding is at least 0.55 similar to their voice and 0.1 more similar than to anyone else remembered.
+  - Long turns are split where the recognised person changes for 1.5 s or more. Two similar voices can share one turn in the segmentation.
+  - A voice whose recognised speech is mostly one person's takes their name. Their turns inside another voice (two people the clustering merged) move to them.
+  - Everyone else is numbered as before, *Person 1*, *Person 2*, …, skipping the names.
+- **Why 0.55:** fingerprints of the same LibriSpeech reader from different recordings (through Opus) were at least 0.80 similar, and those of different readers at most 0.40. One utterance against a fingerprint scored at least 0.65 for the same reader and at most 0.41 for others.
+- **Test:** in `tests/meeting_test.py --remember`, a second meeting with new sentences, where the people speak in another order, came out as Anna, Boris and Viktor. That was 100 % in English and 90 % in Russian, where espeak's synthetic Russian makes Whisper's word timing blur at one change of speaker. Without the window check, two of espeak's similar voices shared one turn and one name.
+- **Language:** a meeting's language is detected on the system audio and used for your microphone too. Detecting it again on a track that may hold little speech of your own went wrong in the tests, and Whisper then translated.
 
 **Speed:** about 1/7 of the recording's length.
 - Whisper runs ~15x realtime with word timestamps, once per track.

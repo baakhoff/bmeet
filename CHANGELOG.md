@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-10-12
+
+Meeting speakers get names, and BMeet can recognise them in later meetings.
+
+### Added
+- **Name speakers…** in the app turns *Person 1* into a name in a meeting transcript (the headings and the Speakers line). Two labels can get the same name when the pass split one person in two.
+- **Remembered voices (opt-in):** with *Recognise them by voice in later meetings* ticked, the speaker pass keeps each meeting's voice fingerprints (`~/.local/share/bmeet/voices`, private). Naming people remembers theirs, at most 10 meetings per person, and later meetings call them by name.
+  - Recognition works turn by turn. It splits a turn where a remembered person takes over and pulls a remembered person out of a voice the clustering merged with someone else.
+  - *Remembered voices…* forgets one person; unticking forgets all.
+- **`npu-transcribe --meeting … --voices DIR`**, the same from the command line.
+
+### Changed
+- **Meetings:** the language detected on the system audio is used for your microphone too. Detecting it again on your track alone could pick the wrong language, and Whisper then translated your words.
+- **The app** notices when the open transcript is edited in place.
+
 ## [0.2.0] - 2026-10-12
 
 The project is now called **BMeet**, and meeting transcripts say who said what.
@@ -44,5 +59,6 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.3.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.0
 [0.2.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.2.0
 [0.1.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.1.0

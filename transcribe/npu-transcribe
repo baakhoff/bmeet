@@ -86,7 +86,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -116,6 +116,15 @@ EMBEDDING_MODEL = SPEAKER_MODELS / "nemo_en_titanet_small.onnx"  # NVIDIA TitaNe
 # overrides it: lower when two people end up as one, higher when one person is split.
 SPEAKER_THRESHOLD = float(os.environ.get("NPU_SPEAKER_THRESHOLD") or 0.85)
 WORD_SMOOTH_SECONDS = 0.6     # a speaker change shorter than this inside a sentence is noise
+# Remembered voices (--voices): a voice in a new meeting gets a remembered name when its
+# fingerprint is at least this similar (cosine). TitaNet on LibriSpeech readers through
+# Opus, fingerprints from different recordings: the same person >= 0.80, others <= 0.40.
+VOICE_SIMILARITY = 0.55
+VOICE_MARGIN = 0.1            # ... and at least this much more similar than to anyone else remembered
+VOICE_WINDOW = 2.0            # long turns are also checked in windows this long ...
+VOICE_HOP = 0.5               # ... this far apart, and split where a remembered person
+VOICE_MIN_RUN = 1.5           # changes for at least this long (similar voices share a turn)
+FINGERPRINT_SECONDS = 60      # a person's fingerprint: their longest turns, up to this much speech
 ECHO_MARGIN = 2.0             # meeting: a mic word at most this much louder than the echo
                               # expected from the system audio at that moment is the echo
 ECHO_WINDOW = 2.0             # without word timestamps: look this far around a mic line ...
@@ -470,8 +479,18 @@ def speaker_models_missing() -> list[Path]:
     return [p for p in (SEGMENTATION_MODEL, EMBEDDING_MODEL) if not p.is_file()]
 
 
-def diarize(samples: np.ndarray, num_speakers: int = 0) -> list[Turn]:
-    """Who speaks when, on the CPU (sherpa-onnx). num_speakers=0: find out how many."""
+def unit(v) -> np.ndarray:
+    a = np.asarray(v, np.float64)
+    return a / (np.linalg.norm(a) or 1.0)
+
+
+def diarize(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = False,
+            known: dict[str, list[list[float]]] | None = None
+            ) -> tuple[list[Turn], dict[int, list[float]], dict[int, str]]:
+    """Who speaks when, on the CPU (sherpa-onnx). num_speakers=0: find out how many.
+
+    Returns the turns, each voice's fingerprint (with fingerprints or known; see
+    voice_prints) and the remembered names found among the voices (known; see identify)."""
     try:
         import sherpa_onnx
     except ImportError:
@@ -497,17 +516,144 @@ def diarize(samples: np.ndarray, num_speakers: int = 0) -> list[Turn]:
     result = sd.process(samples).sort_by_start_time()
     order: dict[int, int] = {}
     turns = [Turn(r.start, r.end, order.setdefault(r.speaker, len(order))) for r in result]
-    log(f"{len(order)} voice(s) in {time.monotonic() - t0:.1f} s")
-    return turns
+    prints: dict[int, list[float]] = {}
+    names: dict[int, str] = {}
+    if (fingerprints or known) and turns:
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=str(EMBEDDING_MODEL), num_threads=threads))
+
+        def embed(start: float, end: float) -> np.ndarray:
+            stream = extractor.create_stream()
+            stream.accept_waveform(SAMPLE_RATE, samples[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
+            stream.input_finished()
+            return unit(extractor.compute(stream))
+
+        if known:
+            turns = split_by_known_voices(turns, embed, remembered_voices(known))
+        vecs: dict[int, tuple[np.ndarray, float]] = {}
+        for i, t in enumerate(turns):
+            if t.end - t.start >= 1.0:
+                mid = (t.start + t.end) / 2
+                start, end = max(t.start, mid - 7.5), min(t.end, mid + 7.5)  # at most 15 s
+                vecs[i] = (embed(start, end), end - start)
+        if known:
+            turns, names = identify(turns, vecs, known)
+        prints = voice_prints(turns, vecs)
+    log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s"
+        + (f", recognised: {', '.join(sorted(set(names.values())))}" if names else ""))
+    return turns, prints, names
 
 
-def diarize_aside(samples: np.ndarray, num_speakers: int = 0) -> concurrent.futures.Future:
+def remembered_voices(known: dict[str, list[list[float]]]) -> dict[str, np.ndarray]:
+    """{name: the mean of their fingerprints (unit length)}"""
+    return {name: unit(np.mean([unit(f) for f in fps], axis=0)) for name, fps in known.items()}
+
+
+def who_is(v: np.ndarray, voices: dict[str, np.ndarray]) -> str | None:
+    """The remembered person this embedding belongs to: VOICE_SIMILARITY similar to their
+    voice, and VOICE_MARGIN more than to anyone else remembered; else None."""
+    ranked = sorted(((float(v @ k), name) for name, k in voices.items()), reverse=True)
+    if ranked and ranked[0][0] >= VOICE_SIMILARITY and \
+            (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= VOICE_MARGIN):
+        return ranked[0][1]
+    return None
+
+
+def split_by_known_voices(turns: list[Turn], embed, voices: dict[str, np.ndarray]) -> list[Turn]:
+    """Split turns in which remembered people take turns: with similar voices the
+    segmentation can miss the change. embed(start, end) -> embedding. Turns of
+    2 * VOICE_WINDOW or more are checked in VOICE_WINDOW windows every VOICE_HOP; a
+    remembered person heard for VOICE_MIN_RUN or more gets their own piece."""
+    out: list[Turn] = []
+    for t in turns:
+        if t.end - t.start < 2 * VOICE_WINDOW:
+            out.append(t)
+            continue
+        starts = np.arange(t.start, t.end - VOICE_WINDOW + 1e-6, VOICE_HOP)
+        ids = [who_is(embed(a, a + VOICE_WINDOW), voices) for a in starts]
+        for order in (range(len(ids)), reversed(range(len(ids)))):  # unclear windows: neighbour's
+            last = None
+            for i in order:
+                if ids[i] is None:
+                    ids[i] = last
+                last = ids[i]
+        runs = [[name, len(list(group))] for name, group in itertools.groupby(ids)]
+        min_windows = max(1, round(VOICE_MIN_RUN / VOICE_HOP))
+        merged: list[list] = []
+        for name, n in runs:  # a short run joins its neighbour
+            if merged and (name == merged[-1][0] or n < min_windows):
+                merged[-1][1] += n
+            else:
+                merged.append([name, n])
+        if len(merged) > 1 and merged[0][1] < min_windows:
+            merged[1][1] += merged.pop(0)[1]
+        if len(merged) < 2:
+            out.append(t)
+            continue
+        cuts, i = [t.start], 0
+        for _, n in merged[:-1]:
+            i += n  # first window of the next run: cut between the two windows' middles
+            cuts.append(float(starts[i - 1] + starts[i]) / 2 + VOICE_WINDOW / 2)
+        cuts.append(t.end)
+        out += [Turn(a, b, t.speaker) for a, b in zip(cuts, cuts[1:])]
+    return out
+
+
+def identify(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]],
+             known: dict[str, list[list[float]]]) -> tuple[list[Turn], dict[int, str]]:
+    """Remembered people in a recording. vecs: {turn index: (embedding, seconds)}.
+
+    A turn is a remembered person's when who_is() says so. A voice (cluster) whose
+    recognised speech is mostly one person's takes their name; that person's turns inside
+    another voice (two people the clustering merged) move to them. Returns the turns
+    (moved ones get a new voice number) and {voice: name}."""
+    voices = remembered_voices(known)
+    whose = {i: name for i, (v, _) in vecs.items() if (name := who_is(v, voices))}
+    names: dict[int, str] = {}
+    for voice in {t.speaker for t in turns}:
+        heard: dict[str, float] = {}
+        for i, t in enumerate(turns):
+            if t.speaker == voice and i in whose:
+                heard[whose[i]] = heard.get(whose[i], 0.0) + vecs[i][1]
+        measured = sum(vecs[i][1] for i, t in enumerate(turns) if t.speaker == voice and i in vecs)
+        if heard and (best := max(heard, key=heard.__getitem__)) and heard[best] >= measured / 2:
+            names[voice] = best
+    extra = {name: max(t.speaker for t in turns) + 1 + n for n, name in enumerate(voices)}
+    moved = []
+    for i, t in enumerate(turns):
+        if i in whose and names.get(t.speaker) != whose[i]:
+            t = Turn(t.start, t.end, extra[whose[i]])
+            names[t.speaker] = whose[i]
+        moved.append(t)
+    return moved, names
+
+
+def voice_prints(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]) -> dict[int, list[float]]:
+    """Each voice's fingerprint, to remember it by: the duration-weighted mean of the
+    embeddings of its longest turns, up to FINGERPRINT_SECONDS (unit length)."""
+    prints: dict[int, list[float]] = {}
+    for voice in {t.speaker for t in turns}:
+        total, acc = 0.0, np.zeros(0)
+        for i in sorted((i for i, t in enumerate(turns) if t.speaker == voice and i in vecs),
+                        key=lambda i: -vecs[i][1]):  # longest first
+            if total >= FINGERPRINT_SECONDS:
+                break
+            v, seconds = vecs[i]
+            acc = v * seconds if not acc.size else acc + v * seconds
+            total += seconds
+        if acc.size:
+            prints[voice] = [round(float(x), 5) for x in unit(acc)]
+    return prints
+
+
+def diarize_aside(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = False,
+                  known: dict[str, list[list[float]]] | None = None) -> concurrent.futures.Future:
     """diarize() in a second process, so the CPU tells voices apart while Whisper runs on
     the NPU (sherpa-onnx holds the GIL: in a thread Whisper would just wait). "spawn",
     not fork: the parent may hold the NPU."""
     pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
     try:
-        return pool.submit(diarize, samples, num_speakers)
+        return pool.submit(diarize, samples, num_speakers, fingerprints, known)
     finally:
         pool.shutdown(wait=False)
 
@@ -628,19 +774,35 @@ def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
     return kept, cut
 
 
-def number_speakers(segments: list[Segment], found: list[Turn], word: str,
-                    unknown: str) -> tuple[list[Segment], int]:
+def load_voices(folder: Path) -> dict[str, list[list[float]]]:
+    """Remembered voices, {name: [fingerprint, ...]}, from FOLDER/voices.json (the BMeet
+    app writes it when you name people). Fingerprints of another model are ignored."""
+    try:
+        data = json.loads((folder / "voices.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if data.get("model") != EMBEDDING_MODEL.name:
+        return {}
+    return {name: v["fingerprints"] for name, v in (data.get("voices") or {}).items()
+            if isinstance(v, dict) and v.get("fingerprints")}
+
+
+def number_speakers(segments: list[Segment], found: list[Turn], word: str, unknown: str,
+                    names: dict[int, str] | None = None) -> tuple[list[Segment], dict[int, str]]:
     """Label (and split) segments by speaker as "<word> 1", "<word> 2", ... numbered in the
-    order they first say something (a voice that only coughed gets no number)."""
+    order they first say something (a voice that only coughed gets no number). Voices in
+    `names` (recognised) keep that name instead. Returns the segments and {voice: label}."""
+    names = names or {}
     labelled = [part for seg in segments
                 for part in label_speakers(seg, found, lambda n: "" if n is None else str(n))]
-    order: dict[str, int] = {}
+    labels: dict[int, str] = {}
     for seg in labelled:
-        if seg.speaker:
-            order.setdefault(seg.speaker, len(order) + 1)
+        if seg.speaker and (voice := int(seg.speaker)) not in labels:
+            numbered = sum(1 for v in labels if v not in names)
+            labels[voice] = names.get(voice) or f"{word} {numbered + 1}"
     for seg in labelled:
-        seg.speaker = f"{word} {order[seg.speaker]}" if seg.speaker else unknown
-    return labelled, len(order)
+        seg.speaker = labels[int(seg.speaker)] if seg.speaker else unknown
+    return labelled, labels
 
 
 PART_NAME = re.compile(r"^part-(\d+)-(mic|remote)\.wav$")
@@ -744,13 +906,15 @@ def meeting_md(title: str, started: float | None, duration: float, segments: lis
                       *(body or ["*(no speech detected)*", ""])])
 
 
-def write_atomic(path: Path, text: str) -> None:
-    """Write via a temp file + rename so a crash never leaves half a transcript."""
+def write_atomic(path: Path, text: str, private: bool = False) -> None:
+    """Write via a temp file + rename so a crash never leaves half a transcript.
+    private: keep mkstemp's 0600 (voice fingerprints)."""
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.chmod(tmp, 0o666 & ~UMASK)  # mkstemp creates 0600; use normal file modes
+        if not private:
+            os.chmod(tmp, 0o666 & ~UMASK)  # mkstemp creates 0600; use normal file modes
         os.replace(tmp, path)
     except BaseException:
         os.unlink(tmp)
@@ -888,6 +1052,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="transcribe a BMeet meeting recording (see above) instead of files")
     p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
     p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
+    p.add_argument("--voices", type=Path, metavar="DIR",
+                   help="--meeting: give voices remembered in DIR/voices.json their names, and keep "
+                        "this meeting's voice fingerprints in DIR/meetings/ (BMeet's 'remember voices')")
     args = p.parse_args(argv)
     if args.num_speakers < 0:
         p.error("--num-speakers: expected a positive number")
@@ -895,6 +1062,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.meeting is not None:
         if args.files or not args.output:
             p.error("--meeting DIR takes no FILE and needs --output FILE.md")
+    elif args.voices is not None:
+        p.error("--voices only works with --meeting")
     elif not args.files:
         p.error("the following arguments are required: FILE")
     if args.speakers and (missing := speaker_models_missing()):
@@ -911,6 +1080,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         log("WARNING: whisper-large-v3-turbo was not trained to translate; output may stay untranslated")
     args.language = args.language.lower().strip("<|>")
     return args
+
+
+def save_meeting_voices(folder: Path, transcript: Path, people: dict[str, list[float]]) -> None:
+    """FOLDER/meetings/<transcript name>.json: this meeting's voice fingerprints by label, so
+    the BMeet app can remember the people you name. Private (0700 folders, 0600 file)."""
+    meetings = folder / "meetings"
+    for d in (folder, meetings):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data = {"version": 1, "model": EMBEDDING_MODEL.name, "transcript": transcript.name,
+            "people": people}
+    write_atomic(meetings / f"{transcript.stem}.json", json.dumps(data) + "\n", private=True)
 
 
 def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Path,
@@ -933,15 +1113,22 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
         t0 = time.monotonic()
         audible = {name: samples.size > 0 and peak_dbfs(samples) >= SILENCE_DBFS
                    for name, samples in (("system audio", remote), ("microphone", mic))}
-        voices = diarize_aside(remote, args.num_speakers) if audible["system audio"] else None
-        heard: dict[str, Transcript | None] = {}
-        for name, samples in (("system audio", remote), ("microphone", mic)):
-            heard[name] = transcribe(whisper, name, array_blocks(samples), samples.size / SAMPLE_RATE,
-                                     gen_kwargs) if audible[name] else None
-        theirs, yours = heard["system audio"], heard["microphone"]
-        remote_segments, people = [], 0
+        remembered = load_voices(args.voices.expanduser()) if args.voices else {}
+        voices = diarize_aside(remote, args.num_speakers, args.voices is not None, remembered) \
+            if audible["system audio"] else None
+        theirs = transcribe(whisper, "system audio", array_blocks(remote), remote.size / SAMPLE_RATE,
+                            gen_kwargs) if audible["system audio"] else None
+        if "language" not in gen_kwargs and theirs and theirs.language != "?":
+            # One language per meeting: detecting it again on your track, which may hold little
+            # speech of your own, can go wrong (and Whisper then translates).
+            gen_kwargs = dict(gen_kwargs, language=f"<|{theirs.language}|>")
+        yours = transcribe(whisper, "microphone", array_blocks(mic), mic.size / SAMPLE_RATE,
+                           gen_kwargs) if audible["microphone"] else None
+        remote_segments, labels, prints, names = [], {}, {}, {}
         if voices and theirs and theirs.segments:
-            remote_segments, people = number_speakers(theirs.segments, voices.result(), "Person", "Remote")
+            found, prints, names = voices.result()
+            remote_segments, labels = number_speakers(theirs.segments, found, "Person", "Remote", names)
+        people = len(set(labels.values()))
         my_segments = [Segment(s.start, s.end, s.text, s.words, "You") for s in yours.segments] \
             if yours else []
         my_segments, echoes = drop_echo(my_segments, theirs.segments if theirs else [], mic, remote)
@@ -955,6 +1142,8 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
             "Transcribed": f"{model_dir.name} on {whisper.device} in {hms(wall)}; "
                            "voices told apart by sherpa-onnx",
         }
+        if recognised := sorted({names[v] for v in labels if v in names}):
+            meta["Recognised by voice"] = ", ".join(recognised)
         if echoes:
             meta["Echo"] = (f"{echoes} word(s) your microphone picked up from the speakers "
                             "were left out")
@@ -963,6 +1152,12 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
             dest = out.with_name(f"{out.stem}-speakers.md")
             log(f"{out.name} changed while this ran; writing {dest.name} instead")
         write_atomic(dest, meeting_md(title, info.get("started"), duration, segments, meta))
+        if args.voices and prints:  # so the people can be named and remembered later
+            people_prints: dict[str, list[float]] = {}
+            for v, label in labels.items():  # (a name can cover two voices: keep the longer)
+                if v in prints and label not in people_prints:
+                    people_prints[label] = prints[v]
+            save_meeting_voices(args.voices.expanduser(), dest, people_prints)
     except Exception as exc:
         log(f"ERROR: {exc}")
         if args.notify:
@@ -970,10 +1165,13 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
                    "Meeting speakers failed")
         return 1
     print(dest, flush=True)
-    log(f"done: {hms(duration)} in {hms(wall)}, {people} other voice(s), "
+    log(f"done: {hms(duration)} in {hms(wall)}, {people} other voice(s)"
+        + (f" ({', '.join(recognised)} recognised)" if names and recognised else "") + ", "
         f"{len(segments)} segment(s)" + (f", {echoes} echo word(s) left out" if echoes else ""))
     if args.notify:
-        notify(True, [f"{people} other voice(s) told apart", str(dest)], "Meeting speakers identified")
+        who = ", ".join(sorted(set(labels.values()), key=list(labels.values()).index))
+        notify(True, [f"{people} other voice(s): {who}" if people else "no other voices", str(dest)],
+               "Meeting speakers identified")
     return 0
 
 
@@ -1038,8 +1236,9 @@ def main(argv: list[str]) -> int:
                 t = transcribe(whisper, src.name, array_blocks(samples), samples.size / SAMPLE_RATE,
                                gen_kwargs)
                 t0 = time.monotonic()
-                found = voices.result() if t.segments else []
-                t.segments, speakers = number_speakers(t.segments, found, "Speaker", "Speaker ?")
+                found = voices.result()[0] if t.segments else []  # (turns, prints, names)
+                t.segments, labels = number_speakers(t.segments, found, "Speaker", "Speaker ?")
+                speakers = len(labels)
                 t.wall += time.monotonic() - t0  # the part of the diarization Whisper did not hide
                 del samples
             else:

@@ -45,8 +45,8 @@ class Labelling(unittest.TestCase):
         seg = Seg(0.5, 6.0, "Okay that is all. Thank you Viktor, go on.",
                   words("Okay@0.5-0.8 that@0.8-1.0 is@1.0-1.2 all.@1.2-1.6 Thank@4.3-4.6 you@4.6-4.8 "
                         "Viktor,@4.8-5.3 go@5.4-5.6 on.@5.6-6.0"))
-        parts, n = nt.number_speakers([seg], self.TURNS, "Person", "Remote")
-        self.assertEqual(n, 2)
+        parts, labels = nt.number_speakers([seg], self.TURNS, "Person", "Remote")
+        self.assertEqual(labels, {0: "Person 1", 1: "Person 2"})
         self.assertEqual([(p.speaker, p.text) for p in parts],
                          [("Person 1", "Okay that is all."), ("Person 2", "Thank you Viktor, go on.")])
         self.assertEqual((parts[1].start, parts[1].end), (4.3, 6.0))
@@ -55,24 +55,125 @@ class Labelling(unittest.TestCase):
         turns = [Turn(0, 2.0, 0), Turn(2.0, 2.3, 1), Turn(2.3, 6, 0)]
         seg = Seg(0, 5, "one two three four five",
                   words("one@0-0.9 two@1-1.9 three@2.0-2.3 four@2.4-3.5 five@3.6-4.5"))
-        parts, n = nt.number_speakers([seg], turns, "Person", "Remote")
+        parts, labels = nt.number_speakers([seg], turns, "Person", "Remote")
         self.assertEqual([(p.speaker, p.text) for p in parts], [("Person 1", "one two three four five")])
-        self.assertEqual(n, 1)
+        self.assertEqual(len(labels), 1)
 
     def test_no_voices_found(self):
         seg = Seg(0, 2, "hello", words("hello@0.2-0.8"))
-        parts, n = nt.number_speakers([seg], [], "Person", "Remote")
-        self.assertEqual((parts[0].speaker, n), ("Remote", 0))
+        parts, labels = nt.number_speakers([seg], [], "Person", "Remote")
+        self.assertEqual((parts[0].speaker, labels), ("Remote", {}))
 
     def test_numbered_by_first_words(self):
         # diarization's voice 1 says the first words here: it becomes Speaker 1
         parts, _ = nt.number_speakers([Seg(4.5, 8, "hello there")], self.TURNS, "Speaker", "?")
         self.assertEqual(parts[0].speaker, "Speaker 1")
 
+    def test_recognised_voices_keep_their_name(self):
+        segs = [Seg(0.5, 2, "hi"), Seg(4.5, 6, "hello"), Seg(9.6, 11, "bye")]
+        turns = self.TURNS + [Turn(12, 14, 2)]
+        segs.append(Seg(12.2, 13.5, "late"))
+        parts, labels = nt.number_speakers(segs, turns, "Person", "Remote", {1: "Viktor"})
+        self.assertEqual([p.speaker for p in parts], ["Person 1", "Viktor", "Person 1", "Person 2"])
+        self.assertEqual(labels, {0: "Person 1", 1: "Viktor", 2: "Person 2"})
+
     def test_words_between_turns_take_a_neighbour(self):
         seg = Seg(3, 6, "a b c", words("a@3.0-3.5 b@4.05-4.15 c@4.4-5.0"))
         parts, _ = nt.number_speakers([seg], [Turn(0, 3.6, 0), Turn(5.5, 9, 1)], "P", "?")
         self.assertEqual(len(parts), 1)  # b and c are near voice 0's end (within 1 s)
+
+
+class Voices(unittest.TestCase):
+    @staticmethod
+    def vec(*xs):
+        v = np.zeros(192)
+        v[:len(xs)] = xs
+        return list(v)
+
+    def turns_and_vecs(self, *spec):
+        """spec: (start, end, voice, embedding or None) per turn"""
+        turns = [Turn(a, b, v) for a, b, v, _ in spec]
+        vecs = {i: (nt.unit(e), b - a) for i, (a, b, _, e) in enumerate(spec) if e is not None}
+        return turns, vecs
+
+    def test_identify_names_voices_and_splits_merged_people(self):
+        anna, boris, other = self.vec(1, 0, 0), self.vec(0, 1, 0), self.vec(0, 0, 1)
+        # the clustering put Anna and Boris into voice 0; voice 1 is someone not remembered
+        turns, vecs = self.turns_and_vecs((0, 3, 0, anna), (3.5, 6, 0, boris), (6.2, 6.6, 0, None),
+                                          (7, 9, 1, other), (9.5, 12, 0, anna))
+        moved, names = nt.identify(turns, vecs, {"Anna": [anna], "Boris": [self.vec(0.1, 1, 0)]})
+        self.assertEqual([t.speaker for t in moved], [0, 3, 0, 1, 0])   # Boris's turn split off
+        self.assertEqual(names, {0: "Anna", 3: "Boris"})
+
+    def test_identify_needs_similarity_and_margin(self):
+        both = self.vec(1, 0.9, 0)       # 0.74 like Anna, 0.67 like Boris: too close to call
+        weak = self.vec(0.5, 0, 1)       # 0.45 like Anna: not enough
+        turns, vecs = self.turns_and_vecs((0, 3, 0, both), (4, 6, 1, weak))
+        moved, names = nt.identify(turns, vecs, {"Anna": [self.vec(1, 0, 0)], "Boris": [self.vec(0, 1, 0)]})
+        self.assertEqual((moved, names), (turns, {}))
+
+    def test_identify_several_fingerprints(self):
+        # Boris remembered from two meetings: their mean is compared (0.60 and 0.51 here)
+        voices = {"Boris": [self.vec(0, 1, 0.3), self.vec(0, 1, -0.3)]}
+        turns, vecs = self.turns_and_vecs((0, 2, 0, self.vec(0.8, 0.6, 0)))
+        self.assertEqual(nt.identify(turns, vecs, voices)[1], {0: "Boris"})
+        turns, vecs = self.turns_and_vecs((0, 2, 0, self.vec(0.85, 0.5, 0)))
+        self.assertEqual(nt.identify(turns, vecs, voices)[1], {})
+
+    def test_split_turn_where_remembered_people_change(self):
+        boris, viktor = nt.unit(self.vec(0, 1, 0)), nt.unit(self.vec(1, 0, 0))
+
+        def embed(a, b):  # Viktor speaks 11.5-14.5 s inside a turn the segmentation gave Boris
+            mid = (a + b) / 2
+            return viktor if 11.5 <= mid < 14.5 else boris
+        out = nt.split_by_known_voices([Turn(0, 3, 0), Turn(8, 18, 0)], embed,
+                                       {"Boris": boris, "Viktor": viktor})
+        self.assertEqual([(t.start, t.speaker) for t in out[:2]], [(0, 0), (8, 0)])
+        self.assertEqual(len(out), 4)
+        self.assertAlmostEqual(out[2].start, 11.5, delta=0.26)
+        self.assertAlmostEqual(out[3].start, 14.5, delta=0.26)
+        self.assertEqual(out[3].end, 18)
+
+    def test_short_or_unclear_changes_do_not_split(self):
+        boris, viktor = nt.unit(self.vec(0, 1, 0)), nt.unit(self.vec(1, 0, 0))
+        blip = nt.split_by_known_voices(
+            [Turn(0, 10, 0)], lambda a, b: viktor if 5 <= (a + b) / 2 < 5.6 else boris,
+            {"Boris": boris, "Viktor": viktor})   # Viktor for < VOICE_MIN_RUN: not a change
+        self.assertEqual(blip, [Turn(0, 10, 0)])
+        unknown = nt.split_by_known_voices(
+            [Turn(0, 10, 0)], lambda a, b: nt.unit(self.vec(0, 0, 1)) if a > 4 else boris,
+            {"Boris": boris})                      # someone not remembered: left to the clustering
+        self.assertEqual(unknown, [Turn(0, 10, 0)])
+
+    def test_voice_prints_weight_the_longest_turns(self):
+        turns, vecs = self.turns_and_vecs((0, 4, 0, self.vec(1, 0)), (5, 6, 0, self.vec(0, 1)),
+                                          (7, 9, 1, self.vec(0, 0, 1)), (9, 9.5, 1, None))
+        prints = nt.voice_prints(turns, vecs)
+        self.assertAlmostEqual(prints[0][0], 4 / 17 ** 0.5, places=4)   # 4 s of (1,0) + 1 s of (0,1)
+        self.assertAlmostEqual(prints[0][1], 1 / 17 ** 0.5, places=4)
+        self.assertEqual(prints[1][:3], [0.0, 0.0, 1.0])
+
+    def test_voices_file(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
+        import json
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        try:
+            self.assertEqual(nt.load_voices(tmp), {})  # none yet
+            fp = self.vec(1, 2)
+            (tmp / "voices.json").write_text(json.dumps({"version": 1, "model": nt.EMBEDDING_MODEL.name,
+                                                         "voices": {"Anna": {"fingerprints": [fp]}}}))
+            self.assertEqual(nt.load_voices(tmp), {"Anna": [fp]})
+            (tmp / "voices.json").write_text(json.dumps({"version": 1, "model": "other.onnx",
+                                                         "voices": {"Anna": {"fingerprints": [fp]}}}))
+            self.assertEqual(nt.load_voices(tmp), {})  # another model's fingerprints don't compare
+            nt.save_meeting_voices(tmp / "v", Path("/x/2026-10-12_1041-meeting.md"), {"Person 1": fp})
+            saved = tmp / "v/meetings/2026-10-12_1041-meeting.json"
+            self.assertEqual(json.loads(saved.read_text())["people"], {"Person 1": fp})
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((tmp / "v").stat().st_mode & 0o777, 0o700)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class Echo(unittest.TestCase):

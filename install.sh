@@ -31,7 +31,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.2.0
+    local VERSION=0.3.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"

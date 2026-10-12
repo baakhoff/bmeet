@@ -80,6 +80,13 @@ if [ "$speakers" = on ]; then
         && ok "sherpa-onnx in the venv" || bad "sherpa-onnx missing from the venv (run the installer again)"
     command -v pw-record >/dev/null && [ -x "$HOME/.local/bin/bmeet-meeting-audio" ] \
         && ok "meeting audio recorder (pw-record, bmeet-meeting-audio)" || bad "pw-record or bmeet-meeting-audio missing"
+    if [ "$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices" 2>/dev/null)" = on ]; then
+        n=$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["voices"]))' \
+            "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices/voices.json" 2>/dev/null || echo 0)
+        info "remembered voices: on, $n person/people (BMeet app: Name speakers… > Remembered voices…)"
+    else
+        info "remembered voices: off (people are numbered; turn on in the app's Name speakers… dialog)"
+    fi
 else
     info "telling speakers apart is off: meetings are labelled You / Remote (installer --no-speakers)"
 fi

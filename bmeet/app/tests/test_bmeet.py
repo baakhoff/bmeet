@@ -169,6 +169,7 @@ ENV = {
     "NPU_TRANSCRIBE_HISTORY": str(WORK / "history.jsonl"),
     "BMEET_RUN_DIR": str(WORK / "run"),
     "BMEET_AUDIO_DIR": str(WORK / "meeting-audio"),
+    "BMEET_VOICES_DIR": str(WORK / "voices"),
     "BMEET_VOXTYPE": str(HERE / "fake-voxtype"),
     "BMEET_TRANSCRIBE": str(HERE / "fake-npu-transcribe"),
     "FAKE_VOXTYPE_DB": str(WORK / "index.db"),
@@ -345,6 +346,68 @@ class A_DataTests(unittest.TestCase):
         (run / "state").write_text("idle\n")
         (run / "meeting_state").write_text("idle\n")
         self.assertEqual(vn.ctl.status()["meeting_id"], None)
+
+    SPEAKER_MD = ("# Meeting\n\n## Meeting Info\n\n- **Speakers:** You, Person 1, Person 2, Person 3\n\n"
+                  "## Transcript\n\n### Person 1\n\n*[00:00]* Hello, Person 2 here is late.\n\n"
+                  "### You\n\n*[00:04]* Hi.\n\n### Person 2\n\n*[00:06]* Sorry.\n\n"
+                  "### Person 3\n\n*[00:09]* Me again.\n")
+
+    def test_md_speakers_and_rename(self):
+        self.assertEqual(vn.md_speakers(self.SPEAKER_MD),
+                         [("Person 1", "Hello, Person 2 here is late."), ("Person 2", "Sorry."),
+                          ("Person 3", "Me again.")])
+        out = vn.rename_speakers(self.SPEAKER_MD, {"Person 1": "Viktor", "Person 3": "Viktor",
+                                                   "Person 2": "Анна"})
+        self.assertIn("- **Speakers:** You, Viktor, Анна\n", out)
+        self.assertIn("### Viktor\n\n*[00:00]* Hello, Person 2 here is late.", out)  # text untouched
+        self.assertIn("### Анна\n", out)
+        self.assertEqual(out.count("### Viktor"), 2)
+        self.assertNotIn("Person 3", out)
+        self.assertTrue(out.endswith("Me again.\n"))
+        self.assertEqual(vn.rename_speakers("### Person 1", {"Person 1": "A"}), "### A")  # no newline at end
+
+    def test_name_problems(self):
+        for ok in ("Viktor", "Анна Петрова", "Dr. O'Neil"):
+            self.assertIsNone(vn.name_problem(ok), ok)
+        for bad in ("", "You", "Person 4", "Remote", "a, b", "# x", "x" * 41, "*bold*"):
+            self.assertIsNotNone(vn.name_problem(bad), bad)
+
+    def test_remember_named_voices(self):
+        voices = WORK / "voices"
+        md = str(WORK / "Meetings/2026-10-12_1041-meeting.md")
+        side = vn.meeting_voices_path(md)
+        self.assertEqual(side, voices / "meetings/2026-10-12_1041-meeting.json")
+        try:
+            self.assertEqual(vn.remember_named(md, {"Person 1": "Viktor"}), [])  # no fingerprints
+            side.parent.mkdir(parents=True)
+            side.write_text(json.dumps({"version": 1, "model": "m.onnx",
+                                        "people": {"Person 1": [1.0, 0.0], "Person 2": [0.0, 1.0]}}))
+            self.assertEqual(vn.remember_named(md, {"Person 1": "Viktor"}), ["Viktor"])
+            store = json.loads((voices / "voices.json").read_text())
+            self.assertEqual(store["model"], "m.onnx")
+            self.assertEqual(store["voices"]["Viktor"]["fingerprints"], [[1.0, 0.0]])
+            self.assertEqual((voices / "voices.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(side.read_text())["people"],
+                             {"Viktor": [1.0, 0.0], "Person 2": [0.0, 1.0]})
+            # a typo fixed: this meeting's fingerprint moves to the new name
+            self.assertEqual(vn.remember_named(md, {"Viktor": "Victor"}), ["Victor"])
+            self.assertEqual(vn.remembered_voices(), {"Victor": 1})
+            # the same person in another meeting: a second fingerprint
+            md2 = str(WORK / "Meetings/2026-10-13_0900-meeting.md")
+            vn.meeting_voices_path(md2).write_text(json.dumps({"model": "m.onnx",
+                                                               "people": {"Person 1": [0.9, 0.1]}}))
+            vn.remember_named(md2, {"Person 1": "Victor"})
+            self.assertEqual(vn.remembered_voices(), {"Victor": 2})
+            vn.forget_voice("Victor")
+            self.assertEqual(vn.remembered_voices(), {})
+            vn.set_remember_voices(True)
+            self.assertTrue(vn.remember_voices_on())
+            vn.set_remember_voices(False)  # off forgets everything
+            self.assertFalse(vn.remember_voices_on())
+            self.assertFalse(voices.exists())
+        finally:
+            shutil.rmtree(voices, ignore_errors=True)
+            vn.REMEMBER_FILE.unlink(missing_ok=True)
 
     def test_ctl_speakers_pending(self):
         audio = WORK / "meeting-audio"
@@ -575,6 +638,67 @@ class B_WindowTests(unittest.TestCase):
             shutil.rmtree(marker.parent, ignore_errors=True)
             md.write_text(before)
             self.state()
+
+    def test_18_name_speakers(self):
+        w, p = self.win, self.win.meetings_page
+        w.set_page("meetings")
+        self.select(p, FIX["ids"]["B"])
+        self.assertFalse(p.act_names.isEnabled())  # no speaker headings in this transcript
+        md = Path(p.meetings[FIX["ids"]["B"]].md_path)
+        before = md.read_text()
+        side = vn.meeting_voices_path(str(md))
+        asked = []
+        p.ask_names = lambda speakers, has_fp: asked.append((speakers, has_fp)) or (
+            {"Person 1": "Viktor"}, True)
+        try:
+            md.write_text(A_DataTests.SPEAKER_MD)
+            side.parent.mkdir(parents=True)
+            side.write_text(json.dumps({"model": "m.onnx", "people": {"Person 1": [1.0, 0.0]}}))
+            self.state()  # (reload: the file changed)
+            self.select(p, FIX["ids"]["B"])
+            self.assertTrue(wait_until(lambda: p.act_names.isEnabled()))
+            p.act_names.trigger()
+            self.assertEqual(asked[0][0][0], ("Person 1", "Hello, Person 2 here is late."))
+            self.assertTrue(asked[0][1])  # this meeting has fingerprints
+            self.assertIn("### Viktor", md.read_text())
+            self.assertEqual(vn.remembered_voices(), {"Viktor": 1})
+            self.assertTrue(vn.remember_voices_on())
+            self.assertTrue(wait_until(lambda: "### Viktor" in p.current_text), p.current_text)
+            # while a speaker pass runs it cannot be renamed
+            marker = WORK / "meeting-audio" / md.name[:15] / "speaker-pass"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            self.state()
+            self.assertFalse(p.act_names.isEnabled())
+            shutil.rmtree(marker.parent)
+            self.state()
+            self.assertTrue(p.act_names.isEnabled())
+        finally:
+            md.write_text(before)
+            shutil.rmtree(WORK / "voices", ignore_errors=True)
+            vn.REMEMBER_FILE.unlink(missing_ok=True)
+            del p.ask_names
+            self.state()
+
+    def test_19_name_speakers_dialog(self):
+        vn.set_remember_voices(False)
+        dlg = vn.NameSpeakersDialog(self.win, [("Person 1", "Hello."), ("Viktor", "Hi.")], False)
+        try:
+            self.assertEqual(dlg.fields["Person 1"].text(), "")      # a label: empty field
+            self.assertEqual(dlg.fields["Viktor"].text(), "Viktor")  # a name: prefilled
+            self.assertFalse(dlg.remember.isChecked())
+            dlg.fields["Person 1"].setText("Person 7")
+            dlg.accept()
+            self.assertFalse(dlg.isHidden() and dlg.result() == vn.QDialog.DialogCode.Accepted)
+            self.assertIn("Person 7", dlg.error.text())
+            dlg.fields["Person 1"].setText(" Anna ")
+            dlg.remember.setChecked(True)
+            self.assertIn("next meeting", dlg.note.text())  # no fingerprints in this one
+            self.assertEqual(dlg.names(), {"Person 1": "Anna"})
+            self.assertEqual(dlg.problems(), [])
+        finally:
+            dlg.deleteLater()
+            vn.REMEMBER_FILE.unlink(missing_ok=True)
 
     def test_11_meeting_via_export(self):
         p = self.win.meetings_page

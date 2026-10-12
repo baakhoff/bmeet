@@ -2,6 +2,13 @@
 # Start or stop a voxtype meeting (mic + system audio). On stop, wait until the daemon
 # has transcribed the last chunk, then save a Markdown copy into ~/Documents/Meetings.
 #
+# Speakers (BMeet): while the meeting runs, bmeet-meeting-audio records both sources into
+# RAM ($XDG_RUNTIME_DIR/bmeet/meeting-audio/STAMP). After the stop, `npu-transcribe
+# --meeting` transcribes them again, tells the voices in the system audio apart (Person 1,
+# Person 2, ...) and replaces the Markdown copy; then the audio is deleted. Both run as
+# systemd user units (bmeet-meeting-audio, bmeet-speakers-STAMP), so this script never
+# waits for them. Off when ~/.config/bmeet/speakers does not say "on".
+#
 # Bound to Meta+Alt+M via voxtype-meeting.desktop (see docs/voxtype.md).
 #   voxtype-meeting-toggle            toggle
 #   voxtype-meeting-toggle start|stop explicit
@@ -13,6 +20,10 @@ RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
 STATE_FILE="$RUN_DIR/meeting_state"          # written by the voxtype daemon
 STAMP_FILE="$RUN_DIR/meeting-toggle.started"  # our own: start time for the file name
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype-meeting-toggle.lock"
+BIN_DIR="$HOME/.local/bin"
+SPEAKERS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
+AUDIO_ROOT="${XDG_RUNTIME_DIR:-/tmp}/bmeet/meeting-audio"
+REC_UNIT=bmeet-meeting-audio
 
 notify() {  # best effort; never fail the toggle because of a notification
     notify-send -a "Voxtype" -i "${3:-audio-input-microphone}" "$1" "${2:-}" 2>/dev/null || true
@@ -20,6 +31,56 @@ notify() {  # best effort; never fail the toggle because of a notification
 
 meeting_state() {  # first line of the daemon's state file: recording|paused|idle
     head -n1 "$STATE_FILE" 2>/dev/null || echo idle
+}
+
+speakers_on() {
+    [ "$(head -n1 "$SPEAKERS_FILE" 2>/dev/null)" = on ] && command -v pw-record >/dev/null \
+        && [ -x "$BIN_DIR/bmeet-meeting-audio" ] && [ -x "$BIN_DIR/npu-transcribe" ]
+}
+
+clean_audio() {  # recordings no unit works on any more (a crash, a stop from elsewhere)
+    local d
+    for d in "$AUDIO_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"
+        systemctl --user is-active --quiet "bmeet-speakers-$(basename "$d").service" || rm -rf "$d"
+    done
+}
+
+start_audio() {  # $1 stamp, $2 title; best effort: the live transcript works without it
+    speakers_on || return 0
+    systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true
+    systemctl --user reset-failed "$REC_UNIT.service" 2>/dev/null || true
+    clean_audio
+    local dir="$AUDIO_ROOT/$1"
+    install -d -m 0700 "${AUDIO_ROOT%/*}" "$AUDIO_ROOT" "$dir"
+    printf '{"title": "%s", "started": %s}\n' "$(printf '%s' "$2" | sed 's/[\\"]/\\&/g')" \
+        "$(date +%s)" > "$dir/meeting.json"
+    if ! systemd-run --user --quiet --collect --unit="$REC_UNIT" \
+            -p KillSignal=SIGINT -p TimeoutStopSec=15 "$BIN_DIR/bmeet-meeting-audio" "$dir"; then
+        rm -rf "$dir"
+        notify "Speakers will not be told apart" "The meeting audio recorder did not start" dialog-warning
+    fi
+}
+
+speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
+    local dir="$AUDIO_ROOT/$1"
+    systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true  # (it also ends on "idle")
+    [ -d "$dir" ] || return 0
+    if ! ls "$dir"/part-*-remote.wav >/dev/null 2>&1; then
+        rm -rf "$dir"
+        return 0
+    fi
+    # ExecStopPost deletes the audio however the pass ends (done, failed, stopped, logout).
+    # The marker tells bmeet-ctl (and so the app) that the pass is running.
+    touch "$dir/speaker-pass"
+    if systemd-run --user --quiet --collect --unit="bmeet-speakers-$1" -p Nice=10 \
+            -p "ExecStopPost=/usr/bin/rm -rf $dir" \
+            "$BIN_DIR/npu-transcribe" --meeting "$dir" --output "$2" --notify; then
+        return 0
+    fi
+    rm -rf "$dir"
+    notify "Speakers not told apart" "Could not start npu-transcribe; the transcript has You/Remote only" dialog-warning
 }
 
 start_meeting() {
@@ -31,7 +92,10 @@ start_meeting() {
         exit 1
     fi
     mkdir -p "$RUN_DIR"
-    date '+%Y-%m-%d_%H%M' > "$STAMP_FILE"
+    local stamp
+    stamp="$(date '+%Y-%m-%d_%H%M')"
+    echo "$stamp" > "$STAMP_FILE"
+    start_audio "$stamp" "$title"
     notify "Meeting recording started" "Microphone + system audio. Press again to stop."
 }
 
@@ -42,28 +106,37 @@ stop_meeting() {
     fi
     notify "Meeting stopped" "Transcribing the last chunk..." media-playback-stop
 
-    # The daemon flushes the final chunk, saves, then writes "idle". Allow 5 minutes.
-    for _ in $(seq 1 600); do
-        [ "$(meeting_state)" = "idle" ] && break
-        sleep 0.5
-    done
-    if [ "$(meeting_state)" != "idle" ]; then
-        notify "Meeting export not done" "Daemon still busy. Later run: voxtype meeting export latest -o FILE.md" dialog-warning
-        exit 1
-    fi
-
     local stamp file
     stamp="$(cat "$STAMP_FILE" 2>/dev/null || date '+%Y-%m-%d_%H%M')"
     mkdir -p "$OUT_DIR"
     file="$OUT_DIR/$stamp-meeting.md"
     [ -e "$file" ] && file="$OUT_DIR/$stamp-meeting-$(date +%s).md"   # never overwrite
+
+    # The daemon flushes the final chunk, saves, then writes "idle". Allow 5 minutes.
+    for _ in $(seq 1 600); do
+        [ "$(meeting_state)" = "idle" ] && break
+        sleep 0.5
+    done
+    # (when voxtype's own transcript cannot be saved, the speaker pass still writes one)
+    if [ "$(meeting_state)" != "idle" ]; then
+        notify "Meeting export not done" "Daemon still busy. Later run: voxtype meeting export latest -o FILE.md" dialog-warning
+        speaker_pass "$stamp" "$file"
+        exit 1
+    fi
     if ! voxtype meeting export latest --format markdown --timestamps --speakers --metadata --output "$file"; then
         notify "Meeting export failed" "Saved in voxtype's database; try: voxtype meeting export latest -o FILE.md" dialog-warning
+        speaker_pass "$stamp" "$file"
         exit 1
     fi
     rm -f "$STAMP_FILE"
-    notify "Meeting transcript saved" "$file" document-save
+    if [ -d "$AUDIO_ROOT/$stamp" ]; then
+        notify "Meeting transcript saved" "$file
+Telling the speakers apart; the file is updated in a few minutes." document-save
+    else
+        notify "Meeting transcript saved" "$file" document-save
+    fi
     echo "$file"
+    speaker_pass "$stamp" "$file"
 }
 
 # One toggle at a time (double-clicked panel button, key auto-repeat...).

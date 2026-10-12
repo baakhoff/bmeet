@@ -168,6 +168,7 @@ ENV = {
     "VOXTYPE_MEETING_DIR": str(WORK / "Meetings"),
     "NPU_TRANSCRIBE_HISTORY": str(WORK / "history.jsonl"),
     "BMEET_RUN_DIR": str(WORK / "run"),
+    "BMEET_AUDIO_DIR": str(WORK / "meeting-audio"),
     "BMEET_VOXTYPE": str(HERE / "fake-voxtype"),
     "BMEET_TRANSCRIBE": str(HERE / "fake-npu-transcribe"),
     "FAKE_VOXTYPE_DB": str(WORK / "index.db"),
@@ -344,6 +345,17 @@ class A_DataTests(unittest.TestCase):
         (run / "state").write_text("idle\n")
         (run / "meeting_state").write_text("idle\n")
         self.assertEqual(vn.ctl.status()["meeting_id"], None)
+
+    def test_ctl_speakers_pending(self):
+        audio = WORK / "meeting-audio"
+        self.assertEqual(vn.ctl.status()["speakers_pending"], [])   # no folder at all
+        (audio / "2026-10-12_1041").mkdir(parents=True)               # still recording
+        (audio / "2026-10-12_0900").mkdir()
+        (audio / "2026-10-12_0900" / "speaker-pass").touch()          # pass running
+        try:
+            self.assertEqual(vn.ctl.status()["speakers_pending"], ["2026-10-12_0900"])
+        finally:
+            shutil.rmtree(audio)
 
     def test_export_cmd(self):
         self.assertEqual(vn.export_cmd("ID", "json", "/o.json")[-5:], ["--metadata", "--output", "/o.json", "--", "ID"])
@@ -538,6 +550,31 @@ class B_WindowTests(unittest.TestCase):
         p.act_copy.trigger()
         self.assertIn("budget", QApplication.clipboard().text())
         p.act_folder.trigger()  # dry run
+
+    def test_17_speaker_pass_replaces_transcript(self):
+        """While the speaker pass runs the meeting says so; when it replaces the Markdown
+        copy, the new text is shown without selecting the meeting again."""
+        w, p = self.win, self.win.meetings_page
+        w.set_page("meetings")
+        self.select(p, FIX["ids"]["B"])
+        md = Path(p.meetings[FIX["ids"]["B"]].md_path)
+        before = md.read_text()
+        marker = WORK / "meeting-audio" / md.name[:15] / "speaker-pass"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+        try:
+            self.state()
+            self.assertIn("Telling the speakers apart", p.meta.text())
+            md.write_text("# Meeting B\n\n## Transcript\n\n### Person 1\n\n*[00:01]* The budget.\n")
+            os.utime(md, (time.time() + 5, time.time() + 5))  # a new mtime even on coarse clocks
+            shutil.rmtree(marker.parent)
+            self.state()
+            self.assertTrue(wait_until(lambda: "Person 1" in p.view.toPlainText()), p.view.toPlainText())
+            self.assertNotIn("Telling the speakers apart", p.meta.text())
+        finally:
+            shutil.rmtree(marker.parent, ignore_errors=True)
+            md.write_text(before)
+            self.state()
 
     def test_11_meeting_via_export(self):
         p = self.win.meetings_page

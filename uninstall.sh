@@ -4,7 +4,7 @@
 #   bash ~/.local/share/bmeet/src/uninstall.sh [--keep-system] [--purge]
 #
 #   --keep-system   leave voxtype, the OpenVINO GenAI SDK etc. installed (no sudo)
-#   --purge         also delete the Whisper models (~/.local/share/npu-models/whisper-*),
+#   --purge         also delete the Whisper and speaker models (~/.local/share/npu-models),
 #                   the NPU compile cache and the download cache
 #
 # Never deleted: meeting transcripts (~/Documents/Meetings, voxtype's meetings database),
@@ -41,6 +41,7 @@ bash "$src/voxtype/user-setup.sh" --uninstall || true
 if [ -n "$purge" ]; then
     say "Models and caches"
     rm -rf "$models/whisper-small-int8-ov" "$models/whisper-large-v3-turbo-int8-ov" \
+           "$models/speaker-diarization" \
            "$cache/npu-ov-cache" "$cache/bmeet"
     rmdir "$models" 2>/dev/null || true
 fi

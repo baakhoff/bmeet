@@ -1,0 +1,75 @@
+#!/bin/bash
+# Record the audio of a running voxtype meeting for BMeet's speaker pass.
+#
+# voxtype-meeting-toggle starts this as the systemd user unit bmeet-meeting-audio right
+# after `voxtype meeting start`. It records the same two sources voxtype transcribes live,
+# the default microphone and the monitor of the default output, as 16 kHz mono WAV:
+#   DIR/part-1-mic.wav  DIR/part-1-remote.wav  DIR/part-2-mic.wav ...
+# It follows voxtype's meeting state file: "paused" ends the current part (nothing is
+# recorded while paused), "recording" starts the next one, "idle" ends the recording.
+# Stopping the unit (SIGINT/SIGTERM) ends it too.
+#
+# DIR is under $XDG_RUNTIME_DIR, which is in RAM (~230 MB per hour): the audio never
+# reaches the disk. voxtype-meeting-toggle deletes it once the speaker pass is done.
+#   bmeet-meeting-audio DIR
+# Env (tests): BMEET_STATE_FILE (default: voxtype's), BMEET_MIC_TARGET / BMEET_REMOTE_TARGET
+# (PipeWire node names instead of the default source / the default sink's monitor).
+set -u
+
+dir=${1:?usage: bmeet-meeting-audio DIR}
+state_file="${BMEET_STATE_FILE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voxtype/meeting_state}"
+part=0 restarts=0 mic="" remote=""
+
+meeting_state() {  # first line of the daemon's state file: recording|paused|idle
+    head -n1 "$state_file" 2>/dev/null || echo idle
+}
+
+start_part() {
+    part=$((part + 1))
+    # pw-record without --target uses the default source; stream.capture.sink makes it
+    # record the default sink's monitor instead. PipeWire converts to 16 kHz mono.
+    pw-record ${BMEET_MIC_TARGET:+--target "$BMEET_MIC_TARGET"} --rate 16000 --channels 1 \
+        --format s16 "$dir/part-$part-mic.wav" &
+    mic=$!
+    pw-record -P '{ stream.capture.sink = true }' ${BMEET_REMOTE_TARGET:+--target "$BMEET_REMOTE_TARGET"} \
+        --rate 16000 --channels 1 --format s16 "$dir/part-$part-remote.wav" &
+    remote=$!
+}
+
+stop_part() {
+    [ -n "$mic" ] || return 0
+    kill -INT "$mic" "$remote" 2>/dev/null   # pw-record finishes the WAV header on SIGINT
+    wait "$mic" "$remote" 2>/dev/null
+    mic="" remote=""
+}
+
+trap 'stop_part; exit 0' INT TERM
+install -d -m 0700 "$dir" || exit 1
+
+# voxtype writes "recording" a moment after `voxtype meeting start` returns.
+for _ in $(seq 1 40); do
+    [ "$(meeting_state)" = recording ] && break
+    sleep 0.25
+done
+[ "$(meeting_state)" = recording ] || { echo "the meeting did not start; not recording" >&2; exit 1; }
+
+while :; do
+    case "$(meeting_state)" in
+        recording)
+            if [ -z "$mic" ]; then
+                start_part
+            elif ! kill -0 "$mic" 2>/dev/null || ! kill -0 "$remote" 2>/dev/null; then
+                # A recorder ended on its own (PipeWire restarted, device gone): start a new
+                # part, but do not spin if it keeps failing.
+                stop_part
+                restarts=$((restarts + 1))
+                [ "$restarts" -le 5 ] || { echo "pw-record keeps failing; giving up" >&2; exit 1; }
+                echo "a recorder stopped; starting part $((part + 1))" >&2
+                start_part
+            fi ;;
+        paused) stop_part ;;
+        *) break ;;
+    esac
+    sleep 0.5 & wait $!   # (wait, not sleep: lets the trap run right away)
+done
+stop_part

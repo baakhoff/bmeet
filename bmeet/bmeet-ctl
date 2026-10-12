@@ -17,7 +17,7 @@ Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid},
 ~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
 Actions that can take long (meeting stop waits for the last chunk) run detached.
 
-Path overrides for testing (env): BMEET_RUN_DIR, BMEET_MEETING_DB,
+Path overrides for testing (env): BMEET_RUN_DIR, BMEET_AUDIO_DIR, BMEET_MEETING_DB,
 VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP.
 """
 import json
@@ -29,11 +29,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
            or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
+# Meeting audio waiting for (or in) the speaker pass; see voxtype-meeting-toggle.
+AUDIO_DIR = Path(os.environ.get("BMEET_AUDIO_DIR")
+                 or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bmeet/meeting-audio")
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
 CONFIG = XDG_CONFIG / "voxtype/config.toml"
 LANGUAGES_FILE = XDG_CONFIG / "bmeet/languages"
@@ -113,6 +116,16 @@ def meeting_md(started_at: int) -> str | None:
     return None
 
 
+def speakers_pending() -> list[str]:
+    """Start stamps (YYYY-MM-DD_HHMM, as in the Markdown file names) of meetings whose
+    speaker pass is running. voxtype-meeting-toggle marks their recording with a
+    "speaker-pass" file; the pass deletes the folder when it ends."""
+    try:
+        return sorted(d.name for d in AUDIO_DIR.iterdir() if (d / "speaker-pass").exists())
+    except OSError:
+        return []
+
+
 def status() -> dict:
     ov = config().get("openvino", {})
     language = str(ov.get("language", "en")).lower()
@@ -131,6 +144,7 @@ def status() -> dict:
         "meeting_id": active["id"] if active else None,
         "meeting_title": active["title"] if active else None,
         "meeting_started": active["started_at"] if active else None,
+        "speakers_pending": speakers_pending(),
         "language": language,
         "next_language": next_language(language),
         "languages": languages(),

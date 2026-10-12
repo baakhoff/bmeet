@@ -68,6 +68,22 @@ for m in whisper-small-int8-ov whisper-large-v3-turbo-int8-ov; do
     [ -f "$d/openvino_encoder_model.xml" ] && ok "model $m" || info "model $m not installed"
 done
 
+echo "== meeting speakers (You / Person 1 / Person 2 ...)"
+speakers=$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers" 2>/dev/null || echo off)
+if [ "$speakers" = on ]; then
+    ok "telling speakers apart is on (~/.config/bmeet/speakers)"
+    sd="${NPU_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-models}/speaker-diarization"
+    for m in pyannote-segmentation-3-0.onnx nemo_en_titanet_small.onnx; do
+        [ -f "$sd/$m" ] && ok "speaker model $m" || bad "speaker model $m missing (run the installer again)"
+    done
+    "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/venv/bin/python" -I -c 'import sherpa_onnx' 2>/dev/null \
+        && ok "sherpa-onnx in the venv" || bad "sherpa-onnx missing from the venv (run the installer again)"
+    command -v pw-record >/dev/null && [ -x "$HOME/.local/bin/bmeet-meeting-audio" ] \
+        && ok "meeting audio recorder (pw-record, bmeet-meeting-audio)" || bad "pw-record or bmeet-meeting-audio missing"
+else
+    info "telling speakers apart is off: meetings are labelled You / Remote (installer --no-speakers)"
+fi
+
 echo "== synthetic transcription (separate process, same config)"
 clip="$XDG_RUNTIME_DIR/voxtype-verify.wav"
 python3 -I "$HERE/tools/tts_clip.py" en "Testing one two three. Voice typing runs on the neural processing unit." "$clip" >/dev/null \

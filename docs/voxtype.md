@@ -119,7 +119,11 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
   - It then writes `~/Documents/Meetings/YYYY-MM-DD_HHMM-meeting.md` (timestamps, speakers, metadata; it never overwrites) and shows a notification.
   - The full record stays in `~/.local/share/voxtype/meetings/` (SQLite + JSON). Useful commands: `voxtype meeting list|show|export|delete`.
 - **Echo cancellation:** `echo_cancel = "auto"` uses the GTCRN model to remove your speakers' sound from the mic track; with headphones it changes little.
-- **Limits and storage:** maximum 180 min. Audio is not kept (`retain_audio = false`).
+- **Limits and storage:** maximum 180 min. voxtype keeps no audio (`retain_audio = false`).
+- **Speakers (BMeet):** voxtype labels the live transcript *You* (microphone) and *Remote* (system audio). Its own `ml` backend can't do better with the OpenVINO engine: that engine returns one segment per 30 s chunk, so each chunk would go to one speaker, and *You* would be lost. So BMeet tells the remote voices apart after the meeting:
+  - `voxtype-meeting-toggle` starts `bmeet-meeting-audio` (systemd user unit) right after `voxtype meeting start`. It records the default microphone and the default output's monitor (the same sources voxtype uses) with `pw-record` as 16 kHz mono WAV into `$XDG_RUNTIME_DIR/bmeet/meeting-audio/STAMP/` (RAM, mode 0700). It follows voxtype's meeting state: nothing while paused, a new part after each pause, and it stops when the meeting ends.
+  - After the stop and voxtype's own export, `npu-transcribe --meeting` runs as the unit `bmeet-speakers-STAMP` (see [npu-transcribe.md](npu-transcribe.md#speakers)) and replaces the Markdown copy. The unit's `ExecStopPost` deletes the audio however the pass ends; a meeting start also removes recordings no unit works on any more.
+  - `~/.config/bmeet/speakers` (`on`/`off`) switches it; the installer's `--no-speakers` writes `off`.
 
 ## Is it really on the NPU?
 

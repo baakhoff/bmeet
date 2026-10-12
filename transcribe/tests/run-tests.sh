@@ -56,3 +56,10 @@ for model in small turbo; do
         echo "  $(basename "$txt"): $(tr '\n' ' ' < "$txt")"
     done
 done
+
+# Meeting speaker pass (BMeet): synthetic call in both main languages, with and without echo.
+echo "=== meeting speakers (--meeting)"
+for args in "--language ru" "--language en" "--language en --headphones"; do
+    echo "  $args"
+    NPU_PYTHON="$python" "$here/meeting_test.py" "$work" $args | sed 's/^/  /'
+done

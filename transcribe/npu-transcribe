@@ -16,10 +16,19 @@ Existing files are never overwritten (your own NAME.md notes, downloaded NAME.sr
 subtitles, an earlier transcript): the outputs then become NAME.2.*, NAME.3.*, ...
 unless --overwrite is given.
 
+With --speakers, the voices are told apart (sherpa-onnx speaker diarization on the
+CPU) and every line is labelled Speaker 1, Speaker 2, ... in the order they first speak.
+--meeting DIR turns a BMeet meeting recording (DIR/part-N-mic.wav + part-N-remote.wav,
+written by bmeet-meeting-audio) into a Markdown transcript: the microphone is "You",
+the voices in the system audio become Person 1, Person 2, ...
+
 Examples:
   npu-transcribe meeting.m4a
   npu-transcribe --model small --format srt,md,txt --out ~/transcripts *.mp4
   npu-transcribe --language ru --translate interview.ogg   # Russian speech -> English text
+  npu-transcribe --speakers interview.m4a                    # Speaker 1: ... Speaker 2: ...
+  npu-transcribe --speakers 3 panel.mp4                      # exactly three voices
+  npu-transcribe --meeting DIR --output 2026-10-12_1041-meeting.md
 
 Notes:
   * Models: turbo (default when installed) is the more accurate one and on the
@@ -33,7 +42,10 @@ Notes:
   * --language auto detects the language once per file (first non-silent block).
     On the NPU this needs a fresh pipeline per file (~3 s reload, see
     Whisper.ready_for_detection); pass --language to skip that in big batches.
-  * Models live in ~/.local/share/npu-models (env NPU_MODELS_DIR).
+  * Models live in ~/.local/share/npu-models (env NPU_MODELS_DIR); the speaker models in
+    its speaker-diarization/ folder.
+  * --speakers keeps the whole file in memory (~230 MB per hour of audio) and uses
+    Whisper's word timestamps, so a sentence that crosses a change of speaker is split.
   * Exit status: 0 all files done, 1 some file failed, 2 usage error, 130 Ctrl+C.
   * Every finished file (done or failed) is appended as one JSON line to
     ~/.local/share/npu-transcribe/history.jsonl (env NPU_TRANSCRIBE_HISTORY),
@@ -42,22 +54,25 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import html
 import itertools
 import json
 import math
+import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Generator, Iterator
 
 # `import openvino` initialises Intel's telemetry module, which (with no consent
 # file in ~/intel) counts as opted *in*, sends a Google Analytics event from a
@@ -71,7 +86,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -89,6 +104,22 @@ SILENCE_AMPLITUDE = 10 ** (SILENCE_DBFS / 20)
 CUE_MARGIN = 0.2              # seconds kept around the audible part of a cue
 PARAGRAPH_SECONDS = 30       # Markdown/text paragraph length (approximate)
 FORMATS = ("srt", "md", "txt")
+# Speaker diarization (sherpa-onnx): pyannote segmentation-3.0 finds who speaks when in
+# 10 s windows, a speaker-embedding model fingerprints each voice, and the fingerprints
+# are clustered. The installer downloads both models (sha256-pinned).
+SPEAKER_MODELS = MODELS_DIR / "speaker-diarization"
+SEGMENTATION_MODEL = SPEAKER_MODELS / "pyannote-segmentation-3-0.onnx"
+EMBEDDING_MODEL = SPEAKER_MODELS / "nemo_en_titanet_small.onnx"  # NVIDIA TitaNet-small, CC-BY-4.0
+# Clustering threshold for "same voice" when the number of speakers is not given: higher
+# merges more. With TitaNet, 0.8-0.9 found the right number of people in every test call
+# (0.7 split people, 1.0 merged two); see docs/npu-transcribe.md. Env NPU_SPEAKER_THRESHOLD
+# overrides it: lower when two people end up as one, higher when one person is split.
+SPEAKER_THRESHOLD = float(os.environ.get("NPU_SPEAKER_THRESHOLD") or 0.85)
+WORD_SMOOTH_SECONDS = 0.6     # a speaker change shorter than this inside a sentence is noise
+ECHO_MARGIN = 2.0             # meeting: a mic word at most this much louder than the echo
+                              # expected from the system audio at that moment is the echo
+ECHO_WINDOW = 2.0             # without word timestamps: look this far around a mic line ...
+ECHO_SHARE = 0.6              # ... and drop it when this share of its words was said remotely
 PROG = "npu-transcribe"
 STDERR_LOCK = threading.Lock()  # log() and the progress ticker share stderr
 UMASK = os.umask(0o022)
@@ -209,13 +240,33 @@ def audio_blocks(path: Path) -> Iterator[tuple[float, np.ndarray]]:
             raise RuntimeError("no audio decoded (empty file?)")
 
 
+def decode_all(path: Path) -> np.ndarray:
+    """The whole audio track as one 16 kHz mono float32 array (for --speakers/--meeting)."""
+    return np.concatenate([block for _, block in audio_blocks(path)])
+
+
+def array_blocks(samples: np.ndarray) -> Iterator[tuple[float, np.ndarray]]:
+    """Like audio_blocks(), for audio that is already in memory."""
+    block, offset = BLOCK_SECONDS * SAMPLE_RATE, 0
+    while offset < samples.size:
+        chunk = samples[offset:offset + block]
+        cut = chunk.size if offset + block >= samples.size \
+            else quietest_cut(chunk, CUT_SEARCH_SECONDS * SAMPLE_RATE)
+        yield offset / SAMPLE_RATE, chunk[:cut]
+        offset += cut
+
+
 # --------------------------------------------------------------------------- whisper
 
 class Whisper:
     """WhisperPipeline on the first working device of `devices` (e.g. NPU, then CPU)."""
 
-    def __init__(self, model_dir: Path, devices: list[str]) -> None:
+    def __init__(self, model_dir: Path, devices: list[str], word_timestamps: bool = False) -> None:
         self.model_dir, self.devices = model_dir, devices
+        # Word timestamps (for splitting sentences between speakers) need a pipeline built
+        # for them: on the NPU that is a separate compile (turbo ~1 min, cached), and each
+        # generate() takes ~8% longer.
+        self.word_timestamps = word_timestamps
         self.device = ""
         self.used = False  # has generate() run since the last load?
         self._load()
@@ -230,6 +281,8 @@ class Whisper:
             t0 = time.monotonic()
             # CACHE_DIR only for the NPU: its compile is slow, CPU loads in seconds anyway.
             kwargs = {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
+            if self.word_timestamps:
+                kwargs["word_timestamps"] = True
             try:
                 self.pipe = ov_genai.WhisperPipeline(str(self.model_dir), dev, **kwargs)
             except Exception as exc:  # driver missing, compile error, out of memory, ...
@@ -278,10 +331,19 @@ class Whisper:
 
 
 @dataclass
+class Word:
+    start: float
+    end: float
+    text: str        # as Whisper spells it, usually with a leading space
+
+
+@dataclass
 class Segment:
     start: float
     end: float
     text: str
+    words: list[Word] = field(default_factory=list)  # only with word timestamps
+    speaker: str = ""                                # only with --speakers/--meeting
 
 
 @dataclass
@@ -342,22 +404,23 @@ class Progress:
 
 # --------------------------------------------------------------------------- transcription
 
-def transcribe(whisper: Whisper, path: Path, gen_kwargs: dict) -> Transcript:
-    """Transcribe one file block by block.
+def transcribe(whisper: Whisper, name: str, blocks: Generator[tuple[float, np.ndarray], None, None],
+               duration: float | None, gen_kwargs: dict) -> Transcript:
+    """Transcribe one recording block by block (blocks: audio_blocks() or array_blocks()).
 
     With --language auto the language is detected on the first non-silent block
     and then pinned for the rest of the file (like the openai-whisper CLI does);
     this keeps a file consistent and sidesteps the NPU detection bug above.
     """
-    duration = probe_duration(path)
     language = gen_kwargs.get("language", "").strip("<|>")
     if not language:
         whisper.ready_for_detection()
-    progress = Progress(path.name, duration)
+    if whisper.word_timestamps:
+        gen_kwargs = dict(gen_kwargs, word_timestamps=True)
+    progress = Progress(name, duration)
     segments: list[Segment] = []
     dropped, done = 0, 0.0
     t0 = time.monotonic()
-    blocks = audio_blocks(path)
     try:
         for start, block in blocks:
             length = block.size / SAMPLE_RATE
@@ -369,23 +432,241 @@ def transcribe(whisper: Whisper, path: Path, gen_kwargs: dict) -> Transcript:
                 if not language and result.language:
                     language = result.language.strip("<|>")
                     log(f"language: {language} (auto-detected from the first block)")
-                for chunk in result.chunks or []:
+                words = [Word(float(w.start_ts), float(w.end_ts), w.word)
+                         for w in (getattr(result, "words", None) or [])]
+                chunks = [c for c in result.chunks or [] if c.text.strip()]
+                for i, chunk in enumerate(chunks):
                     text = " ".join(chunk.text.split())  # one line: a blank line would end the SRT cue
-                    if not text:
-                        continue
                     s = min(max(float(chunk.start_ts), 0.0), length)
                     e = min(max(float(chunk.end_ts), s + 0.5), length)  # end may be missing
+                    # this segment's words: those centred before its end (the last one takes the rest)
+                    n = len(words) if i == len(chunks) - 1 else \
+                        sum(1 for _ in itertools.takewhile(lambda w: (w.start + w.end) / 2 <= e, words))
+                    mine, words = words[:n], words[n:]
                     span = audible_span(block, s, e)
                     if span is None:
                         dropped += 1
                         continue
-                    segments.append(Segment(start + span[0], start + span[1], text))
+                    segments.append(Segment(start + span[0], start + span[1], text,
+                                            [Word(start + w.start, start + w.end, w.text) for w in mine]))
             done = start + length
             progress.update(done)
     finally:
         blocks.close()  # stops ffmpeg right away if we bail out early
         progress.close()
     return Transcript(segments, done, time.monotonic() - t0, language or "?", dropped)
+
+
+# --------------------------------------------------------------------------- speakers
+
+@dataclass
+class Turn:
+    start: float
+    end: float
+    speaker: int     # 0, 1, ... in the order the voices first speak
+
+
+def speaker_models_missing() -> list[Path]:
+    return [p for p in (SEGMENTATION_MODEL, EMBEDDING_MODEL) if not p.is_file()]
+
+
+def diarize(samples: np.ndarray, num_speakers: int = 0) -> list[Turn]:
+    """Who speaks when, on the CPU (sherpa-onnx). num_speakers=0: find out how many."""
+    try:
+        import sherpa_onnx
+    except ImportError:
+        raise RuntimeError("sherpa-onnx is missing from the venv - run the installer again")
+    if missing := speaker_models_missing():
+        raise RuntimeError(f"speaker model missing: {missing[0]} - run the installer again")
+    threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=str(SEGMENTATION_MODEL)),
+            num_threads=threads),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=str(EMBEDDING_MODEL), num_threads=threads),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=num_speakers or -1, threshold=SPEAKER_THRESHOLD),
+        min_duration_on=0.3, min_duration_off=0.5)
+    if not config.validate():
+        raise RuntimeError("the speaker models could not be loaded - run the installer again")
+    sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+    log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, {threads} CPU threads)")
+    t0 = time.monotonic()
+    result = sd.process(samples).sort_by_start_time()
+    order: dict[int, int] = {}
+    turns = [Turn(r.start, r.end, order.setdefault(r.speaker, len(order))) for r in result]
+    log(f"{len(order)} voice(s) in {time.monotonic() - t0:.1f} s")
+    return turns
+
+
+def diarize_aside(samples: np.ndarray, num_speakers: int = 0) -> concurrent.futures.Future:
+    """diarize() in a second process, so the CPU tells voices apart while Whisper runs on
+    the NPU (sherpa-onnx holds the GIL: in a thread Whisper would just wait). "spawn",
+    not fork: the parent may hold the NPU."""
+    pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+    try:
+        return pool.submit(diarize, samples, num_speakers)
+    finally:
+        pool.shutdown(wait=False)
+
+
+def speaker_at(turns: list[Turn], start: float, end: float) -> int | None:
+    """The speaker who talks most during [start, end]; else the nearest one within 1 s."""
+    best, best_overlap, near, near_gap = None, 0.0, None, 1.0
+    for t in turns:  # sorted by start
+        if t.start >= end + near_gap:
+            break
+        overlap = min(end, t.end) - max(start, t.start)
+        if overlap > best_overlap:
+            best, best_overlap = t.speaker, overlap
+        elif best is None and (gap := max(t.start - end, start - t.end)) <= near_gap:
+            near, near_gap = t.speaker, gap
+    return best if best is not None else near
+
+
+def label_speakers(seg: Segment, turns: list[Turn], name) -> list[Segment]:
+    """Give a segment its speaker (name(n) for speaker n, name(None) if unknown).
+
+    With word timestamps the segment is split where the voice changes, so a sentence
+    that crosses a change of speaker is not given to one of them; runs shorter than
+    WORD_SMOOTH_SECONDS are put to their neighbour (diarization jitter around pauses).
+    """
+    if not seg.words:
+        return [Segment(seg.start, seg.end, seg.text, seg.words,
+                        name(speaker_at(turns, seg.start, seg.end)))]
+    who = [speaker_at(turns, w.start, w.end) for w in seg.words]
+    for order in (range(len(who)), reversed(range(len(who)))):  # words between turns: neighbour's
+        last = None
+        for i in order:
+            if who[i] is None:
+                who[i] = last
+            last = who[i]
+    runs = [(spk, list(group)) for spk, group in
+            itertools.groupby(zip(who, seg.words), key=lambda x: x[0])]
+    merged: list[tuple[int | None, list[Word]]] = []
+    for spk, pairs in runs:
+        words = [w for _, w in pairs]
+        if merged and (spk == merged[-1][0] or words[-1].end - words[0].start < WORD_SMOOTH_SECONDS):
+            merged[-1][1].extend(words)
+        else:
+            merged.append((spk, words))
+    if len(merged) > 1 and merged[0][1][-1].end - merged[0][1][0].start < WORD_SMOOTH_SECONDS:
+        merged[1] = (merged[1][0], merged[0][1] + merged[1][1])  # a short first run joins the next
+        del merged[0]
+    if len(merged) == 1:
+        return [Segment(seg.start, seg.end, seg.text, seg.words, name(merged[0][0]))]
+    return [Segment(words[0].start, words[-1].end, " ".join("".join(w.text for w in words).split()),
+                    words, name(spk)) for spk, words in merged]
+
+
+def tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def rms(samples: np.ndarray, start: float, end: float) -> float:
+    part = samples[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)]
+    return float(np.sqrt(np.square(part, dtype=np.float64).mean())) if part.size else 0.0
+
+
+def echo_gain(mic: np.ndarray, remote: np.ndarray) -> float:
+    """How loud the system audio comes back through the microphone: the median mic/remote
+    loudness ratio over the 100 ms frames where the remote side is loudest (you are
+    silent in most of them). ~0 with headphones."""
+    frame = SAMPLE_RATE // 10
+    n = min(mic.size, remote.size) // frame
+    if n == 0:
+        return 0.0
+    loud_r = np.sqrt(np.square(remote[:n * frame].reshape(n, frame), dtype=np.float64).mean(axis=1))
+    loud_m = np.sqrt(np.square(mic[:n * frame].reshape(n, frame), dtype=np.float64).mean(axis=1))
+    loud = loud_r >= max(SILENCE_AMPLITUDE, float(np.percentile(loud_r, 70)))
+    return float(np.median(loud_m[loud] / loud_r[loud])) if loud.sum() >= 20 else 0.0
+
+
+def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
+              remote: np.ndarray) -> tuple[list[Segment], int]:
+    """Meeting without headphones: the microphone also hears the other side, and Whisper
+    writes their words into your track too, often in the same sentence as your own.
+
+    With word timestamps, a word is the echo when the microphone is not clearly louder
+    (ECHO_MARGIN) than the echo the system audio would cause at that moment; those words
+    are cut out. Without them, a whole line goes when ECHO_SHARE of its words were said
+    remotely within ECHO_WINDOW. Returns the kept segments and the number of words cut."""
+    gain = echo_gain(mic, remote)
+    kept: list[Segment] = []
+    cut = 0
+    for seg in mine:
+        if seg.words:
+            echo = [gain > 0 and rms(mic, w.start, w.end) < ECHO_MARGIN * gain * rms(remote, w.start, w.end)
+                    for w in seg.words]
+            cut += sum(echo)
+            for is_echo, group in itertools.groupby(zip(echo, seg.words), key=lambda x: x[0]):
+                words = [w for _, w in group]
+                text = " ".join("".join(w.text for w in words).split())
+                if not is_echo and tokens(text):
+                    if len(words) == len(seg.words):
+                        kept.append(seg)
+                    else:
+                        kept.append(Segment(words[0].start, words[-1].end, text, words, seg.speaker))
+            continue
+        said = tokens(seg.text)
+        pool: dict[str, int] = {}
+        for r in theirs:
+            if r.end >= seg.start - ECHO_WINDOW and r.start <= seg.end + ECHO_WINDOW:
+                for tok in tokens(r.text):
+                    pool[tok] = pool.get(tok, 0) + 1
+        hits = 0
+        for tok in said:
+            if pool.get(tok, 0) > 0:
+                pool[tok] -= 1
+                hits += 1
+        if said and hits / len(said) >= ECHO_SHARE:
+            cut += len(said)
+        else:
+            kept.append(seg)
+    return kept, cut
+
+
+def number_speakers(segments: list[Segment], found: list[Turn], word: str,
+                    unknown: str) -> tuple[list[Segment], int]:
+    """Label (and split) segments by speaker as "<word> 1", "<word> 2", ... numbered in the
+    order they first say something (a voice that only coughed gets no number)."""
+    labelled = [part for seg in segments
+                for part in label_speakers(seg, found, lambda n: "" if n is None else str(n))]
+    order: dict[str, int] = {}
+    for seg in labelled:
+        if seg.speaker:
+            order.setdefault(seg.speaker, len(order) + 1)
+    for seg in labelled:
+        seg.speaker = f"{word} {order[seg.speaker]}" if seg.speaker else unknown
+    return labelled, len(order)
+
+
+PART_NAME = re.compile(r"^part-(\d+)-(mic|remote)\.wav$")
+
+
+def read_meeting(folder: Path) -> tuple[np.ndarray, np.ndarray]:
+    """A recording by bmeet-meeting-audio: part-N-mic.wav + part-N-remote.wav for each
+    stretch between pauses, joined in order. The two tracks of a part are padded to the
+    same length so they stay in step across pauses."""
+    parts = sorted({int(m[1]) for f in folder.iterdir() if (m := PART_NAME.match(f.name))})
+    if not parts:
+        raise RuntimeError(f"no recording in {folder}")
+    mics, remotes = [], []
+    for n in parts:
+        tracks = []
+        for kind in ("mic", "remote"):
+            path = folder / f"part-{n}-{kind}.wav"
+            try:
+                tracks.append(decode_all(path) if path.is_file() else np.zeros(0, np.float32))
+            except RuntimeError as exc:  # empty part: the recorder stopped right away
+                log(f"WARNING: {path.name}: {exc}")
+                tracks.append(np.zeros(0, np.float32))
+        length = max(t.size for t in tracks)
+        mics.append(np.pad(tracks[0], (0, length - tracks[0].size)))
+        remotes.append(np.pad(tracks[1], (0, length - tracks[1].size)))
+    return np.concatenate(mics), np.concatenate(remotes)
 
 
 # --------------------------------------------------------------------------- output
@@ -409,20 +690,58 @@ def paragraphs(segments: list[Segment]) -> list[tuple[float, str]]:
     return out
 
 
+def turns(segments: list[Segment]) -> list[tuple[str, list[Segment]]]:
+    """Consecutive segments of the same speaker ("" without --speakers)."""
+    return [(spk, list(group)) for spk, group in itertools.groupby(segments, key=lambda s: s.speaker)]
+
+
+def speaker_paragraphs(segments: list[Segment]) -> list[tuple[float, str, str]]:
+    """(start, speaker, text): paragraphs that never mix two speakers."""
+    return [(start, spk, text) for spk, group in turns(segments) for start, text in paragraphs(group)]
+
+
 def to_srt(t: Transcript) -> str:
-    cues = [f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text}\n"
+    cues = [f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n"
+            f"{f'{s.speaker}: ' if s.speaker else ''}{s.text}\n"
             for i, s in enumerate(t.segments, 1)]
     return "\n".join(cues)
 
 
 def to_md(t: Transcript, src: Path, meta: dict[str, str]) -> str:
     head = [f"# {src.stem}", ""] + [f"- **{k}:** {v}" for k, v in meta.items()]
-    body = [f"[{hms(start)}] {text}" for start, text in paragraphs(t.segments)]
+    body = [f"[{hms(start)}] " + (f"**{spk}:** " if spk else "") + text
+            for start, spk, text in speaker_paragraphs(t.segments)]
     return "\n".join(head) + "\n\n" + "\n\n".join(body or ["*(no speech detected)*"]) + "\n"
 
 
 def to_txt(t: Transcript) -> str:
-    return "\n\n".join(text for _, text in paragraphs(t.segments)) + "\n"
+    return "\n\n".join((f"{spk}: " if spk else "") + text
+                       for _, spk, text in speaker_paragraphs(t.segments)) + "\n"
+
+
+def meeting_time(seconds: float) -> str:
+    """[mm:ss] like voxtype's meeting export; [h:mm:ss] from the first hour on."""
+    s = int(seconds)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60:02d}:{s % 60:02d}"
+
+
+def meeting_md(title: str, started: float | None, duration: float, segments: list[Segment],
+               meta: dict[str, str]) -> str:
+    """The meeting transcript, laid out like `voxtype meeting export --format markdown`
+    (which it replaces): a heading per change of speaker, a [mm:ss] mark per paragraph."""
+    speakers = sorted({s.speaker for s in segments},
+                      key=lambda n: (n != "You", int(n.split()[-1]) if n[-1:].isdigit() else 0, n))
+    info = ([f"- **Date:** {datetime.fromtimestamp(started):%Y-%m-%d %H:%M}"] if started else []) + [
+        f"- **Duration:** {int(duration) // 60}m {int(duration) % 60}s",
+        f"- **Word Count:** {sum(len(s.text.split()) for s in segments)}",
+        f"- **Speakers:** {', '.join(speakers) or '-'}",
+    ] + [f"- **{k}:** {v}" for k, v in meta.items()]
+    body = []
+    for spk, group in turns(segments):
+        body += [f"### {spk}", ""]
+        body += [f"*[{meeting_time(start)}]* {text}\n" for start, text in paragraphs(group)]
+    return "\n".join([f"# {title}", "", "## Meeting Info", "", *info, "", "## Transcript", "",
+                      *(body or ["*(no speech detected)*", ""])])
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -438,11 +757,11 @@ def write_atomic(path: Path, text: str) -> None:
         raise
 
 
-def notify(ok: bool, body: list[str]) -> None:
-    """Desktop notification (used by the Dolphin service menu)."""
+def notify(ok: bool, body: list[str], summary: str = "") -> None:
+    """Desktop notification (used by the Dolphin service menu and meetings)."""
     if not shutil.which("notify-send"):
         return
-    summary = "Transcription finished" if ok else "Transcription failed"
+    summary = summary or ("Transcription finished" if ok else "Transcription failed")
     cmd = ["notify-send", f"--app-name={PROG}", "--icon=view-media-lyrics",
            f"--urgency={'normal' if ok else 'critical'}", summary,
            html.escape("\n".join(body[:10]), quote=False)]  # body allows simple markup
@@ -450,7 +769,7 @@ def notify(ok: bool, body: list[str]) -> None:
 
 
 def record_history(src: Path, outputs: list[Path], model: str, language: str,
-                   device: str, duration: float | None, ok: bool) -> None:
+                   device: str, duration: float | None, ok: bool, speakers: int | None = None) -> None:
     """Append one JSON line per finished file to HISTORY (read by the BMeet
     app and bmeet-ctl). Best effort: a failure here only logs a warning."""
     try:
@@ -466,6 +785,8 @@ def record_history(src: Path, outputs: list[Path], model: str, language: str,
             "duration": round(float(duration or 0.0), 3),
             "status": "done" if ok else "failed",
         }
+        if speakers is not None:
+            entry["speakers"] = speakers
         HISTORY.parent.mkdir(parents=True, exist_ok=True)
         with open(HISTORY, "a", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)  # the app rewrites the file under the same lock
@@ -543,7 +864,7 @@ def pick_devices(requested: str) -> list[str]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog=PROG, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("files", nargs="+", type=Path, metavar="FILE", help="audio or video file(s)")
+    p.add_argument("files", nargs="*", type=Path, metavar="FILE", help="audio or video file(s)")
     p.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     p.add_argument("--model", default=None, metavar="turbo|small|DIR",
                    help="turbo (default if installed, else small), small, or a path to an "
@@ -559,7 +880,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true",
                    help="replace existing NAME.srt/.md/.txt instead of writing NAME.2.* etc.")
     p.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    p.add_argument("--speakers", action="store_true",
+                   help="tell the voices apart: Speaker 1, Speaker 2, ... (in the order they first speak)")
+    p.add_argument("--num-speakers", type=int, default=0, metavar="N",
+                   help="exactly N voices (implies --speakers; default: find out how many)")
+    p.add_argument("--meeting", type=Path, metavar="DIR",
+                   help="transcribe a BMeet meeting recording (see above) instead of files")
+    p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
+    p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
     args = p.parse_args(argv)
+    if args.num_speakers < 0:
+        p.error("--num-speakers: expected a positive number")
+    args.speakers = args.speakers or args.num_speakers > 0 or args.meeting is not None
+    if args.meeting is not None:
+        if args.files or not args.output:
+            p.error("--meeting DIR takes no FILE and needs --output FILE.md")
+    elif not args.files:
+        p.error("the following arguments are required: FILE")
+    if args.speakers and (missing := speaker_models_missing()):
+        p.error(f"speaker model missing: {missing[0]} (run the installer again)")
     args.formats = [f.strip().lower() for f in args.format.split(",") if f.strip()]
     if not args.formats or set(args.formats) - set(FORMATS):
         p.error(f"--format: choose from {', '.join(FORMATS)}")
@@ -572,6 +911,70 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         log("WARNING: whisper-large-v3-turbo was not trained to translate; output may stay untranslated")
     args.language = args.language.lower().strip("<|>")
     return args
+
+
+def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Path,
+                       gen_kwargs: dict) -> int:
+    """--meeting DIR: both tracks through Whisper, the system audio split by voice, your
+    microphone as "You", interleaved by time into --output (Markdown)."""
+    folder, out = args.meeting.expanduser(), args.output.expanduser()
+    try:
+        info = json.loads((folder / "meeting.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        info = {}
+    title = args.title or info.get("title") or "Meeting"
+    # voxtype-meeting-toggle has already saved voxtype's own transcript there; it is replaced
+    # unless it changed meanwhile (then the result goes next to it).
+    before = out.stat().st_mtime_ns if out.exists() else None
+    try:
+        mic, remote = read_meeting(folder)
+        duration = max(mic.size, remote.size) / SAMPLE_RATE
+        log(f"meeting: {hms(duration)} of audio")
+        t0 = time.monotonic()
+        audible = {name: samples.size > 0 and peak_dbfs(samples) >= SILENCE_DBFS
+                   for name, samples in (("system audio", remote), ("microphone", mic))}
+        voices = diarize_aside(remote, args.num_speakers) if audible["system audio"] else None
+        heard: dict[str, Transcript | None] = {}
+        for name, samples in (("system audio", remote), ("microphone", mic)):
+            heard[name] = transcribe(whisper, name, array_blocks(samples), samples.size / SAMPLE_RATE,
+                                     gen_kwargs) if audible[name] else None
+        theirs, yours = heard["system audio"], heard["microphone"]
+        remote_segments, people = [], 0
+        if voices and theirs and theirs.segments:
+            remote_segments, people = number_speakers(theirs.segments, voices.result(), "Person", "Remote")
+        my_segments = [Segment(s.start, s.end, s.text, s.words, "You") for s in yours.segments] \
+            if yours else []
+        my_segments, echoes = drop_echo(my_segments, theirs.segments if theirs else [], mic, remote)
+        del mic, remote
+        segments = sorted(my_segments + remote_segments, key=lambda s: s.start)
+        wall = time.monotonic() - t0
+        langs = {who: t.language for who, t in (("you", yours), ("others", theirs)) if t and t.language != "?"}
+        meta = {
+            "Language": (", ".join(sorted(set(langs.values()))) if len(set(langs.values())) < 2
+                         else ", ".join(f"{who} {lang}" for who, lang in langs.items())) or "-",
+            "Transcribed": f"{model_dir.name} on {whisper.device} in {hms(wall)}; "
+                           "voices told apart by sherpa-onnx",
+        }
+        if echoes:
+            meta["Echo"] = (f"{echoes} word(s) your microphone picked up from the speakers "
+                            "were left out")
+        dest = out
+        if out.exists() and out.stat().st_mtime_ns != before:
+            dest = out.with_name(f"{out.stem}-speakers.md")
+            log(f"{out.name} changed while this ran; writing {dest.name} instead")
+        write_atomic(dest, meeting_md(title, info.get("started"), duration, segments, meta))
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        if args.notify:
+            notify(False, [str(exc), f"The transcript without speakers stays in {out}"],
+                   "Meeting speakers failed")
+        return 1
+    print(dest, flush=True)
+    log(f"done: {hms(duration)} in {hms(wall)}, {people} other voice(s), "
+        f"{len(segments)} segment(s)" + (f", {echoes} echo word(s) left out" if echoes else ""))
+    if args.notify:
+        notify(True, [f"{people} other voice(s) told apart", str(dest)], "Meeting speakers identified")
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -599,9 +1002,13 @@ def main(argv: list[str]) -> int:
     devices: list[str] = []
     try:
         devices = pick_devices(args.device)
-        whisper = Whisper(model_dir, devices)
+        whisper = Whisper(model_dir, devices, word_timestamps=args.speakers)
     except Exception as exc:  # every device failed to load the model
         log(f"ERROR: {exc}")
+        if args.meeting:
+            if args.notify:
+                notify(False, [f"could not load {model_dir.name}: {exc}"], "Meeting speakers failed")
+            return 1
         for src in args.files:  # every file failed
             record_history(src.expanduser(), [], model_label, forced_language,
                            devices[0] if devices else args.device, None, ok=False)
@@ -609,19 +1016,34 @@ def main(argv: list[str]) -> int:
             notify(False, [f"could not load {model_dir.name}: {exc}"])
         return 1
 
+    if args.meeting:
+        return transcribe_meeting(args, whisper, model_dir, gen_kwargs)
+
     report: list[str] = []
     failed = 0
     for i, src in enumerate(args.files, 1):
         src = src.expanduser()
         written: list[Path] = []
         t: Transcript | None = None
+        speakers: int | None = None
         if len(args.files) > 1:
             log(f"[{i}/{len(args.files)}] {src}")
         try:
             if not src.is_file():
                 raise RuntimeError("no such file")
             out_dir = output_dir(src, args.out)  # checked before the expensive part
-            t = transcribe(whisper, src, gen_kwargs)
+            if args.speakers:  # diarization needs the whole recording at once
+                samples = decode_all(src)
+                voices = diarize_aside(samples, args.num_speakers)
+                t = transcribe(whisper, src.name, array_blocks(samples), samples.size / SAMPLE_RATE,
+                               gen_kwargs)
+                t0 = time.monotonic()
+                found = voices.result() if t.segments else []
+                t.segments, speakers = number_speakers(t.segments, found, "Speaker", "Speaker ?")
+                t.wall += time.monotonic() - t0  # the part of the diarization Whisper did not hide
+                del samples
+            else:
+                t = transcribe(whisper, src.name, audio_blocks(src), probe_duration(src), gen_kwargs)
             speed = t.duration / t.wall if t.wall > 0 else 0.0
             lang = f"{t.language} ({'given' if args.language != 'auto' else 'detected'})" \
                 if t.language != "?" else "- (no speech found)"
@@ -632,6 +1054,9 @@ def main(argv: list[str]) -> int:
                 "Model": f"{model_dir.name} on {whisper.device}, {speed:.1f}x realtime",
                 "Created": f"{datetime.now():%Y-%m-%d %H:%M} by {PROG}",
             }
+            if speakers is not None:
+                meta["Speakers"] = f"{speakers}, told apart by voice" + \
+                    (f" (asked for {args.num_speakers})" if args.num_speakers else "")
             render = {"srt": lambda: to_srt(t), "md": lambda: to_md(t, src, meta),
                       "txt": lambda: to_txt(t)}
             stem = output_stem(out_dir, src, args.formats, args.overwrite)
@@ -652,9 +1077,11 @@ def main(argv: list[str]) -> int:
             record_history(src, written, model_label, t.language if t else forced_language,
                            whisper.device, t.duration if t else None, ok=False)
             continue
-        record_history(src, written, model_label, t.language, whisper.device, t.duration, ok=True)
+        record_history(src, written, model_label, t.language, whisper.device, t.duration, ok=True,
+                       speakers=speakers)
         log(f"done: {src.name}: {hms(t.duration)} of audio in {t.wall:.1f} s on {whisper.device} "
             f"({speed:.1f}x realtime), {len(t.segments)} segment(s), language {lang}"
+            + (f", {speakers} speaker(s)" if speakers is not None else "")
             + (f", dropped {t.dropped} segment(s) over silence" if t.dropped else ""))
         report.append(f"{src.name} → {out_dir / stem}.{{{','.join(args.formats)}}} "
                       f"({hms(t.duration)} in {t.wall:.0f} s, {whisper.device})")

@@ -60,7 +60,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -275,6 +275,7 @@ class Meeting:
     storage_path: str | None = None
     model: str | None = None
     md_path: str | None = None  # Markdown copy in ~/Documents/Meetings, if any
+    md_sig: tuple | None = None  # its stat when loaded: the speaker pass replaces it later
 
     def duration(self) -> int | None:
         if self.duration_secs is not None:
@@ -285,7 +286,13 @@ class Meeting:
 
     def signature(self) -> tuple:
         return (self.title, self.ended_at, self.duration_secs, self.status, self.chunk_count,
-                self.md_path)
+                self.md_path, self.md_sig)
+
+    def stamps(self) -> set[str]:
+        """Start stamps this meeting may be filed under (see assign_meeting_mds)."""
+        if self.md_path and (m := MD_NAME.match(Path(self.md_path).name)):
+            return {m[1]}
+        return {minute_stamp(self.started_at), minute_stamp(self.started_at + 10)}
 
 
 def minute_stamp(epoch: float) -> str:
@@ -332,6 +339,8 @@ def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> li
                         status=str(r[5] or ""), chunk_count=int(r[6] or 0), storage_path=r[7],
                         model=r[8]) for r in rows]
     assign_meeting_mds(meetings, Path(md_dir or MEETING_MD_DIR))
+    for m in meetings:
+        m.md_sig = stat_sig(m.md_path) if m.md_path else None
     return meetings
 
 
@@ -1016,6 +1025,7 @@ class MeetingsPage(ListDetailPage):
         self.live_id: str | None = None
         self.live_state = "idle"
         self.live_elapsed: float | None = None
+        self.speakers_pending: set[str] = set()   # start stamps of running speaker passes
         self.error: str | None = None
         self._req = 0
         self._index_queue: list[str] = []
@@ -1101,7 +1111,14 @@ class MeetingsPage(ListDetailPage):
         text = " · ".join(parts)
         text += "\n" + (f"Markdown copy: {tilde(m.md_path)}" if m.md_path
                         else "From voxtype's meeting database (no Markdown copy)")
+        if m.stamps() & self.speakers_pending:
+            text += "\nTelling the speakers apart… the transcript is replaced when that is done."
         return text
+
+    def set_speakers_pending(self, pending: set[str]) -> None:
+        self.speakers_pending = pending
+        if m := self.current():
+            self.meta.setText(self.meta_text(m))
 
     def show_detail(self, key: str) -> None:
         m = self.meetings.get(key)
@@ -2210,6 +2227,13 @@ class MainWindow(QMainWindow):
                                        else "Pause recording (nothing is recorded until you resume)")
         self.act_meet_stop.setEnabled(daemon_on and meeting != "idle" and not busy)
         self.meetings_page.set_live(st.get("meeting_id"), meeting, elapsed)
+        pending = set(st.get("speakers_pending") or [])
+        if pending != self.meetings_page.speakers_pending:
+            finished = self.meetings_page.speakers_pending - pending
+            self.meetings_page.set_speakers_pending(pending)
+            if finished:  # its Markdown copy was replaced: show the new one
+                self.meetings_page.reload()
+                self.message("Speakers told apart: the meeting transcript was updated")
 
         # language
         lang = (st.get("language") or "en").lower()

@@ -8,7 +8,7 @@
         "Id": "io.github.baakhoff.bmeet",
         "License": "MIT",
         "Name": "BMeet",
-        "Version": "0.1.0",
+        "Version": "0.2.0",
         "Website": "https://github.com/baakhoff/bmeet"
     },
     "X-Plasma-API-Minimum-Version": "6.0"

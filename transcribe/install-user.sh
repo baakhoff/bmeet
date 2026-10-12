@@ -85,7 +85,7 @@ Name=Transcribe (NPU)
 X-KDE-ServiceTypes=KonqPopupMenu/Plugin
 MimeType=audio/*;video/*;application/ogg;
 ExcludeServiceTypes=audio/x-mpegurl;audio/x-scpls;audio/x-ms-asx;audio/midi;
-Actions=transcribe;transcribeSmall;translate;
+Actions=transcribe;transcribeSpeakers;transcribeSmall;translate;
 X-KDE-Submenu=Transcribe (NPU)
 X-KDE-Priority=TopLevel
 Icon=view-media-lyrics
@@ -95,6 +95,12 @@ Name=Transcribe (best installed model)
 Icon=view-media-lyrics
 TryExec=konsole
 Exec=konsole --hold -e $link --notify %F
+
+[Desktop Action transcribeSpeakers]
+Name=Transcribe with speakers (Speaker 1, Speaker 2, ...)
+Icon=system-users
+TryExec=konsole
+Exec=konsole --hold -e $link --speakers --notify %F
 
 [Desktop Action transcribeSmall]
 Name=Transcribe with Whisper small (lighter, faster on CPU)

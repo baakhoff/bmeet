@@ -5,3 +5,4 @@ bmeet/app/tests/.work/
 *.part
 /dl/
 .venv/
+transcribe/tests/.work-speakers/

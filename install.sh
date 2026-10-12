@@ -13,6 +13,8 @@
 #   --languages "en de"  dictation languages that Meta+Shift+H cycles through
 #                        (Whisper codes; default: English + your desktop language)
 #   --no-turbo           skip whisper-large-v3-turbo (~1 GB; best for file transcripts)
+#   --no-speakers        do not tell meeting speakers apart (no meeting audio is kept, not
+#                        even in RAM; no speaker models)
 #   --no-panel           do not add the BMeet widget to the panel
 #   --no-npu-driver      do not install Intel's NPU driver even if it is missing
 #   --skip-system        skip the sudo part (it must have run before)
@@ -29,7 +31,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.1.0
+    local VERSION=0.2.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -44,11 +46,12 @@ main() {
     die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
     # --- options -------------------------------------------------------------------
-    local languages="" turbo=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
+    local languages="" turbo=1 speakers=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
     while [ $# -gt 0 ]; do
         case "$1" in
             --languages) languages="${2:?--languages needs a value, e.g. \"en de\"}"; shift ;;
             --no-turbo) turbo= ;;
+            --no-speakers) speakers= ;;
             --no-panel) panel= ;;
             --no-npu-driver) system_args+=(--no-npu-driver) ;;
             --skip-system) system= ;;
@@ -56,7 +59,7 @@ main() {
             --force) system_args+=(--force) ;;
             --version) echo "BMeet installer $VERSION"; return 0 ;;
             -h|--help)
-                if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,25p' "${BASH_SOURCE[0]}"
+                if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,27p' "${BASH_SOURCE[0]}"
                 else echo "See https://github.com/$REPO#install"; fi
                 return 0 ;;
             *) die "unknown option: $1 (see --help)" ;;
@@ -184,6 +187,51 @@ import openvino_genai, numpy; print("  openvino-genai", openvino_genai.__version
         HF_HUB_DISABLE_TELEMETRY=1 "$venv/bin/hf" download "$repo" --revision "$rev" \
             --local-dir "$dir" >/dev/null
     done
+
+    # --- 4b. speaker models (meetings: Person 1, Person 2, ...; npu-transcribe --speakers) ---
+    # sherpa-onnx's exports, sha256-pinned: pyannote segmentation-3.0 (MIT) and the
+    # speaker-embedding model (see docs/npu-transcribe.md for the choice and its license).
+    local speakers_file="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
+    mkdir -p "$(dirname "$speakers_file")"
+    if [ -n "$speakers" ]; then
+        local sd="$MODELS_DIR/speaker-diarization" dl="$CACHE/downloads"
+        local rel=https://github.com/k2-fsa/sherpa-onnx/releases/download
+        local seg_tar=sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+        local seg_tar_sha=24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
+        local seg_sha=220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079
+        local emb=nemo_en_titanet_small.onnx
+        local emb_sha=ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
+        say "Speaker models -> $sd"
+        mkdir -p "$sd" "$dl"
+        fetch() {  # file url sha256: download into the cache once, check it every time
+            if ! echo "$3  $dl/$1" | sha256sum -c --status >/dev/null 2>&1; then
+                curl -fL --retry 3 --progress-bar -o "$dl/$1.part" "$2" && mv "$dl/$1.part" "$dl/$1"
+                echo "$3  $dl/$1" | sha256sum -c --status \
+                    || { rm -f "$dl/$1"; die "checksum mismatch for $1 - run the installer again"; }
+            fi
+        }
+        if ! echo "$seg_sha  $sd/pyannote-segmentation-3-0.onnx" | sha256sum -c --status >/dev/null 2>&1; then
+            fetch "$seg_tar" "$rel/speaker-segmentation-models/$seg_tar" "$seg_tar_sha"
+            "$venv/bin/python" -I -c 'import sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    data = t.extractfile("sherpa-onnx-pyannote-segmentation-3-0/model.onnx").read()
+with open(sys.argv[2], "wb") as f:
+    f.write(data)' "$dl/$seg_tar" "$sd/.segmentation.part"
+            echo "$seg_sha  $sd/.segmentation.part" | sha256sum -c --status \
+                || { rm -f "$sd/.segmentation.part"; die "unexpected segmentation model in $seg_tar"; }
+            chmod 0644 "$sd/.segmentation.part"
+            mv "$sd/.segmentation.part" "$sd/pyannote-segmentation-3-0.onnx"
+        fi
+        if ! echo "$emb_sha  $sd/$emb" | sha256sum -c --status >/dev/null 2>&1; then
+            fetch "$emb" "$rel/speaker-recongition-models/$emb" "$emb_sha"   # (sic: upstream's tag)
+            install -m 0644 "$dl/$emb" "$sd/$emb"
+        fi
+        echo "  pyannote-segmentation-3-0, ${emb%.onnx}: present"
+        [ -s "$speakers_file" ] || echo on > "$speakers_file"   # keeps an "off" you set
+    else
+        echo off > "$speakers_file"
+        echo "  skipped (--no-speakers): meetings keep the You / Remote labels"
+    fi
 
     # --- 5. per-user parts -----------------------------------------------------------
     say "Dictation and meetings (voxtype)"

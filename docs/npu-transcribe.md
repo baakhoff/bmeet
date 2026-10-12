@@ -7,6 +7,8 @@ with Whisper on the Intel NPU. It falls back to the CPU when the NPU is missing 
 npu-transcribe meeting.m4a                                  # -> meeting.srt + meeting.md
 npu-transcribe --model small --format srt,md,txt --out ~/transcripts *.mp4
 npu-transcribe --language de --translate interview.ogg      # German speech -> English text
+npu-transcribe --speakers interview.m4a                     # Speaker 1: ... Speaker 2: ...
+npu-transcribe --meeting DIR --output MEETING.md            # BMeet's meeting speaker pass
 npu-transcribe --help
 ```
 
@@ -25,6 +27,57 @@ npu-transcribe --help
 **Other ways to start it:**
 - **Dolphin:** right-click audio or video → **Transcribe (NPU)**. It runs in a Konsole window and sends a notification when done.
 - **BMeet app:** the **Transcribe a file** page has a queue and progress display.
+
+## Speakers
+
+`--speakers` labels every line with the voice that says it (**Speaker 1**, **Speaker 2**, …,
+numbered in the order they first speak); `--num-speakers N` fixes the count when you know it.
+`--meeting DIR` is the same for a BMeet meeting recording: the microphone track is **You**,
+the voices in the system audio become **Person 1**, **Person 2**, …
+
+**How it works:**
+1. **Who speaks when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s offline speaker diarization runs on the CPU in a second process, at the same time as Whisper on the NPU.
+   - pyannote **segmentation-3.0** finds the speech turns.
+   - NVIDIA **TitaNet-small** turns each turn into a voice fingerprint.
+   - The fingerprints are clustered: threshold 0.85 (env `NPU_SPEAKER_THRESHOLD`), or exactly `--num-speakers` clusters.
+2. **Words, not sentences:** Whisper runs with word timestamps (a separate NPU compile of ~1 min, cached; each block takes ~8 % longer). Every word goes to the voice that speaks during it, so a sentence that crosses a change of speaker is split there. A change shorter than 0.6 s inside a sentence is treated as noise.
+3. **Echo (meetings):** without headphones the microphone also hears the other side, and Whisper writes their words into your track too, often in the same sentence as your own.
+   - First, how loud the system audio comes back through the microphone is measured: the median mic/remote ratio while the other side talks.
+   - A word on your track is cut when the microphone is less than 2x louder than that predicted echo at that moment.
+   - With headphones the predicted echo is ~0, so nothing is cut. When you talk over the other side, your voice is far louder than the echo and stays.
+4. **Output:** Speaker labels in `.srt` cues (`Speaker 1: …`), `.md` and `.txt` paragraphs (which never mix two speakers), and a `speakers` count in the history line. Meetings get voxtype's Markdown layout: a `### Person 1` heading per change of speaker and a `*[mm:ss]*` mark per paragraph.
+
+**Memory:** the whole recording is held as one array (~230 MB per hour), because diarization needs all of it at once.
+
+**Choosing the voice model.** All four of sherpa-onnx's general speaker-embedding exports were tested on 36 LibriSpeech utterances by 9 readers (sent through 16 kbit/s Opus, like a VoIP call). The columns show the cosine similarity between two utterances:
+
+| model | same person (mean, lowest) | different people (mean, highest) | equal error rate |
+|---|---|---|---|
+| **NeMo TitaNet-small** (`nemo_en_titanet_small.onnx`, 40 MB) | 0.76, 0.59 | 0.10, 0.41 | **0 %** |
+| 3D-Speaker ERes2Net base (zh-cn) | 0.62, 0.29 | 0.17, 0.49 | 7 % |
+| WeSpeaker ResNet34-LM (VoxCeleb) | 0.81, 0.65 | 0.58, 0.84 | 14 % |
+| 3D-Speaker CAM++ (VoxCeleb) | 0.50, 0.01 | 0.39, 0.95 | 43 % |
+
+**Threshold.** Four synthetic calls (2-4 readers, 2.5-4 min each, 24-40 turns) through the whole pipeline with TitaNet. Each cell shows people found and the share of speech given to the right person:
+
+| threshold | 3 readers | 2 readers | 4 readers | 4 readers |
+|---|---|---|---|---|
+| 0.6 | 4, 91 % | 4, 81 % | 9, 84 % | 6, 89 % |
+| 0.7 | 4, 91 % | 2, 100 % | 5, 99 % | 4, 98 % |
+| **0.8-0.9** | **3, 97 %** | **2, 100 %** | **4, 99 %** | **4, 98 %** |
+| 1.0 | 2, 78 % | 2, 100 % | 4, 99 % | 4, 98 % |
+
+**End to end** (`--meeting` on the NPU): a 2:55 meeting (three readers in the system audio, a fourth on the microphone, the system audio leaking into the microphone at -22 dB, a pause in the middle) took 24 s.
+- All 3 people were found.
+- 100 % of the text was under the right label.
+- 244 echo words were cut, and none of yours.
+
+`tests/meeting_test.py` builds the same kind of meeting from espeak-ng voices in Russian and English and checks it. espeak's voices are much more alike than people (similarity ~0.35 between its variants), so the test sets a stricter threshold (0.7).
+
+**Speed:** about 1/7 of the recording's length.
+- Whisper runs ~15x realtime with word timestamps, once per track.
+- Diarization runs ~16x realtime on 4 CPU threads, hidden behind Whisper.
+- A 1-hour meeting takes ~8 minutes, a 1-hour file with `--speakers` ~4.
 
 ## Models
 

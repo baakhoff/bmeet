@@ -66,6 +66,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -I bmeet/app/tests/test_bmeet.py -v
+      - name: npu-transcribe speaker helpers (offline, no models)
+        run: |
+          python -m pip install --quiet "numpy>=2.0"
+          python -I transcribe/tests/test_speakers.py -v
       - name: npu-transcribe output checker
         run: |
           printf '1\n00:00:00,000 --> 00:00:01,500\nHello world.\n' > /tmp/t.srt

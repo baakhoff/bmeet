@@ -7,3 +7,6 @@ openvino-tokenizers==2026.4.1.0
 numpy>=2.0
 # `hf download` for the Whisper models
 huggingface-hub>=0.34
+# Speaker diarization (meetings: Person 1, Person 2, ...; npu-transcribe --speakers), CPU.
+# Pulls sherpa-onnx-core of the same version (the onnxruntime libraries, ~40 MB).
+sherpa-onnx==1.13.8

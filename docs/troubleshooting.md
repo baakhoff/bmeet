@@ -25,5 +25,20 @@ bash ~/.local/share/bmeet/src/voxtype/verify.sh
 | BMeet window only flashes in the task bar | Wayland focus-stealing prevention when it's opened from another program. Click the task bar entry. |
 | npu-transcribe: "model not found … turbo" | It was installed with `--no-turbo`. Re-run the installer without it, or use `--model small`. |
 
+## Meeting speakers
+
+The speaker pass (You / Person 1 / Person 2 …) runs as the systemd user unit
+`bmeet-speakers-YYYY-MM-DD_HHMM` after each meeting; the BMeet app shows "Telling the
+speakers apart…" until it is done.
+
+| Symptom | What to check |
+|---|---|
+| The transcript keeps *You* / *Remote* | `head -1 ~/.config/bmeet/speakers` must say `on` (off with `--no-speakers`). Its log: `journalctl --user -u 'bmeet-speakers-*' -u bmeet-meeting-audio -b`. A desktop notification "Meeting speakers failed" names the reason. |
+| Two people are one *Person* | Their voices were too alike (or one barely spoke). Lower the threshold for the pass, e.g. `systemctl --user set-environment NPU_SPEAKER_THRESHOLD=0.75` (the default is 0.85), and it applies from the next meeting. Undo: `systemctl --user unset-environment NPU_SPEAKER_THRESHOLD`. |
+| One person is split in two | The opposite: raise it, e.g. `NPU_SPEAKER_THRESHOLD=0.95`. Files: `npu-transcribe --num-speakers N` fixes the count. |
+| Your own words are missing | The echo filter cuts words where your microphone is less than 2x louder than the echo of the system audio. It can happen if you talk very quietly while the other side is loud. Headphones avoid the echo altogether. |
+| Their words appear under *You* | Usually loud speakers next to a sensitive microphone. Headphones help. |
+| A "-speakers.md" file appeared next to the transcript | You edited the transcript while the pass ran, so your edit was kept and the speaker version was saved next to it. |
+
 When you open an issue, include the output of `verify.sh` and
 `journalctl --user -u voxtype -b -n 50`.

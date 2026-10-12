@@ -7,7 +7,7 @@
 #   ~/.config/voxtype/config.toml            written if missing; a config not written by
 #                                            BMeet is kept as config.toml.bak-<time>
 #   ~/.config/bmeet/languages       dictation languages for Meta+Shift+H
-#   ~/.local/bin/voxtype-meeting-toggle, voxtype-lang
+#   ~/.local/bin/voxtype-meeting-toggle, voxtype-lang, bmeet-meeting-audio
 #   ~/.local/share/applications/voxtype-*.desktop  (+ links in ~/.local/share/kglobalaccel/)
 #   ~/.local/share/voxtype/models/gtcrn_simple.onnx (meeting echo cancel, sha256-pinned)
 #   ~/.cache/voxtype/openvino/                (NPU compile cache, ~1.1 GB for whisper-small)
@@ -71,7 +71,11 @@ uninstall() {
     fi
     systemctl --user disable --now voxtype.service 2>/dev/null || true
     systemctl --user stop ydotool.service 2>/dev/null || true
-    rm -f "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang"
+    # speaker passes still running: stop them (their ExecStopPost deletes the audio)
+    systemctl --user stop bmeet-meeting-audio.service 'bmeet-speakers-*.service' 2>/dev/null || true
+    rm -rf "$XDG_RUNTIME_DIR/bmeet/meeting-audio"
+    rmdir "$XDG_RUNTIME_DIR/bmeet" 2>/dev/null || true
+    rm -f "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang" "$BIN_DIR/bmeet-meeting-audio"
     for f in $APPS; do
         rm -f "$APP_DIR/$f.desktop" "$KGA_DIR/$f.desktop"
     done
@@ -83,7 +87,8 @@ uninstall() {
         mv "$CONF_DIR/config.toml" "$CONF_DIR/config.toml.uninstalled-$(date +%Y%m%d-%H%M%S)"
         echo "  your voxtype config was kept as $CONF_DIR/config.toml.uninstalled-*"
     fi
-    rm -f "$LANG_FILE"; rmdir "$(dirname "$LANG_FILE")" 2>/dev/null || true
+    rm -f "$LANG_FILE" "$(dirname "$LANG_FILE")/speakers"
+    rmdir "$(dirname "$LANG_FILE")" 2>/dev/null || true
     rm -f "$DROPIN" "$DROPIN_DIR/10-log-warn.conf"
     rmdir "$DROPIN_DIR" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
@@ -172,8 +177,9 @@ echo "  engine=$(voxtype config get engine) model=$(basename "$(voxtype config g
 
 step "4/8 helper commands -> $BIN_DIR"
 install -d -m 0755 "$BIN_DIR"
-install -m 0755 "$HERE/bin/voxtype-meeting-toggle" "$HERE/bin/voxtype-lang" "$BIN_DIR/"
-ls -l "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang"
+install -m 0755 "$HERE/bin/voxtype-meeting-toggle" "$HERE/bin/voxtype-lang" \
+    "$HERE/bin/bmeet-meeting-audio" "$BIN_DIR/"
+ls -l "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang" "$BIN_DIR/bmeet-meeting-audio"
 
 step "5/8 launchers + KDE global shortcuts (Meta+H, Meta+Alt+H, Meta+Alt+M, Meta+Shift+H)"
 install -d -m 0755 "$APP_DIR" "$KGA_DIR"

@@ -82,7 +82,7 @@ NPU_SIGNER=EA267657A608300C296B8F8AD52C9665A4077678       # Intel linux-npu-driv
 
 KEYS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/keys"
 APT_OPTS=(-o DPkg::Lock::Timeout=600)   # wait for unattended-upgrades instead of failing
-BASE_PKGS="ffmpeg python3-venv python3-pyqt6 wl-clipboard libnotify-bin desktop-file-utils
+BASE_PKGS="ffmpeg python3-venv python3-pyqt6 wl-clipboard libnotify-bin desktop-file-utils pipewire-bin
            libespeak-ng1 libtbb12 libze1 curl"
 UDEV_RULE=/etc/udev/rules.d/70-voxtype-uinput.rules
 YDO_DROPIN=/etc/systemd/user/ydotool.service.d/10-voxtype.conf

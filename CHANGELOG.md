@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-10-13
+
+English terms in Russian speech come out right far more often.
+
+### Added
+- **English terms in Russian transcripts:** GigaAM, used for Russian, garbles English words ("Data Dog", "worниiнг statemont", "Рuби, Пиtн") or writes them in Cyrillic, while Whisper hears most of them. Now the sentences in which GigaAM wrote Latin letters also go to Whisper, and each English word Whisper heard replaces the GigaAM word at the same moment that sounds like it.
+  - Russian endings stay ("warning-и", "GPU-шки", "Go-разработчиков"), words that don't sound alike are never touched, and words the two models agree on keep GigaAM's spelling.
+  - Measured on 33 min of a Russian IT podcast with 98 English terms (Podlodka): word errors went from 7.05 % to 6.52 %, and the English terms written right from 22 % to 54 %. Whisper turbo alone gets 58 % of the terms but 8.2 % word errors.
+  - **Cost:** Whisper ran on 12 % of the audio, which took 29 s on the NPU and 12 s of CPU for the 33 minutes. Expect a minute or two more per hour of a term-heavy meeting.
+  - `npu-transcribe --no-english-terms` turns it off. `transcribe/tests/english_terms_test.py` reruns the measurement.
+
 ## [0.5.1] - 2026-10-13
 
 Fixes from the first real in-person meeting, tidier text, and nothing slips onto the CPU.
@@ -127,6 +138,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.5.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.2
 [0.5.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.1
 [0.5.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.0
 [0.4.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.4.0

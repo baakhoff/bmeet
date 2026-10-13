@@ -322,6 +322,64 @@ class Tidy(unittest.TestCase):
             nt.VERBATIM = False
 
 
+class EnglishTerms(unittest.TestCase):
+    """GigaAM's words with Whisper's English words put in (swap_english, english_terms)."""
+
+    @staticmethod
+    def timed(spec):  # "word@start-end ..." with Whisper's/GigaAM's leading spaces
+        return words(spec)
+
+    def test_garbled_terms_are_swapped(self):
+        mine = self.timed("в@0-0.2 компании@0.2-0.8 Daita@0.9-1.2 Doh,@1.2-1.5 то@1.6-1.7 есть@1.7-2")
+        theirs = self.timed("в@0-0.2 компании@0.2-0.8 Datadog,@0.9-1.5 то@1.6-1.7 есть@1.7-2")
+        out, n = nt.swap_english(mine, theirs)
+        self.assertEqual(("".join(w.text for w in out).strip(), n), ("в компании Datadog, то есть", 1))
+
+    def test_cyrillic_spelling_and_russian_endings(self):
+        mine = self.timed("на@0-0.2 ворнинги,@0.3-0.9 там,@1-1.3 не@1.4-1.5 знаю,@1.5-1.8 GPU-шки@1.9-2.6")
+        theirs = self.timed("на@0-0.2 warning,@0.3-0.9 там,@1-1.3 не@1.4-1.5 знаю,@1.5-1.8 GPU@1.9-2.4")
+        out, n = nt.swap_english(mine, theirs)
+        self.assertEqual("".join(w.text for w in out).strip(), "на warning-и, там, не знаю, GPU-шки")
+        self.assertEqual(n, 2)
+
+    def test_pieces_join_and_unlike_words_stay(self):
+        mine = self.timed("упомянул@0-0.6 OneOn-On.@0.7-1.4 Допустим@1.5-2")
+        theirs = [Word(0.0, 0.6, " упомянул"), Word(0.7, 0.9, " one"), Word(0.9, 1.1, "-on"),
+                  Word(1.1, 1.3, "-one"), Word(1.3, 1.4, "."), Word(1.5, 2.0, " Допустим")]
+        out, _ = nt.swap_english(mine, theirs)
+        self.assertEqual("".join(w.text for w in out).strip(), "упомянул one-on-one. Допустим")
+        # (too unlike to swap: "ван-нлан" for "one-on-one" stays as GigaAM wrote it)
+        out, n = nt.swap_english(self.timed("ван-нлан@0.7-1.4"), theirs[1:4])
+        self.assertEqual(("".join(w.text for w in out).strip(), n), ("ван-нлан", 0))
+        # nothing English-sounding where Whisper heard English: GigaAM stays
+        out, n = nt.swap_english(self.timed("потом@0-0.5 мы@0.6-0.8"), self.timed("Wave@0-0.5 to@0.6-0.8"))
+        self.assertEqual(("".join(w.text for w in out).strip(), n), ("потом мы", 0))
+
+    def test_same_words_keep_gigaam_spelling(self):
+        out, n = nt.swap_english(self.timed("в@0-0.2 Google@0.3-0.6 Play@0.6-0.9"),
+                                 self.timed("в@0-0.2 google@0.3-0.6 play@0.6-0.9"))
+        self.assertEqual(("".join(w.text for w in out).strip(), n), ("в Google Play", 0))
+
+    def test_only_sentences_with_latin_go_to_whisper(self):
+        class FakeWhisper:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, samples, **kw):
+                self.calls.append((samples.size / RATE, kw["language"]))
+                w = type("W", (), {"start_ts": 0.3, "end_ts": 0.9, "word": " Datadog"})
+                return type("R", (), {"words": [w]})
+        segs = [Seg(0, 2, "Привет всем.", words("Привет@0-0.5 всем.@0.5-2")),
+                Seg(10, 12, "Это Data Dog.", words("Это@10-10.2 Data@10.3-10.6 Dog.@10.6-10.9"))]
+        fake = FakeWhisper()
+        out, n, seconds = nt.english_terms(fake, np.zeros(20 * RATE, np.float32), segs, "ru")
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0][1], "<|ru|>")
+        self.assertAlmostEqual(seconds, 2 + 2 * nt.TERM_PAD)
+        self.assertEqual([s.text for s in out], ["Привет всем.", "Это Datadog."])
+        self.assertEqual(n, 1)
+
+
 class Echo(unittest.TestCase):
     """System audio 0-10 s, leaking into the microphone at -20 dB; you speak 10-12 s."""
 

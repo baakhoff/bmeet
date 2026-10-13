@@ -28,7 +28,7 @@ machine, and the CPU and GPU are left alone.
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - `--speakers` (or *Transcribe with speakers* in Dolphin) labels the lines Speaker 1, Speaker 2, …
   - Whisper large-v3-turbo runs at ~25x realtime on the NPU.
-- **Russian with GigaAM v3** (Sber): about 20 % fewer word errors than Whisper on Russian conversation, at ~200x realtime on the NPU. It's used for Russian meetings and files automatically; English terms inside Russian speech come out worse than with Whisper (details in [docs/npu-transcribe.md](docs/npu-transcribe.md#russian-gigaam-v3)).
+- **Russian with GigaAM v3** (Sber): about 20 % fewer word errors than Whisper on Russian conversation, at ~200x realtime on the NPU. It's used for Russian meetings and files automatically. GigaAM garbles English terms, so Whisper redoes the sentences where it hears some: on a Russian IT podcast, 54 % of the English terms came out right instead of 22 % (details in [docs/npu-transcribe.md](docs/npu-transcribe.md#english-terms-in-russian-speech)).
 - **Everything on the NPU:** speech recognition, language detection and telling the speakers apart. The CPU only decodes audio and does small arithmetic.
 - **BMeet app:**
   - Meeting history, transcribed files and a transcription queue, with search.
@@ -203,6 +203,7 @@ bmeet/plasmoid/tests/check_qml.py --strict bmeet/plasmoid/*/contents/ui/*.qml
 transcribe/tests/run-tests.sh /tmp/npt "NPU CPU"  # npu-transcribe benchmark / regression
 transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass (ru; --language en,
                                                   #   --remember, --muted, --in-person)
+transcribe/tests/english_terms_test.py /tmp/npt   # English terms in Russian speech (downloads Podlodka)
 python3 -I bmeet/chrome/tests/test_host.py        # Chrome extension's host (offline)
 bmeet/chrome/tests/test_extension.py              # the extension in a throwaway headless Chrome
 bash voxtype/verify.sh                            # health check of an installed system

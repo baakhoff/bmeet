@@ -38,7 +38,9 @@ Examples:
 Notes:
   * Russian (given with --language ru, or detected) goes to GigaAM v3 when it is installed:
     ~20 % fewer word errors than Whisper turbo on Russian conversation and ~15x faster,
-    but it mangles English words inside Russian speech. --engine whisper keeps Whisper;
+    but it mangles English words inside Russian speech. So the sentences where GigaAM
+    wrote Latin letters also go to Whisper, and Whisper's English words replace GigaAM's
+    garbled ones (--no-english-terms turns that off). --engine whisper keeps Whisper;
     --translate always uses Whisper (docs/npu-transcribe.md).
   * Whisper models: turbo (default when installed) is the more accurate one and on the
     NPU about as fast as small. small needs less RAM (~2.6 vs ~3.9 GB RSS), compiles faster and is
@@ -63,6 +65,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import difflib
 import fcntl
 import html
 import itertools
@@ -99,7 +102,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -740,6 +743,159 @@ def transcribe_ctc(model: GigaAM, name: str, blocks: Generator[tuple[float, np.n
         blocks.close()
         progress.close()
     return Transcript(segments, done, time.monotonic() - t0, model.language, 0)
+
+
+# English terms in Russian speech. GigaAM writes them garbled or in Cyrillic ("Data Dog",
+# "worниiнг statemont", "Рuби, Пиtн", "жаво"); Whisper gets most of them, but makes more
+# errors in the Russian around them. So the sentences in which GigaAM wrote Latin letters
+# (it heard something English) are also given to Whisper, and Whisper's English words
+# replace the GigaAM words that sound like them, at the same time. On 33 min of a Russian IT
+# podcast with 98 English terms (Podlodka; docs/npu-transcribe.md): GigaAM 7.3 % word
+# errors and 20 % of the terms right, Whisper turbo 8.2 % and 58 %, both together 6.8 %
+# and 54 %, with Whisper on 13 % of the audio.
+TERM_SIMILARITY = 0.4         # how alike (transliterated) a GigaAM word and Whisper's English word must sound
+TERM_SHORT_SIMILARITY = 0.7   # ... for GigaAM words of 1-3 letters ("то", "не")
+TERM_SLICE_GAP = 2.0          # sentences closer than this go to Whisper together, ...
+TERM_SLICE_MAX = 28.0         # ... up to this long (one Whisper window)
+TERM_PAD = 0.3                # audio around a sentence for Whisper
+# Russian endings kept after an English word: "GPU-шки", "warning-и", "Go-разработчиков"
+TERM_ENDING = re.compile(r"^(?:ы|и|а|у|е|ой|ом|ов|ев|ах|ам|ами|ей|ем|шк[аиуе]|шками|к[аиуе]|ками|"
+                         r"ный|ная|ное|ные|ного|ному|ными|ский|ские|ским|ер|ера|еры|ерам|ером)$", re.I)
+ENGLISH_WORD = re.compile(r"^\W*[A-Za-z][\w.+#'&/-]*?(?:-[а-яё]+)?\W*$", re.I)
+
+
+def sounds(text: str) -> str:
+    """Letters as they sound, in Latin: "ворнинг" -> "vorning"."""
+    return re.sub(r"[^a-z0-9]", "", "".join(CYR_TO_LAT.get(c, c) for c in text.lower()))
+
+
+def alike(a: str, b: str) -> float:
+    a, b = sounds(a), sounds(b)
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def english_word(text: str) -> bool:
+    return bool(ENGLISH_WORD.match(text.strip())) and len(re.sub(r"[^A-Za-z]", "", text)) >= 2
+
+
+def whole_words(words: list[Word]) -> list[Word]:
+    """Whisper's pieces (" one", "-on", "-one", ",") joined into words: a piece without a
+    leading space continues the word before it."""
+    out: list[Word] = []
+    for w in words:
+        if out and w.text and not w.text[0].isspace():
+            out[-1] = Word(out[-1].start, w.end, out[-1].text + w.text)
+        else:
+            out.append(Word(w.start, w.end, w.text))
+    return out
+
+
+def split_ending(text: str) -> tuple[str, str]:
+    """("GPU,", "-шки") for "GPU-шки,"; (text, "") when there is no "-ending"."""
+    m = re.match(r"^(.*?)(-[а-яё]+)(\W*)$", text.strip(), re.I)
+    return (m[1] + m[3], m[2]) if m and m[1] else (text.strip(), "")
+
+
+def swap_english(mine: list[Word], theirs: list[Word]) -> tuple[list[Word], int]:
+    """GigaAM's words (mine) with Whisper's English words (theirs) put in where they were
+    said: a run of English Whisper words replaces the GigaAM words at the same time that
+    sound like them (TERM_SIMILARITY). Returns the words and how many runs went in."""
+    runs: list[list[Word]] = []
+    current: list[Word] = []
+    for w in whole_words(theirs) + [Word(0.0, 0.0, " .")]:  # (the last one ends the last run)
+        if english_word(w.text):
+            current.append(w)
+        elif current:
+            runs.append(current)
+            current = []
+    mark: list[int | None] = [None] * len(mine)
+    for k, run in enumerate(runs):
+        a, b = run[0].start - 0.15, run[-1].end + 0.15
+        for i, w in enumerate(mine):
+            if mark[i] is not None or max(0.0, min(w.end, b) - max(w.start, a)) < 0.3 * max(w.end - w.start, 0.02):
+                continue
+            core, _ = split_ending(w.text)
+            near = [x for x in run if min(x.end, w.end + 0.15) - max(x.start, w.start - 0.15) > 0] or run
+            best = max([alike(core, x.text) for x in near if len(sounds(x.text)) >= 3]
+                       + [alike(core, "".join(x.text for x in near))])
+            short = len(sounds(core)) <= 3 and not re.search(r"[A-Za-z]", core)
+            if best >= (TERM_SHORT_SIMILARITY if short else TERM_SIMILARITY):
+                mark[i] = k
+    out: list[Word] = []
+    done: set[int] = set()
+    swapped = 0
+    for i, w in enumerate(mine):
+        k = mark[i]
+        if k is None:
+            out.append(w)
+            continue
+        if k in done:
+            continue
+        done.add(k)
+        idx = [j for j in range(len(mine)) if mark[j] == k]
+        first, last = mine[idx[0]], mine[idx[-1]]
+        said = [x for x in runs[k] if min(x.end, last.end + 0.25) - max(x.start, first.start - 0.25) > 0] or runs[k]
+        text = "".join(x.text for x in said).strip()
+        if tokens(text) == tokens("".join(mine[j].text for j in idx)):  # the same words: keep GigaAM's
+            out += [mine[j] for j in idx]
+            continue
+        last_text = last.text.strip()
+        _, ending = split_ending(last_text)
+        if not ending and re.fullmatch(r"\W*[а-яё]+\W*", last_text, re.I):  # "ворнинги" -> "warning-и"
+            word, said_last = re.sub(r"\W+", "", last_text), said[-1].text
+            for n in (3, 2, 1):
+                stem, end = word[:-n], word[-n:].lower()
+                if len(stem) >= 3 and TERM_ENDING.match(end) \
+                        and alike(stem, said_last) >= alike(word, said_last) + 0.03 \
+                        and not (end in ("ы", "и") and re.search(r"s\W*$", said_last)):  # (already plural)
+                    ending = "-" + end
+                    break
+        if ending and not re.search(r"[а-яё]", text, re.I):
+            part = ending[1:]
+            if TERM_ENDING.match(part) or (len(part) >= 6 and max(alike(part, x.text) for x in said) < TERM_SIMILARITY):
+                text = re.sub(r"\W*$", "", text) + ending
+        if (tail := re.search(r"[.!?…,]+$", last_text)) and not re.search(r"[.!?…,]$", text):
+            text += tail[0]
+        elif not tail:
+            text = re.sub(r"[.!?…,]+$", "", text)
+        out.append(Word(first.start, last.end, " " + text))
+        swapped += 1
+    return out, swapped
+
+
+def english_terms(whisper: Whisper, samples: np.ndarray, segments: list[Segment],
+                  language: str) -> tuple[list[Segment], int, float]:
+    """GigaAM's segments with Whisper's English words put in (see TERM_SIMILARITY) where GigaAM
+    wrote Latin letters. Returns the segments, the words swapped in, and the seconds of
+    audio given to Whisper."""
+    chosen = [i for i, seg in enumerate(segments) if seg.words and re.search(r"[A-Za-z]", seg.text)]
+    slices: list[list[int]] = []
+    for i in chosen:
+        seg = segments[i]
+        if slices and seg.start - segments[slices[-1][-1]].end < TERM_SLICE_GAP \
+                and seg.end - segments[slices[-1][0]].start < TERM_SLICE_MAX:
+            slices[-1].append(i)
+        else:
+            slices.append([i])
+    out, swapped, seconds = list(segments), 0, 0.0
+    for group in slices:
+        a = max(0.0, segments[group[0]].start - TERM_PAD)
+        b = min(samples.size / SAMPLE_RATE, segments[group[-1]].end + TERM_PAD)
+        seconds += b - a
+        result = whisper.generate(samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)], language=f"<|{language}|>",
+                                  task="transcribe", return_timestamps=True, word_timestamps=True)
+        if result is None:
+            continue
+        theirs = [Word(a + float(w.start_ts), a + float(w.end_ts), w.word) for w in (result.words or [])]
+        for i in group:
+            seg = segments[i]
+            near = [w for w in theirs if seg.start - 0.5 <= (w.start + w.end) / 2 <= seg.end + 0.5]
+            words, n = swap_english(seg.words, near)
+            if n:
+                swapped += n
+                out[i] = Segment(seg.start, seg.end, " ".join("".join(w.text for w in words).split()),
+                                 words, seg.speaker)
+    return out, swapped, seconds
 
 
 # --------------------------------------------------------------------------- speakers
@@ -1772,6 +1928,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="transcribe a BMeet meeting recording (see above) instead of files")
     p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
     p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
+    p.add_argument("--no-english-terms", action="store_true",
+                   help="Russian (GigaAM): do not let Whisper redo the English terms in sentences where "
+                        "GigaAM heard some (by default it does, on the NPU, for those sentences only)")
     p.add_argument("--verbatim", action="store_true",
                    help="keep fillers (э-э, а-а, um), stutters and repeated words; by default they are "
                         "left out")
@@ -1817,10 +1976,25 @@ class Engines:
         self._gigaam: GigaAM | None = None
         self._speakers: SpeakerModels | None = None
 
-    def whisper(self) -> Whisper:
+    def whisper(self, words: bool = False) -> Whisper:
+        """words: with word timestamps (a separately compiled pipeline; reloaded if needed)."""
+        words = words or self.args.speakers
+        if self._whisper is not None and words and not self._whisper.word_timestamps:
+            self._whisper = None  # (frees the pipeline without them)
         if self._whisper is None:
-            self._whisper = Whisper(self.model_dir, list(self.devices), word_timestamps=self.args.speakers)
+            self._whisper = Whisper(self.model_dir, list(self.devices), word_timestamps=words)
         return self._whisper
+
+    def english_terms(self, samples: np.ndarray, t: Transcript) -> int:
+        """English terms from Whisper in a GigaAM transcript (english_terms()), in place.
+        Returns the words swapped in."""
+        if self.args.no_english_terms or not any(re.search(r"[A-Za-z]", s.text) for s in t.segments):
+            return 0
+        t0, c0 = time.monotonic(), cpu_seconds()
+        t.segments, swapped, seconds = english_terms(self.whisper(words=True), samples, t.segments, "ru")
+        log(f"English terms: Whisper on {seconds:.0f} s of {t.duration:.0f} s, {swapped} swapped in, "
+            f"in {time.monotonic() - t0:.1f} s (CPU {cpu_seconds() - c0:.1f} s)")
+        return swapped
 
     def gigaam(self) -> GigaAM:
         if self._gigaam is None:
@@ -1956,6 +2130,11 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             if heard[name]:
                 log(f"{name}: transcribed in {time.monotonic() - t1:.1f} s (CPU {cpu_seconds() - c1:.1f} s)")
         theirs, yours = heard["system audio"], heard["microphone"]
+        terms = 0
+        if isinstance(engine, GigaAM):
+            for t, samples in ((theirs, remote), (yours, mic)):
+                if t and t.segments:
+                    terms += engines.english_terms(samples, t)
         room = in_person or not (theirs and theirs.segments)
         segments, labels, prints, names = [], {}, {}, {}
         speakers_on, echoes, me = "", 0, None
@@ -2001,6 +2180,8 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
         if echoes:
             meta["Echo"] = (f"{echoes} word(s) your microphone picked up from the speakers "
                             "were left out")
+        if terms:
+            meta["English terms"] = f"{terms} written as Whisper heard them (GigaAM garbles English)"
         dest = out
         if out.exists() and out.stat().st_mtime_ns != before:
             dest = out.with_name(f"{out.stem}-speakers.md")
@@ -2082,13 +2263,17 @@ def main(argv: list[str]) -> int:
             engine, language = engines.choose(args.language, audio_blocks(src))
             kwargs = dict(gen_kwargs, language=f"<|{language}|>") \
                 if not isinstance(engine, GigaAM) and language not in ("auto", "?") else gen_kwargs
-            if args.speakers:  # diarization needs the whole recording at once
+            terms = 0
+            if args.speakers or isinstance(engine, GigaAM):  # (the whole recording at once)
                 samples = decode_all(src)
                 t = transcribe(engine, src.name, array_blocks(samples), samples.size / SAMPLE_RATE, kwargs)
                 t0 = time.monotonic()
-                found = diarize(engines.speakers(), samples, args.num_speakers)[0] if t.segments else []
-                t.segments, labels = number_speakers(t.segments, found, "Speaker", "Speaker ?")
-                speakers = len(set(labels.values()))
+                if isinstance(engine, GigaAM) and t.segments:
+                    terms = engines.english_terms(samples, t)
+                if args.speakers:
+                    found = diarize(engines.speakers(), samples, args.num_speakers)[0] if t.segments else []
+                    t.segments, labels = number_speakers(t.segments, found, "Speaker", "Speaker ?")
+                    speakers = len(set(labels.values()))
                 t.wall += time.monotonic() - t0
                 del samples
             else:
@@ -2104,6 +2289,8 @@ def main(argv: list[str]) -> int:
                 "Model": f"{model_name} on {engine.device}, {speed:.1f}x realtime",
                 "Created": f"{datetime.now():%Y-%m-%d %H:%M} by {PROG}",
             }
+            if terms:
+                meta["English terms"] = f"{terms} written as Whisper heard them (GigaAM garbles English)"
             if speakers is not None:
                 meta["Speakers"] = f"{speakers}, told apart by voice" + \
                     (f" (asked for {args.num_speakers})" if args.num_speakers else "")

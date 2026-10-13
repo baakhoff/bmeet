@@ -49,7 +49,7 @@ For Russian, npu-transcribe uses [GigaAM v3](https://github.com/salute-developer
 
 **Trade-offs:**
 - **Better:** GigaAM gets Russian words right that Whisper misses ("тимлидом" where Whisper wrote "тем лидом", "чатик" where it wrote "чат").
-- **Worse:** English terms inside Russian speech come out mangled, for example "Superviselening" or "Perfomance".
+- **Worse:** English terms inside Russian speech come out mangled, for example "Superviselening" or "Perfomance". Since 0.5.2, Whisper fixes most of them (see the next section).
 - **Through the call codec:** the margin over Whisper turbo shrinks to 7.1 % vs 7.9 %.
 
 **Making it run on the NPU.** `transcribe/prepare-models` does this once, at install time (~7 s, plus a ~1 min NPU compile).
@@ -60,6 +60,32 @@ For Russian, npu-transcribe uses [GigaAM v3](https://github.com/salute-developer
   - The rotary tables come from constant folding at the fixed 30 s input (750 positions).
 - **The result:** WER 6.5 %, the same as on the CPU, at ~215x realtime on the NPU. The model is saved with fp16 weights (~480 MB in `~/.local/share/npu-models/gigaam-v3-ctc-ru`).
 - **At run time:** the features (64-band log-mel, n_fft 320, hop 160, like `gigaam.preprocess`) are computed in numpy, and the output is decoded greedily. Words get their times from the 40 ms output frames.
+
+## English terms in Russian speech
+
+GigaAM garbles English words or writes them in Cyrillic: "Data Dog", "worниiнг statemont", "Рuби, Пиtн", "жаво", "обзервабилити". Whisper hears most of them, but makes more errors in the Russian around them. So for Russian, `english_terms()` combines the two:
+
+1. **Where:** the sentences in which GigaAM wrote Latin letters (it heard something English) go to Whisper turbo too. Sentences less than 2 s apart are sent together, up to 28 s. Whisper is forced to Russian and gives word timestamps. On the test set that was 12 % of the audio. Also sending sentences with English-looking Cyrillic words ("-инг", "-шн", "-айн"…) needed 64 % of the audio for a few more terms.
+2. **What:** a run of Whisper words in Latin letters replaces the GigaAM words said at the same time that sound like it. "Sound like" is checked by transliterating both to Latin and needing a difflib ratio of 0.4, or 0.7 for words of 1–3 letters. Whisper's pieces ("one", "-on", "-one") are joined first.
+3. **Russian endings stay:**
+   - after a hyphen: "GPU-шки", "Go-разработчиков";
+   - attached to a Cyrillic word: "ворнинги" → "warning-и", when the stem sounds more like Whisper's word than the whole word does.
+4. **Left alone:** words that do not sound alike ("там, не знаю" next to "GPU"), and words the two models agree on (GigaAM's capitals stay).
+
+**Measured** on the Podlodka clips with Latin-letter references: 87 unique clips, 33 min, 4,744 words, 98 English terms (`tests/english_terms_test.py`). WER is on lower-case words. A term counts when the output has the Latin word, endings aside.
+
+| | WER | English terms right |
+|---|---|---|
+| GigaAM (with tidying, as before) | 7.05 % | 22 / 98 |
+| Whisper turbo alone | 8.2 % | 57 / 98 |
+| **GigaAM + Whisper's English words** | **6.52 %** | **53 / 98** |
+| ... with Whisper on all the audio (simulated) | 6.67 % | 62 / 98 |
+
+**Typical swaps:** "Data Dog" → "DataDog", "worниiнг statemont" → "warning statement", "эксepшеon" → "exception", "Рuби, Пиtн" → "Ruby, Python", "Baunderis" → "Boundaries", "P" → "KPI".
+
+**What it doesn't fix:** some swaps are still wrong where Whisper is wrong too ("Wave to VEG" for wav2vec), and terms GigaAM wrote in plain Cyrillic in a sentence with no Latin letters are not looked at.
+
+**Cost:** on the test set Whisper took 29 s on the NPU and 12.3 s of CPU (its decoding loop and word timing run on the host) for 33 min of audio. Whisper on all the audio would cost 2.2 s of CPU per minute; without word timestamps 1.1 s. The small model is not cheaper: its decoder is heavier than turbo's. In meetings the Whisper pipeline is already loaded to detect the language. `--no-english-terms` turns it off.
 
 ## Block length
 

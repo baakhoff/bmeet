@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Voxtype: In-person meeting
+GenericName=In-person meeting transcription (toggle)
+Comment=Start/stop a meeting in the room (microphone only, split by voice); Markdown goes to ~/Documents/Meetings
+Exec=@HOME@/.local/bin/voxtype-meeting-toggle --in-person
+Icon=group
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+Keywords=meeting;in person;office;transcript;voxtype;
+X-KDE-Shortcuts=Meta+Alt+Shift+M

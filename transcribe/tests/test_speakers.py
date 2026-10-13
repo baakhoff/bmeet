@@ -339,10 +339,123 @@ class MeetingFolder(unittest.TestCase):
             wav("part-2-mic.wav", 1.0)
             wav("part-2-remote.wav", 1.0)
             (tmp / "meeting.json").write_text("{}")
-            mic, remote = nt.read_meeting(tmp)
+            (tmp / "part-2.start").write_text("1760000100.25\n")
+            mic, remote, parts = nt.read_meeting(tmp)
             self.assertEqual((mic.size, remote.size), (3 * RATE, 3 * RATE))
             self.assertEqual(float(remote[int(1.7 * RATE)]), 0.0)
             self.assertNotEqual(float(remote[int(2.1 * RATE)]), 0.0)
+            self.assertEqual(parts, [nt.Part(0.0, 2.0, None), nt.Part(2.0, 1.0, 1760000100.25)])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_in_person_has_no_remote_tracks(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
+        import wave
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        try:
+            for n in (1, 2):
+                with wave.open(str(tmp / f"part-{n}-mic.wav"), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(RATE)
+                    w.writeframes(b"\x00\x10" * RATE)
+            mic, remote, parts = nt.read_meeting(tmp)
+            self.assertEqual((mic.size, remote.size, len(parts)), (2 * RATE, 2 * RATE, 2))
+            self.assertFalse(remote.any())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class MicOff(unittest.TestCase):
+    """The call log of BMeet's Chrome extension -> when your microphone is left out."""
+    T = 1_760_000_000.0
+
+    def log(self, *spec):  # (seconds after T, call, live)
+        return [(self.T + t, call, live) for t, call, live in spec]
+
+    def test_muted_stretch(self):
+        log = self.log((0, True, True), (5, True, True), (10, True, False), (15, True, False),
+                       (20, True, False), (24, True, True), (29, True, True))
+        parts = [nt.Part(0.0, 60.0, self.T - 2.0)]  # the recording started 2 s before the log
+        # muted 10..24 s, minus LIVE_LEAD before the sound at 24 s; +2 s in the recording
+        self.assertEqual(nt.muted_spans(log, parts), [(12.0, 26.0 - nt.LIVE_LEAD)])
+
+    def test_across_a_pause(self):
+        log = self.log((0, True, True), (10, True, False), (20, True, False), (30, True, True))
+        # part 1: T-5..T+15, paused, part 2: T+25..T+45 (muted 10 s .. 30 s - LIVE_LEAD)
+        parts = [nt.Part(0.0, 20.0, self.T - 5.0), nt.Part(20.0, 20.0, self.T + 25.0)]
+        self.assertEqual(nt.muted_spans(log, parts), [(15.0, 20.0), (20.0, 25.0 - nt.LIVE_LEAD)])
+
+    def test_lines_go_stale(self):  # the extension stopped talking: no longer muted after CALL_STALE
+        log = self.log((0, True, True), (10, True, False))
+        self.assertEqual(nt.muted_spans(log, [nt.Part(0.0, 100.0, self.T)]),
+                         [(10.0, 10.0 + nt.CALL_STALE)])
+
+    def test_no_call_or_never_live(self):
+        parts = [nt.Part(0.0, 60.0, self.T)]
+        self.assertEqual(nt.muted_spans(self.log((0, False, False), (30, False, False)), parts), [])
+        # a call in which no sound was ever seen: the extension cannot see that microphone
+        self.assertEqual(nt.muted_spans(self.log((0, True, False), (5, True, False)), parts), [])
+        self.assertEqual(nt.muted_spans([], parts), [])
+
+    def test_short_gaps_and_unplaced_parts(self):
+        short = 10 + nt.LIVE_LEAD + nt.MIN_MUTED_SECONDS - 0.3  # muted for 0.3 s less than the minimum
+        log = self.log((0, True, True), (10, True, False), (short, True, True))
+        self.assertEqual(nt.muted_spans(log, [nt.Part(0.0, 60.0, self.T)]), [])
+        log = self.log((0, True, True), (10, True, False), (30, True, True))
+        self.assertEqual(nt.muted_spans(log, [nt.Part(0.0, 60.0, None)]), [])
+
+    def test_read_call_log_and_silence(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        try:
+            (tmp / "call-mic.jsonl").write_text(
+                '{"t": 20.5, "call": true, "live": false}\nnot json\n{"t": 10, "call": true, "live": true}\n')
+            self.assertEqual(nt.read_call_log(tmp), [(10.0, True, True), (20.5, True, False)])
+            self.assertEqual(nt.read_call_log(tmp / "missing"), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        x = np.ones(5 * RATE, np.float32)
+        nt.silence(x, [(1.0, 2.5)])
+        self.assertEqual(float(x[:RATE].min()), 1.0)
+        self.assertEqual(float(x[RATE:int(2.5 * RATE)].max()), 0.0)
+        self.assertEqual(float(x[int(2.5 * RATE):].min()), 1.0)
+
+
+class YourVoice(unittest.TestCase):
+    class Models:
+        EMB_SECONDS = 4.0
+
+        def __init__(self, vec):
+            self.vec, self.pieces = vec, []
+
+        def embed(self, pieces):
+            self.pieces += pieces
+            return np.array([self.vec for _ in pieces])
+
+    def test_self_print_from_your_longest_lines(self):
+        models = self.Models(np.array([3.0, 4.0]))
+        mine = [Seg(i * 10.0, i * 10.0 + 6.0, "x") for i in range(6)] + [Seg(70.0, 71.0, "short")]
+        fp = nt.self_print(models, np.zeros(80 * RATE, np.float32), mine)
+        self.assertEqual(fp, [0.6, 0.8])
+        self.assertEqual(len(models.pieces), 6)
+        self.assertTrue(all(p.size == 4 * RATE for p in models.pieces))  # the middle 4 s
+        # too little of your speech: nothing learned
+        self.assertIsNone(nt.self_print(models, np.zeros(80 * RATE, np.float32), mine[:2]))
+
+    def test_learn_self_keeps_the_latest_and_skips_strangers(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            self.assertEqual(nt.load_self(tmp), [])
+            self.assertTrue(nt.learn_self(tmp, [1.0, 0.0], "m1"))
+            self.assertTrue(nt.learn_self(tmp, [0.9, 0.1], "m2"))
+            self.assertFalse(nt.learn_self(tmp, [0.0, 1.0], "m3"))   # someone else
+            self.assertTrue(nt.learn_self(tmp, [0.95, 0.05], "m2"))  # same meeting again: replaced
+            self.assertEqual(nt.load_self(tmp), [[1.0, 0.0], [0.95, 0.05]])
+            self.assertEqual((tmp / "you.json").stat().st_mode & 0o777, 0o600)
+            for i in range(nt.MAX_SELF_PRINTS + 3):
+                nt.learn_self(tmp, [1.0, 0.0], f"n{i}")
+            self.assertEqual(len(nt.load_self(tmp)), nt.MAX_SELF_PRINTS)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

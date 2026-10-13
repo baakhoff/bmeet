@@ -12,9 +12,14 @@
 # people the BMeet app was told about, and keeps this meeting's voice fingerprints in
 # ~/.local/share/bmeet/voices so you can name its people afterwards.
 #
-# Bound to Meta+Alt+M via voxtype-meeting.desktop (see docs/voxtype.md).
-#   voxtype-meeting-toggle            toggle
-#   voxtype-meeting-toggle start|stop explicit
+# In person (--in-person): a meeting in the room, not on a call. Only the microphone is
+# recorded for the speaker pass, which splits it by voice: You, Person 1, Person 2, ...
+# (voxtype's own live transcript still has its You/Remote tracks until the pass replaces it.)
+#
+# Bound to Meta+Alt+M (voxtype-meeting.desktop) and Meta+Alt+Shift+M (in person,
+# voxtype-meeting-in-person.desktop); see docs/voxtype.md.
+#   voxtype-meeting-toggle [--in-person]             toggle
+#   voxtype-meeting-toggle start|stop [--in-person]  explicit
 # Env: VOXTYPE_MEETING_DIR (default ~/Documents/Meetings)
 set -eu
 
@@ -52,17 +57,20 @@ clean_audio() {  # recordings no unit works on any more (a crash, a stop from el
     done
 }
 
-start_audio() {  # $1 stamp, $2 title; best effort: the live transcript works without it
-    speakers_on || return 0
+start_audio() {  # $1 stamp, $2 title, $3 in_person (1 or empty); best effort: the live
+    speakers_on || return 0  # transcript works without it
     systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true
     systemctl --user reset-failed "$REC_UNIT.service" 2>/dev/null || true
     clean_audio
     local dir="$AUDIO_ROOT/$1"
     install -d -m 0700 "${AUDIO_ROOT%/*}" "$AUDIO_ROOT" "$dir"
-    printf '{"title": "%s", "started": %s}\n' "$(printf '%s' "$2" | sed 's/[\\"]/\\&/g')" \
-        "$(date +%s)" > "$dir/meeting.json"
+    local in_person=false
+    [ -z "${3:-}" ] || in_person=true
+    printf '{"title": "%s", "started": %s, "in_person": %s}\n' \
+        "$(printf '%s' "$2" | sed 's/[\\"]/\\&/g')" "$(date +%s)" "$in_person" > "$dir/meeting.json"
     if ! systemd-run --user --quiet --collect --unit="$REC_UNIT" \
-            -p KillSignal=SIGINT -p TimeoutStopSec=15 "$BIN_DIR/bmeet-meeting-audio" "$dir"; then
+            -p KillSignal=SIGINT -p TimeoutStopSec=15 "$BIN_DIR/bmeet-meeting-audio" \
+            ${3:+--mic-only} "$dir"; then
         rm -rf "$dir"
         notify "Speakers will not be told apart" "The meeting audio recorder did not start" dialog-warning
     fi
@@ -72,7 +80,7 @@ speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
     local dir="$AUDIO_ROOT/$1"
     systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true  # (it also ends on "idle")
     [ -d "$dir" ] || return 0
-    if ! ls "$dir"/part-*-remote.wav >/dev/null 2>&1; then
+    if ! compgen -G "$dir/part-*.wav" >/dev/null; then  # nothing recorded
         rm -rf "$dir"
         return 0
     fi
@@ -93,6 +101,7 @@ speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
 start_meeting() {
     local title
     title="Meeting $(date '+%Y-%m-%d %H:%M')"
+    [ -z "$in_person" ] || title="In-person meeting $(date '+%Y-%m-%d %H:%M')"
     # Started from a shortcut there is no terminal, so say it when it does not work.
     if ! voxtype meeting start --title "$title"; then
         notify "Meeting NOT started" "Is voxtype running? systemctl --user status voxtype" dialog-error
@@ -102,8 +111,14 @@ start_meeting() {
     local stamp
     stamp="$(date '+%Y-%m-%d_%H%M')"
     echo "$stamp" > "$STAMP_FILE"
-    start_audio "$stamp" "$title"
-    notify "Meeting recording started" "Microphone + system audio. Press again to stop."
+    start_audio "$stamp" "$title" "$in_person"
+    if [ -z "$in_person" ]; then
+        notify "Meeting recording started" "Microphone + system audio. Press again to stop."
+    elif speakers_on; then
+        notify "In-person meeting started" "Microphone only; the voices are told apart when you stop. Press again to stop."
+    else
+        notify "In-person meeting started" "Microphone only. Telling speakers apart is off, so everything is under You." dialog-warning
+    fi
 }
 
 stop_meeting() {
@@ -150,7 +165,16 @@ Telling the speakers apart; the file is updated in a few minutes." document-save
 exec 9>"$LOCK_FILE"
 flock -n 9 || { notify "Meeting toggle already running" "" dialog-information; exit 0; }
 
-case "${1:-toggle}" in
+action=toggle in_person=""
+for arg in "$@"; do
+    case "$arg" in
+        start|stop|toggle) action=$arg ;;
+        --in-person) in_person=1 ;;
+        *) echo "usage: $0 [toggle|start|stop] [--in-person]" >&2; exit 2 ;;
+    esac
+done
+
+case "$action" in
     start)  start_meeting ;;
     stop)   stop_meeting ;;
     toggle)
@@ -158,5 +182,4 @@ case "${1:-toggle}" in
             recording|paused) stop_meeting ;;
             *)                start_meeting ;;
         esac ;;
-    *) echo "usage: $0 [toggle|start|stop]" >&2; exit 2 ;;
 esac

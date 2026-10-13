@@ -192,7 +192,25 @@ PlasmaExtras.Representation {
                 icon.name: "media-record"
                 text: full.app.starting ? "Starting…" : "Start meeting"
                 enabled: full.app.canStartMeeting
-                onClicked: full.app.startMeeting()
+                onClicked: full.app.startMeeting(false)
+            }
+
+            PlasmaComponents3.Button {
+                id: inPersonButton
+                visible: full.app.meeting === "idle" && !full.app.saving && !full.app.starting
+                icon.name: "group"
+                text: "In person"
+                enabled: full.app.canStartMeeting
+                onClicked: full.app.startMeeting(true)
+                Accessible.description: inPersonTip.text
+
+                PlasmaComponents3.ToolTip {
+                    id: inPersonTip
+                    visible: inPersonButton.hovered
+                    delay: Kirigami.Units.toolTipDelay
+                    text: "A meeting in the room: only the microphone is recorded, and the voices "
+                          + "are told apart when you stop (also Meta+Alt+Shift+M)."
+                }
             }
 
             PlasmaComponents3.Label {

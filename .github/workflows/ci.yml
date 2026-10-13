@@ -19,14 +19,20 @@ jobs:
           shellcheck --version
           shellcheck -S warning install.sh uninstall.sh system/*.sh voxtype/*.sh voxtype/bin/* \
             transcribe/*.sh transcribe/tests/*.sh bmeet/app/*.sh bmeet/app/tests/*.sh \
-            bmeet/plasmoid/*.sh
+            bmeet/plasmoid/*.sh bmeet/chrome/*.sh
       - name: Python syntax
         run: |
-          for f in transcribe/npu-transcribe bmeet/bmeet-ctl bmeet/app/bmeet \
+          for f in transcribe/npu-transcribe transcribe/prepare-models bmeet/bmeet-ctl bmeet/app/bmeet \
+                   bmeet/chrome/bmeet-chrome-host \
                    bmeet/app/tests/fake-voxtype bmeet/app/tests/fake-npu-transcribe \
                    $(git ls-files '*.py'); do
             python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
           done
+      - name: Chrome extension
+        run: |
+          python3 -m json.tool bmeet/chrome/extension/manifest.json >/dev/null
+          for f in bmeet/chrome/extension/*.js; do node --check "$f"; done
+          python3 -I bmeet/chrome/tests/test_host.py -v
       - name: JSON / desktop files
         run: |
           python3 -m json.tool bmeet/plasmoid/io.github.baakhoff.bmeet/metadata.json >/dev/null
@@ -43,6 +49,7 @@ jobs:
           grep -q "__version__ = \"$v\"" bmeet/bmeet-ctl
           grep -q "__version__ = \"$v\"" bmeet/app/bmeet
           grep -q "\"Version\": \"$v\"" bmeet/plasmoid/io.github.baakhoff.bmeet/metadata.json
+          grep -q "\"version\": \"$v\"" bmeet/chrome/extension/manifest.json
           grep -q "^## \[$v\]" CHANGELOG.md
           if [[ $GITHUB_REF == refs/tags/v* ]]; then test "${GITHUB_REF#refs/tags/v}" = "$v"; fi
 

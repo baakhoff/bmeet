@@ -57,9 +57,12 @@ for model in small turbo; do
     done
 done
 
-# Meeting speaker pass (BMeet): synthetic call in both main languages, with and without echo.
+# Meeting speaker pass (BMeet): synthetic call in both main languages, with and without echo,
+# muted in the call for a sentence, and in person (one microphone).
 echo "=== meeting speakers (--meeting)"
-for args in "--language ru --remember" "--language en --remember" "--language en --headphones"; do
+for args in "--language ru --remember" "--language en --remember" "--language en --headphones" \
+            "--language ru --muted" "--language en --muted --headphones" \
+            "--language ru --in-person" "--language en --in-person"; do
     echo "  $args"
     NPU_PYTHON="$python" "$here/meeting_test.py" "$work" $args | sed 's/^/  /'
 done

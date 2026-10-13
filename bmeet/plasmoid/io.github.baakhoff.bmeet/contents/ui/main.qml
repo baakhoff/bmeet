@@ -38,7 +38,8 @@ PlasmoidItem {
             lines.push("Dictation: " + vn.engineText);
         lines.push("");
         lines.push("Meta+H dictate at cursor · Meta+Alt+H to clipboard");
-        lines.push("Meta+Alt+M meeting · Meta+Shift+H switch language");
+        lines.push("Meta+Alt+M meeting · Meta+Alt+Shift+M in person");
+        lines.push("Meta+Shift+H switch language");
         lines.push("Middle-click: start/stop meeting");
         return lines.join("\n");
     }
@@ -58,6 +59,13 @@ PlasmoidItem {
             icon.name: vn.meetingActive ? "media-playback-stop" : "media-record"
             enabled: vn.meetingActive ? !vn.saving : vn.canStartMeeting
             onTriggered: vn.toggleMeeting()
+        },
+        PlasmaCore.Action {
+            text: "Start in-person meeting"
+            icon.name: "group"
+            visible: !vn.meetingActive
+            enabled: vn.canStartMeeting
+            onTriggered: vn.startMeeting(true)
         },
         PlasmaCore.Action {
             text: "Transcribe a file…"

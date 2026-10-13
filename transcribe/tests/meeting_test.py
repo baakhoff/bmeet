@@ -17,7 +17,16 @@ named as the BMeet app would (voices.json from the meeting's fingerprints), and 
 meeting with other sentences, in which the people speak in another order, must come out
 as Anna, Boris and Viktor.
 
-Usage: meeting_test.py WORKDIR [--language ru|en] [--headphones] [--remember]
+--in-person: like --remember (you also say a few more sentences in the first meeting, so
+that your own voice is learned from your microphone), but the second meeting is in the
+room: everyone on the microphone, nothing in the system audio. It must still come out as
+You, Anna, Boris and Viktor.
+
+--muted: after the pause you also say a sentence while the call cannot hear you
+(call-mic.jsonl, as the Chrome extension logs it, says so); it must not be in the
+transcript, the rest must.
+
+Usage: meeting_test.py WORKDIR [--language ru|en] [--headphones] [--remember | --in-person] [--muted]
 Env:   NPU_PYTHON  Python with openvino-genai (default: the installer's venv)
 Exit status 0 = passed. Writes only below WORKDIR (plus the OpenVINO compile cache).
 """
@@ -44,6 +53,10 @@ TOOL = HERE.parent / "npu-transcribe"
 TTS = HERE.parent.parent / "voxtype/tools/tts_clip.py"
 RATE = 16_000
 VOICES = {"Anna": ("+f4", 1.0), "Boris": ("+m3", 1.0), "Viktor": ("+m7", 1.3), "You": ("+m1", 1.0)}
+# --in-person: on one microphone the voices are told apart by sound alone, and espeak's
+# variants above are too alike for that (TitaNet: You/Boris 0.84, as one real person). These
+# four are at most 0.41 alike in both languages, like different real people (<= ~0.4).
+VOICES_APART = {"Anna": ("+f2", 0.85), "Boris": ("+m3", 1.3), "Viktor": ("+m7", 0.85), "You": ("+f4", 1.3)}
 
 # Our own text. Each voice says only its own sentences, so a sentence identifies its speaker.
 SCRIPT = {
@@ -123,35 +136,84 @@ def write_wav(path: Path, x: np.ndarray) -> None:
         w.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
 
 
-def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: bool) -> None:
+# Said by you while muted (--muted): the call cannot hear it, so it must not be transcribed.
+MUTED = {
+    "ru": ("You", "Пока микрофон выключен, обсудим зарплату Бориса шёпотом."),
+    "en": ("You", "While the microphone is muted, let us whisper about salaries."),
+}
+
+# More of your speech (--in-person), so that your own voice is learned in the first meeting.
+YOU_MORE = {
+    "ru": [("You", "Давайте я коротко расскажу, что мы успели сделать за прошлую неделю."),
+           ("You", "Мы закончили миграцию базы данных и обновили все тестовые окружения."),
+           ("You", "Осталось проверить резервное копирование и написать инструкцию для дежурных.")],
+    "en": [("You", "Let me briefly tell you what we managed to do during the last week."),
+           ("You", "We finished the database migration and updated all the test environments."),
+           ("You", "What is left is to check the backups and to write a guide for the people on call.")],
+}
+T0 = 1_760_000_000.0  # when the test meeting "started" (part-1.start)
+
+
+def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: bool,
+         in_person: bool = False, muted: tuple[str, str] | None = None, voices: dict | None = None) -> None:
+    """in_person: everyone on the microphone, no system audio. muted: this line goes into
+    part 2 (second; after the pause, and out of the first 30 s, where the language is
+    detected), and call-mic.jsonl says the call could not hear you meanwhile."""
     tts = load_tts()
     rng = np.random.default_rng(7)
-    folder.mkdir(parents=True, exist_ok=True)
-    for part, chunk in ((1, lines[:5]), (2, lines[5:])):
-        remote, mic = [], []
-        for who, text in chunk:
-            variant, slower = VOICES[who]
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    half = len(lines) // 2
+    chunks = [lines[:half], lines[half:]]
+    if muted:
+        chunks[1] = chunks[1][:1] + [muted] + chunks[1][1:]
+    log, wall = [], T0
+    for part, chunk in enumerate(chunks, 1):
+        remote, mic, at = [], [], 0
+        (folder / f"part-{part}.start").write_text(f"{wall}\n")
+        for line in chunk:
+            who, text = line
+            variant, slower = (voices or VOICES)[who]
             x = speak(tts, language + variant, text, slower)
             gap = np.zeros(int(rng.uniform(0.4, 1.0) * RATE), np.float32)
-            remote += [gap, np.zeros_like(x) if who == "You" else x]
-            mic += [gap, x if who == "You" else np.zeros_like(x)]
+            mine = who == "You" or in_person
+            remote += [gap, np.zeros_like(x) if mine else x]
+            mic += [gap, x if mine else np.zeros_like(x)]
+            if line == muted:  # you mute, say it, unmute (the extension logs it within 0.5 s)
+                start = wall + (at + gap.size) / RATE
+                log += [(start - 0.8, False), (start + x.size / RATE + 0.8, True)]
+            at += gap.size + x.size
         r, m = np.concatenate(remote), np.concatenate(mic)
-        if not headphones:  # the speakers' sound reaches the microphone 30 ms later, -20 dB
+        if not headphones and not in_person:  # the speakers reach the microphone 30 ms later, -20 dB
             m = m + np.concatenate([np.zeros(480, np.float32), r[:-480]]) * 0.1
         m = m + rng.normal(0, 0.002, m.size).astype(np.float32)  # room noise
-        write_wav(folder / f"part-{part}-remote.wav", r)
+        if not in_person:
+            write_wav(folder / f"part-{part}-remote.wav", r)
         write_wav(folder / f"part-{part}-mic.wav", m)
-    (folder / "meeting.json").write_text(json.dumps({"title": f"Test meeting ({language})"}))
+        wall += at / RATE + 10  # a 10 s pause between the parts
+    info = {"title": f"Test meeting ({language})", "in_person": in_person}
+    (folder / "meeting.json").write_text(json.dumps(info))
+    if muted:  # as bmeet-chrome-host writes it: live, every 5 s and at each change
+        changes = [(T0, True)] + log
+        rows = []
+        for (t, live), nxt in zip(changes, changes[1:] + [(wall, None)]):
+            rows += [(x, live) for x in np.arange(t, nxt[0], 5.0)]
+        (folder / "call-mic.jsonl").write_text("".join(
+            json.dumps({"t": round(float(t), 3), "call": True, "live": live}) + "\n" for t, live in rows))
 
 
 def tokens(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
 
 
-def score(md: str, lines: list[tuple[str, str]], named: bool = False) -> tuple[bool, list[str], dict]:
+def score(md: str, lines: list[tuple[str, str]], named: bool = False,
+          one_mic: bool = False) -> tuple[bool, list[str], dict]:
     """Which label each word ended up under, against who said it. Only words of 4+ letters
     that one person says are counted, matched loosely (Whisper misspells synthetic speech).
-    named: the people must be labelled with their own names (remembered voices)."""
+    named: the people must be labelled with their own names (remembered voices).
+    one_mic: everyone on one microphone (in person). Told apart by sound alone, a quick reply
+    between two lines of someone else can go to them (on these ~22 s meetings with 0.4-1 s
+    gaps: 1-3 words): 85 % of the words and at most one of theirs under You."""
     owner: dict[str, set[str]] = collections.defaultdict(set)
     for who, text in lines:
         for word in tokens(text):
@@ -177,8 +239,9 @@ def score(md: str, lines: list[tuple[str, str]], named: bool = False) -> tuple[b
     report = [f"  {lab:9s} -> " + ", ".join(f"{w} {votes[(lab, w)]}" for w in VOICES if votes[(lab, w)])
               for lab in labels]
     others_as_you = sum(n for (lab, w), n in votes.items() if lab == "You" and w != "You")
-    ok = (total > 0 and right / total >= 0.9 and len(people) == 3 and main.get("You") == "You"
-          and len({main[p] for p in people}) == 3 and others_as_you == 0
+    ok = (total > 0 and right / total >= (0.85 if one_mic else 0.9) and len(people) == 3
+          and main.get("You") == "You" and len({main[p] for p in people}) == 3
+          and others_as_you <= (1 if one_mic else 0)
           and (not named or all(main[p] == p for p in people)))
     report.append(f"  {right}/{total} words under the right label ({right / max(total, 1):.0%}), "
                   f"{len(people)} people found (3 expected), {others_as_you} of theirs under You"
@@ -201,6 +264,13 @@ def speaker_pass(python: str, folder: Path, out: Path, env: dict, voices: Path |
     return run.returncode == 0
 
 
+def muted_words(md: str, muted: tuple[str, str]) -> list[str]:
+    """Words of the muted sentence (5+ letters, matched loosely) found in the transcript."""
+    said = [w for w in tokens(muted[1]) if len(w) >= 5]
+    body = md.split("## Transcript", 1)[-1]
+    return [w for w in tokens(body) if len(w) >= 5 and difflib.get_close_matches(w, said, n=1, cutoff=0.8)]
+
+
 def name_people(voices: Path, transcript: Path, main: dict) -> None:
     """What the BMeet app does when you name the people of a meeting: their fingerprints
     from voices/meetings/<transcript>.json go into voices/voices.json under the name."""
@@ -217,31 +287,48 @@ def main() -> int:
     p.add_argument("--language", choices=sorted(SCRIPT), default="ru")
     p.add_argument("--headphones", action="store_true")
     p.add_argument("--remember", action="store_true")
+    p.add_argument("--in-person", action="store_true")
+    p.add_argument("--muted", action="store_true")
     args = p.parse_args()
     python = os.environ.get("NPU_PYTHON") or str(Path.home() / ".local/share/bmeet/venv/bin/python")
-    name = f"meeting-{args.language}{'-headphones' if args.headphones else ''}"
+    name = (f"meeting-{args.language}{'-headphones' if args.headphones else ''}"
+            f"{'-in-person' if args.in_person else ''}{'-muted' if args.muted else ''}")
     env = dict(os.environ, NPU_TRANSCRIBE_HISTORY=str(args.work / "history.jsonl"))
-    voices = args.work / f"{name}-voices" if args.remember else None
+    voices = args.work / f"{name}-voices" if args.remember or args.in_person else None
     if voices:
         shutil.rmtree(voices, ignore_errors=True)
 
+    lines = SCRIPT[args.language] + (YOU_MORE[args.language] if args.in_person else [])
+    muted = MUTED[args.language] if args.muted else None
+    voice_set = VOICES_APART if args.in_person else VOICES
     folder, out = args.work / name, args.work / f"{name}.md"
-    make(folder, SCRIPT[args.language], args.language, args.headphones)
+    make(folder, lines, args.language, args.headphones, muted=muted, voices=voice_set)
     if not speaker_pass(python, folder, out, env, voices):
         return 1
-    ok, report, main_speaker = score(out.read_text(), SCRIPT[args.language])
+    ok, report, main_speaker = score(out.read_text(), lines)
+    if muted:
+        heard = muted_words(out.read_text(), muted)
+        ok &= len(heard) <= 1
+        report.append(f"  {len(heard)} word(s) of the muted sentence in the transcript"
+                      + (f": {', '.join(heard)}" if heard else "") + " (at most 1 expected)")
+    if args.in_person:
+        learned = (voices / "you.json").exists()
+        ok &= learned
+        report.append("  your voice " + ("learned" if learned else "NOT learned") + " from your microphone")
     print("\n".join(report))
     print(("PASS" if ok else "FAIL") + f": {out}")
     if not ok or not voices:
         return 0 if ok else 1
 
-    print("  naming the people as the app would, then a second meeting")
+    print("  naming the people as the app would, then a second meeting"
+          + (" in the room (microphone only)" if args.in_person else ""))
     name_people(voices, out, main_speaker)
     folder, out = args.work / f"{name}-2", args.work / f"{name}-2.md"
-    make(folder, SCRIPT_2[args.language], args.language, args.headphones)
+    make(folder, SCRIPT_2[args.language], args.language, args.headphones, in_person=args.in_person,
+         voices=voice_set)
     if not speaker_pass(python, folder, out, env, voices):
         return 1
-    ok, report, _ = score(out.read_text(), SCRIPT_2[args.language], named=True)
+    ok, report, _ = score(out.read_text(), SCRIPT_2[args.language], named=True, one_mic=args.in_person)
     print("\n".join(report))
     print(("PASS" if ok else "FAIL") + f": {out}")
     return 0 if ok else 1

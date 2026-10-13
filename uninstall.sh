@@ -33,6 +33,7 @@ say "BMeet panel widget"
 bash "$src/bmeet/plasmoid/install-user.sh" --uninstall || true
 say "BMeet app"
 bash "$src/bmeet/app/install-user.sh" --uninstall || true
+[ -f "$src/bmeet/chrome/install-user.sh" ] && { bash "$src/bmeet/chrome/install-user.sh" --uninstall || true; }
 say "npu-transcribe"
 bash "$src/transcribe/install-user.sh" --uninstall || true
 say "voxtype (per-user)"

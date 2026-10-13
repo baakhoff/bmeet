@@ -1,0 +1,87 @@
+#!/usr/bin/python3 -I
+"""bmeet-chrome-host - native messaging host of BMeet's Chrome extension (extension/).
+
+Chrome starts it when the extension's service worker connects, and it ends with that
+connection. Each message is {"t": epoch seconds, "call": bool, "live": bool}: is a tab in
+a call (Google Meet, Slack huddle), and does the call hear your microphone (not muted).
+While BMeet records a meeting ($XDG_RUNTIME_DIR/bmeet/recording names its folder, see
+bmeet-meeting-audio), each message is appended to FOLDER/call-mic.jsonl; npu-transcribe
+leaves out your words from the stretches the call could not hear you. Without a meeting
+the messages are dropped. Nothing else is written, nothing is sent anywhere, and it
+never answers (the extension does not wait for it).
+
+Env (tests): BMEET_RECORDING_FILE, BMEET_AUDIO_DIR (the folder meetings record into).
+"""
+import json
+import os
+import struct
+import sys
+import time
+from pathlib import Path
+
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+POINTER = Path(os.environ.get("BMEET_RECORDING_FILE") or RUN / "bmeet/recording")
+AUDIO_ROOT = Path(os.environ.get("BMEET_AUDIO_DIR") or RUN / "bmeet/meeting-audio")
+MAX_MESSAGE = 4096       # ours are ~50 bytes
+MAX_CLOCK_SKEW = 60.0    # a time further off than this is replaced by ours
+
+
+def read_message(stream) -> dict | None:
+    """One message: 4-byte length (native byte order), then that much JSON. None at the end."""
+    head = stream.read(4)
+    if len(head) < 4:
+        return None
+    (size,) = struct.unpack("=I", head)
+    if size > MAX_MESSAGE:
+        return None  # not our extension talking: stop
+    data = stream.read(size)
+    if len(data) < size:
+        return None
+    try:
+        msg = json.loads(data)
+    except ValueError:
+        return {}
+    return msg if isinstance(msg, dict) else {}
+
+
+def recording_dir() -> Path | None:
+    """The folder of the meeting being recorded, if any (and only one of BMeet's)."""
+    try:
+        folder = Path(POINTER.read_text(encoding="utf-8").strip()).resolve(strict=True)
+        root = AUDIO_ROOT.resolve(strict=True)
+    except (OSError, ValueError):
+        return None
+    if folder.parent != root or not folder.is_dir() or (folder / "speaker-pass").exists():
+        return None
+    return folder
+
+
+def main() -> int:
+    stdin = sys.stdin.buffer
+    while (msg := read_message(stdin)) is not None:
+        if not (isinstance(msg.get("call"), bool) and isinstance(msg.get("live"), bool)):
+            continue
+        now = time.time()
+        try:
+            t = float(msg.get("t"))
+        except (TypeError, ValueError):
+            t = now
+        if abs(t - now) > MAX_CLOCK_SKEW:
+            t = now
+        folder = recording_dir()
+        if folder is None:
+            continue
+        line = json.dumps({"t": round(t, 3), "call": msg["call"], "live": msg["live"]}) + "\n"
+        try:
+            fd = os.open(folder / "call-mic.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, line.encode())
+            finally:
+                os.close(fd)
+        except OSError:
+            pass  # the meeting just ended (its folder is gone)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

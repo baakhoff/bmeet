@@ -43,6 +43,10 @@ speakers apart…" until it is done.
 | A "-speakers.md" file appeared next to the transcript | You edited the transcript while the pass ran, so your edit was kept and the speaker version was saved next to it. |
 | Someone got the wrong name | Rename them in that meeting with *Name speakers…*. Their fingerprint from that meeting then moves to the right name. Or forget the name in *Remembered voices…*. |
 | A remembered person is not recognised | Their voice sounded different, for example through another microphone or connection. Name them again in that meeting: up to 10 meetings per person are kept, and their mean is compared. |
+| You were muted in Meet or Slack, and your words are still there | Load BMeet's Chrome extension in the profile you take calls in (README, *Chrome extension*); `verify.sh` shows where it is loaded. After an upgrade, press its reload button in `chrome://extensions`. Calls in desktop apps (Zoom, Teams) are not seen. If the meeting ran without it, there is nothing to correct afterwards. |
+| Your words are missing although you were not muted | The transcript's *Microphone off* line says how much was left out. Look at `call-mic.jsonl` while a meeting records (`$(cat $XDG_RUNTIME_DIR/bmeet/recording)/call-mic.jsonl`): `"live": false` while you talk means the extension did not see your sound. Please open an issue with that file's lines. Removing the extension restores the old behaviour. |
+| In person, everyone is *Person 1, 2…* and nobody is *You* | Your voice is learned from online meetings with remembered voices on (`verify.sh` shows how many). Until then, write *You* for yourself in *Name speakers…*: later in-person meetings recognise you. |
+| In person, everything is under *You* | Telling speakers apart is off, or only one voice was found. |
 | *Name speakers…* is greyed out | The meeting is still recording, its speaker pass is running, or the transcript has no speakers (voxtype's *You* / *Remote* version). |
 
 When you open an issue, include the output of `verify.sh` and

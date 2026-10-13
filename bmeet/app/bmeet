@@ -61,7 +61,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -360,9 +360,13 @@ def export_cmd(meeting_id: str, fmt: str = "markdown", output: str | None = None
 VOICES_DIR = Path(os.environ.get("BMEET_VOICES_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "bmeet/voices")
 REMEMBER_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet/remember-voices"
-NOT_A_NAME = re.compile(r"^(You|Remote|Person \d+|Speaker \d+|Speaker \?)$|[\n#*,\[\]`<>|]")
+NOT_A_NAME = re.compile(r"^(You|Remote|Person \d+|Person \?|Speaker \d+|Speaker \?)$|[\n#*,\[\]`<>|]")
 MAX_FINGERPRINTS = 10      # per person: the latest meetings they were named in
 SPEAKERS_LINE = "- **Speakers:** "
+# npu-transcribe's line in a transcript whose microphone was split by voice (an in-person
+# meeting): there "You" is a voice like the others, and you can name yourself (You).
+SPLIT_MIC_LINE = "- **Microphone:** split by voice"
+YOU = "You"
 
 
 def remember_voices_on() -> bool:
@@ -380,10 +384,13 @@ def set_remember_voices(on: bool) -> None:
         shutil.rmtree(VOICES_DIR, ignore_errors=True)
 
 
-def name_problem(name: str) -> str | None:
-    """Why `name` cannot be a speaker's name, or None."""
+def name_problem(name: str, you_allowed: bool = False) -> str | None:
+    """Why `name` cannot be a speaker's name, or None. you_allowed: "You" is a name too
+    (yourself, in a meeting whose microphone was split by voice)."""
     if not name:
         return "empty"
+    if name == YOU and you_allowed:
+        return None
     if len(name) > 40:
         return "longer than 40 characters"
     if NOT_A_NAME.search(name):
@@ -391,15 +398,22 @@ def name_problem(name: str) -> str | None:
     return None
 
 
+def mic_split(text: str) -> bool:
+    """Was the microphone of this meeting transcript split by voice (in person)?"""
+    return any(line.startswith(SPLIT_MIC_LINE) for line in text.splitlines())
+
+
 def md_speakers(text: str) -> list[tuple[str, str]]:
     """(label, the first thing they said) for each speaker heading of a meeting transcript
-    ("### Person 1"), in order of appearance, without You."""
+    ("### Person 1"), in order of appearance; without You (your microphone), unless the
+    microphone was split by voice (then You is a guess that can be wrong)."""
     out: dict[str, str] = {}
     label = None
+    with_you = mic_split(text)
     for line in text.splitlines():
         if line.startswith("### "):
             label = line[4:].strip()
-            if label != "You":
+            if label != YOU or with_you:
                 out.setdefault(label, "")
         elif label in out and not out[label] and line.strip():
             out[label] = re.sub(r"^\*\[[\d:]+\]\*\s*", "", line.strip())
@@ -448,6 +462,35 @@ def remembered_voices() -> dict[str, int]:
     return {name: len(v.get("fingerprints") or []) for name, v in (data.get("voices") or {}).items()}
 
 
+def own_voice_meetings() -> int:
+    """How many meetings your own voice (you.json) comes from: npu-transcribe learns it from
+    your microphone in online meetings, and you can name yourself in in-person meetings."""
+    return len((_load_json(VOICES_DIR / "you.json") or {}).get("fingerprints") or [])
+
+
+def forget_own_voice() -> None:
+    (VOICES_DIR / "you.json").unlink(missing_ok=True)
+
+
+def _own_voice(model, key: str, fingerprint: list[float] | None) -> None:
+    """Take this meeting's fingerprint out of your own voice (you.json), and put
+    `fingerprint` in instead when given (the latest MAX_FINGERPRINTS meetings)."""
+    path = VOICES_DIR / "you.json"
+    data = _load_json(path) or {}
+    if data.get("model") != model:
+        data = {"version": 1, "model": model, "fingerprints": [], "meetings": []}
+    fps, meetings = data.get("fingerprints") or [], data.get("meetings") or []
+    if len(meetings) != len(fps):
+        meetings = [""] * len(fps)
+    pairs = [(f, m) for f, m in zip(fps, meetings) if m != key]
+    if fingerprint is None and len(pairs) == len(fps):
+        return  # nothing of this meeting in it
+    if fingerprint is not None:
+        pairs = (pairs + [(fingerprint, key)])[-MAX_FINGERPRINTS:]
+    data.update(fingerprints=[f for f, _ in pairs], meetings=[m for _, m in pairs], updated=int(time.time()))
+    _write_private(path, data)
+
+
 def forget_voice(name: str) -> None:
     path = VOICES_DIR / "voices.json"
     if (data := _load_json(path)) and name in (data.get("voices") or {}):
@@ -476,6 +519,10 @@ def remember_named(md_path: str, names: dict[str, str]) -> list[str]:
         people.setdefault(new, fingerprint)
         if new == label:
             continue
+        if label == YOU or new == YOU:  # your own voice is kept apart (you.json)
+            _own_voice(meeting.get("model"), key, fingerprint if new == YOU else None)
+            if new == YOU:
+                remembered.append(YOU)
         if label in voices:  # this meeting's fingerprint no longer belongs to the old name
             old = voices[label]
             keep = [i for i, m in enumerate(old.get("meetings") or []) if m != key]
@@ -1160,12 +1207,15 @@ class ListDetailPage(QWidget):
 class NameSpeakersDialog(QDialog):
     """Names for the speakers of one meeting, and the "remember voices" switch."""
 
-    def __init__(self, parent: QWidget, speakers: list[tuple[str, str]], has_fingerprints: bool) -> None:
+    def __init__(self, parent: QWidget, speakers: list[tuple[str, str]], has_fingerprints: bool,
+                 you_allowed: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Name speakers")
+        self.you_allowed = you_allowed
         layout = QVBoxLayout(self)
         intro = QLabel("Who is who? Leave a field empty to keep the label. Give two labels the "
-                       "same name when they are one person.")
+                       "same name when they are one person."
+                       + (" This meeting was in person: write You for yourself." if you_allowed else ""))
         intro.setWordWrap(True)
         layout.addWidget(intro)
         grid = QGridLayout()
@@ -1207,14 +1257,14 @@ class NameSpeakersDialog(QDialog):
 
     def _update_note(self) -> None:
         on = self.remember.isChecked()
-        self.voices_btn.setVisible(on and bool(remembered_voices()))
+        self.voices_btn.setVisible(on and bool(remembered_voices() or own_voice_meetings()))
         self.note.setText("" if not on or self.has_fingerprints else
                           "Recognition starts with the next meeting: this one was transcribed "
                           "before remembering voices was on, so it has no fingerprints.")
         self.note.setVisible(bool(self.note.text()))
 
     def _remember_toggled(self, on: bool) -> None:
-        if not on and remembered_voices() and QMessageBox.question(
+        if not on and (remembered_voices() or own_voice_meetings()) and QMessageBox.question(
                 self, "Forget voices", "Forget all remembered voices?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
@@ -1229,7 +1279,8 @@ class NameSpeakersDialog(QDialog):
                 if edit.text().strip() and edit.text().strip() != label}
 
     def problems(self) -> list[str]:
-        return [f"“{name}”: {why}" for name in self.names().values() if (why := name_problem(name))]
+        return [f"“{name}”: {why}" for name in self.names().values()
+                if (why := name_problem(name, self.you_allowed))]
 
     def accept(self) -> None:
         if problems := self.problems():
@@ -1261,6 +1312,12 @@ class VoicesDialog(QDialog):
 
     def fill(self) -> None:
         self.list.clear()
+        if n := own_voice_meetings():  # (None: not a name, so it cannot clash with one)
+            item = QListWidgetItem(f"You: your own voice  ({n} meeting{'s' if n != 1 else ''})")
+            item.setToolTip("Learned from your microphone in online meetings; in-person "
+                            "meetings use it to tell you from the others in the room")
+            item.setData(Qt.ItemDataRole.UserRole, None)
+            self.list.addItem(item)
         for name, n in sorted(remembered_voices().items(), key=lambda x: x[0].casefold()):
             item = QListWidgetItem(f"{name}  ({n} meeting{'s' if n != 1 else ''})")
             item.setData(Qt.ItemDataRole.UserRole, name)
@@ -1270,7 +1327,11 @@ class VoicesDialog(QDialog):
     def forget(self) -> None:
         item = self.list.currentItem() or self.list.item(0)
         if item:
-            forget_voice(item.data(Qt.ItemDataRole.UserRole))
+            name = item.data(Qt.ItemDataRole.UserRole)
+            if name is None:
+                forget_own_voice()
+            else:
+                forget_voice(name)
             self.fill()
 
 
@@ -1396,9 +1457,10 @@ class MeetingsPage(ListDetailPage):
             "Put names on Person 1, Person 2, …; optionally recognise them by voice in later meetings"
             if has_people else "This transcript has no speakers to name")
 
-    def ask_names(self, speakers: list[tuple[str, str]], has_fingerprints: bool) -> tuple[dict[str, str], bool] | None:
+    def ask_names(self, speakers: list[tuple[str, str]], has_fingerprints: bool,
+                  you_allowed: bool = False) -> tuple[dict[str, str], bool] | None:
         """({label: name}, remember voices?) from the dialog, or None if cancelled."""
-        dlg = NameSpeakersDialog(self, speakers, has_fingerprints)
+        dlg = NameSpeakersDialog(self, speakers, has_fingerprints, you_allowed)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         return dlg.names(), dlg.remember.isChecked()
@@ -1411,7 +1473,7 @@ class MeetingsPage(ListDetailPage):
         speakers = md_speakers(text or "")
         if not speakers:
             return
-        answer = self.ask_names(speakers, meeting_voices_path(m.md_path).exists())
+        answer = self.ask_names(speakers, meeting_voices_path(m.md_path).exists(), mic_split(text or ""))
         if answer is None:
             return
         names, remember = answer
@@ -2425,14 +2487,18 @@ class MainWindow(QMainWindow):
         self.act_meet_start = QAction(icon("media-record"), "Start meeting", self)
         self.act_meet_start.setToolTip("Record the microphone + system audio and transcribe it in "
                                        "30-second chunks (also Meta+Alt+M)")
-        self.act_meet_start.triggered.connect(self.start_meeting)
+        self.act_meet_start.triggered.connect(lambda: self.start_meeting())
+        self.act_meet_room = QAction(icon("group"), "In person", self)
+        self.act_meet_room.setToolTip("Start an in-person meeting: record only the microphone and tell "
+                                      "the voices in the room apart (also Meta+Alt+Shift+M)")
+        self.act_meet_room.triggered.connect(lambda: self.start_meeting(in_person=True))
         self.act_meet_pause = QAction(icon("media-playback-pause"), "Pause", self)
         self.act_meet_pause.triggered.connect(self.pause_meeting)
         self.act_meet_stop = QAction(icon("media-playback-stop"), "Stop", self)
         self.act_meet_stop.setToolTip("Stop the meeting: the last chunk is transcribed and a Markdown "
                                       f"copy is saved to {tilde(MEETING_MD_DIR)}")
         self.act_meet_stop.triggered.connect(self.stop_meeting)
-        for act in (self.act_meet_start, self.act_meet_pause, self.act_meet_stop):
+        for act in (self.act_meet_start, self.act_meet_room, self.act_meet_pause, self.act_meet_stop):
             tb.addAction(act)
 
     def createPopupMenu(self):  # the control bar cannot be hidden
@@ -2457,7 +2523,7 @@ class MainWindow(QMainWindow):
             self.dict_label.setText("Status unavailable")
             self.dict_label.setToolTip(error or "")
             for act in (self.act_dictate, self.act_cancel, self.act_lang, self.act_meet_start,
-                        self.act_meet_pause, self.act_meet_stop):
+                        self.act_meet_room, self.act_meet_pause, self.act_meet_stop):
                 act.setEnabled(False)
             self.meet_label.setText("")
             return
@@ -2538,6 +2604,7 @@ class MainWindow(QMainWindow):
         self.meet_label.setToolTip(st.get("meeting_title") or "")
         busy = stopping or bool(self._meeting_pending)
         self.act_meet_start.setEnabled(daemon_on and meeting == "idle" and not busy)
+        self.act_meet_room.setEnabled(self.act_meet_start.isEnabled())
         self.act_meet_pause.setEnabled(daemon_on and meeting != "idle" and not busy)
         self.act_meet_pause.setText("Resume" if meeting == "paused" else "Pause")
         self.act_meet_pause.setIcon(icon("media-playback-start" if meeting == "paused" else "media-playback-pause"))
@@ -2618,9 +2685,9 @@ class MainWindow(QMainWindow):
         self.act_lang.setText("…")
         self.act_lang.setEnabled(False)
 
-    def start_meeting(self) -> None:
+    def start_meeting(self, in_person: bool = False) -> None:
         self._meeting_pending = ("starting", time.time() + 10)
-        run_detached([str(BIN / "voxtype-meeting-toggle"), "start"])
+        run_detached([str(BIN / "voxtype-meeting-toggle"), "start"] + (["--in-person"] if in_person else []))
         self.poll()
 
     def stop_meeting(self) -> None:

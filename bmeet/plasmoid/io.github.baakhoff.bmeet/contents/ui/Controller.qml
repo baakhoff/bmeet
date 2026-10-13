@@ -349,12 +349,12 @@ Item {
         });
     }
 
-    function startMeeting() {
+    function startMeeting(inPerson) {
         if (!vn.canStartMeeting)
             return;
         vn.starting = true;
         vn.startingSince = Date.now() / 1000;
-        vn.act("meeting start", "Meeting start", ok => {
+        vn.act("meeting start" + (inPerson ? " --in-person" : ""), "Meeting start", ok => {
             if (!ok)
                 vn.starting = false;
         });
@@ -385,7 +385,7 @@ Item {
         if (vn.meetingActive)
             vn.stopMeeting();
         else
-            vn.startMeeting();
+            vn.startMeeting(false);
     }
 
     function openApp(args) {

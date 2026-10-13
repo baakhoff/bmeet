@@ -81,7 +81,8 @@ npu-transcribe used to give Whisper 2-minute blocks and let OpenVINO GenAI chain
 `--speakers` labels every line with the voice that says it (**Speaker 1**, **Speaker 2**, …,
 numbered in the order they first speak); `--num-speakers N` fixes the count when you know it.
 `--meeting DIR` is the same for a BMeet meeting recording: the microphone track is **You**,
-the voices in the system audio become **Person 1**, **Person 2**, …
+the voices in the system audio become **Person 1**, **Person 2**, … In an in-person meeting
+the microphone is split by voice instead ([In person](#in-person)).
 
 **How it works:**
 1. **Who speaks when**, on the NPU (OpenVINO; until 0.3 this ran on the CPU through sherpa-onnx):
@@ -153,6 +154,26 @@ This ran at ~110x realtime on the NPU. Under sherpa-onnx's CPU diarization (0.2-
 - **Why so little:** numpy is kept to one thread. Its BLAS would otherwise start a thread per core for the small matrix products of the features, and they busy-wait: that was 26 s of CPU for the same meeting.
 - **Per hour of a Russian meeting:** about 2 minutes. GigaAM takes ~30 s for both tracks, and the speakers ~1.5 min.
 - **Other languages:** Whisper turbo is slower, at ~15x realtime per track.
+
+### Muted in the call
+
+BMeet records the microphone itself, so it hears you while the call app has you muted.
+BMeet's Chrome extension (`bmeet/chrome/extension`) tells the pass when that was:
+- **In the page** (Meet, Slack; the page's own JavaScript world, before its scripts run), it keeps the `RTCPeerConnection`s the page sets up. While one is connected with audio, it reads `getStats()` twice a second: how much the energy (`totalAudioEnergy`) of each audio `media-source` grew, for those an active `outbound-rtp` sends. Muted, it does not grow, however the app mutes. A disabled track, no track, a silent WebAudio track and a paused sender were each caught in headless Chrome (`bmeet/chrome/tests/test_extension.py`). It is not tied to Meet's or Slack's buttons, which change.
+- **Timing:** sound found in a poll began after the poll before, and silence began after the last poll with sound, so each change is stamped with that time. In the tests the stamps were within about 1 s of the real change, mostly within 0.5 s. During a call the state is repeated every 5 s.
+- **The service worker** combines the tabs and passes `{t, call, live}` to `bmeet-chrome-host` (native messaging). That writes it to `call-mic.jsonl` in the meeting being recorded (`$XDG_RUNTIME_DIR/bmeet/recording`), and drops it when no meeting records.
+- **The pass:** `bmeet-meeting-audio` writes each part's start time, which places the log in the recording. Where a call was on and sent no sound, the microphone track is silenced before transcribing. A log line counts for at most 15 s; 0.5 s before each stretch with sound is kept; stretches under 1 s are ignored.
+- **Safety:** a log that never once saw sound sent leaves the microphone alone. That covers a call whose microphone the extension cannot see, and the echo filter still measures the echo on the original track. In-person meetings ignore the log.
+- **Test:** `tests/meeting_test.py --muted` says one sentence while muted, after the pause. It was left out in both languages; everything else stayed.
+
+### In person
+
+An in-person meeting (`meeting.json`: `"in_person": true`) has only the microphone, so the
+microphone is diarized like the system audio, and then:
+- **You:** with `--voices`, your own voice (`DIR/you.json`) is one of the remembered voices, under the name *You*. A single voice found is *You* as well.
+- **Learning your voice:** in online meetings, what is left of your microphone after the echo and the muted stretches is you. Its fingerprint is the duration-weighted mean of the middle 4 s of your longest lines, up to 60 s. It needs at least 15 s, and the last 10 meetings are kept. A meeting whose fingerprint is under 0.5 similar to the ones kept (someone else at your microphone) is skipped once there are two to compare with. In the app you can also name yourself (*You*) in an in-person meeting.
+- **Nobody through the speakers:** an online meeting in which the system audio held no speech is split the same way. That covers starting a normal meeting in the room by habit, and a call whose system audio was not captured, where the others leak into your microphone.
+- **Test:** `tests/meeting_test.py --in-person`. espeak's male voices are too alike for one microphone (TitaNet: m1/m3 0.84, as for one person), so it uses four voices at most 0.41 alike, like different people. You are learned in an online meeting, the people are named, and a second meeting in the room comes out as You, Anna, Boris and Viktor. That was 96 % of the words under the right label in English and 87 % in Russian; the misses were quick replies between two lines of someone else.
 
 ## Models
 

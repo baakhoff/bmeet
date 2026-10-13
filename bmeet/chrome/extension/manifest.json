@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "BMeet: is the call hearing you?",
+  "version": "0.5.0",
+  "description": "Tells BMeet when your Google Meet or Slack call cannot hear your microphone (muted), so the meeting transcript leaves out what you said meanwhile.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxgy94R7Q+PwJoSm0jNi6Q6Tcx5MMbA8LyMMcOxrj4K74y6/wT0yfd6lPCjPa0FmEXl1OtayItxaYm91o0I7EI9F5h+Csa6BMDgK2e8uY6TxLwiAI9ZFFIXzAdlBAhyUYBeCZ3gp2vattxMNIy5Yzdtig68pGMd7J4EgBgxxpcx7u7WP8Qdph0rWfDoWgZydkKZLT7uActjVne8XSXfl3YNmuMDqADmzmls/1fsefAWZyxH/JlQJX/EFkCmxP+7j6NymjlK40L4uYlkLrrzDWYWA7TmcK8qpHP0z0azSOsJwkbSB3/uAUgk59q3IAs39UVWHxPoKmBENmNrhqnfkXyQIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": ["nativeMessaging"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*", "https://app.slack.com/*"],
+      "js": ["page.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true
+    },
+    {
+      "matches": ["https://meet.google.com/*", "https://app.slack.com/*"],
+      "js": ["relay.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true
+    }
+  ]
+}

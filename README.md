@@ -21,6 +21,8 @@ machine, and the CPU and GPU are left alone.
   - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 2 minutes on a Core Ultra 7 258V (other languages, with Whisper: ~8 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
   - **Names:** *Name speakers…* in the app turns *Person 1* into *Viktor*. If you let it remember voices, later meetings call Viktor by name on their own.
+  - **Muted means muted:** with the small Chrome extension loaded, what you say while muted in Google Meet or a Slack huddle is left out of the transcript (see [Chrome extension](#chrome-extension)).
+- **In-person meetings:** press **Meta+Alt+Shift+M** (or *In person* in the app or widget) for a meeting in the room. Only your microphone is recorded, and the voices on it are told apart: **You**, **Person 1**, **Person 2**, … BMeet knows your voice from your online meetings, and remembered people get their names.
 - **File transcription:**
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - `--speakers` (or *Transcribe with speakers* in Dolphin) labels the lines Speaker 1, Speaker 2, …
@@ -98,6 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 | **Meta+H** | start dictation; press again to stop. The text is pasted at the cursor |
 | **Meta+Alt+H** | same, but only copies to the clipboard (for terminals: then Ctrl+Shift+V) |
 | **Meta+Alt+M** | start or stop a meeting transcript |
+| **Meta+Alt+Shift+M** | start or stop an in-person meeting (microphone only, split by voice) |
 | **Meta+Shift+H** | next dictation language (restarts the engine, ~3 s) |
 | Panel widget | click for controls; middle-click starts or stops a meeting |
 | **BMeet** (app menu) | meetings, transcribed files, *Transcribe a file* |
@@ -113,11 +116,29 @@ voxtype meeting list                            # all meetings
 
 **Shortcuts after a fresh install:** they're registered automatically, but KDE may only pick them up after you log out and in once.
 
+### Chrome extension
+
+BMeet records your microphone straight from the system, so it hears you even while the call
+app has you muted. The **BMeet** Chrome extension tells it when a Google Meet or Slack
+huddle tab sends no sound from your microphone. The speaker pass then leaves out what you
+said in those stretches, and the transcript says how long that was.
+
+Load it once (browsers don't let an installer add it):
+
+1. Open `chrome://extensions` and switch on *Developer mode*.
+2. Click *Load unpacked* and pick `~/.local/share/bmeet/src/bmeet/chrome/extension`.
+
+Load it in the Chrome profile you take calls in. `bash ~/.local/share/bmeet/src/voxtype/verify.sh`
+shows which profiles have it. It works in Chromium, Brave, Edge and Vivaldi too. The
+extension only reads how loud the sound it sends is, never the audio itself, and only on
+meet.google.com and app.slack.com. Its helper (`bmeet-chrome-host`) writes that state into
+the meeting being recorded, in RAM, and nowhere else. Without the extension, nothing changes.
+
 ## Configure
 
 - **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
 - **Meeting speakers:** `~/.config/bmeet/speakers` says `on` or `off`. When two people end up as one, or one person is split in two, see [docs/troubleshooting.md](docs/troubleshooting.md#meeting-speakers).
-- **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`).
+- **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.
 
@@ -131,8 +152,10 @@ voxtype meeting list                            # all meetings
 - **Remembered voices (off unless you turn them on):**
   - BMeet then keeps a voice fingerprint per person, 192 numbers from which no audio or words can be recovered, in `~/.local/share/bmeet/voices` (only your user can read it).
   - That covers each meeting's people, plus the people you named, under their names (at most their last 10 meetings).
+  - Your own voice (`you.json`) is learned from your microphone in online meetings (the last 10), so in-person meetings can tell you from the others.
   - Fingerprints are biometric data about other people: turn it on only where that is fine.
   - *Remembered voices…* in the app forgets one person. Unticking the option forgets everyone, and so does the uninstaller.
+- **Chrome extension:** it reads only how much sound your call tab sends (a number, twice a second, during calls), and its helper writes call on/off and muted/unmuted with times into the meeting being recorded. That file is in RAM and is deleted with the meeting audio.
 - **Telemetry:** OpenVINO's telemetry is blocked in npu-transcribe (it's on by default upstream; see [docs/npu-transcribe.md](docs/npu-transcribe.md)). Hugging Face telemetry is turned off for the model download.
 - **Clipboard:** dictation goes through the clipboard (that's how text gets into every app on KWin), so it shows up in Klipper's history.
 
@@ -158,6 +181,7 @@ bash ~/.local/share/bmeet/src/uninstall.sh
 
  meeting: voxtype-meeting-toggle ─> bmeet-meeting-audio (pw-record, RAM) ─> npu-transcribe --meeting
           (live You/Remote transcript from voxtype first, replaced by You/Person 1/... when done)
+          Chrome extension ─> bmeet-chrome-host ─> call-mic.jsonl (muted stretches left out)
 ```
 
 | Path | |
@@ -166,7 +190,7 @@ bash ~/.local/share/bmeet/src/uninstall.sh
 | [`system/`](system) | the sudo part: packages, NPU driver, voxtype binary, OpenVINO SDK, uinput |
 | [`voxtype/`](voxtype) | voxtype config, shortcuts, meeting and language helpers, `verify.sh` |
 | [`transcribe/`](transcribe) | `npu-transcribe` and its tests |
-| [`bmeet/`](bmeet) | `bmeet-ctl`, the BMeet app and the Plasma widget |
+| [`bmeet/`](bmeet) | `bmeet-ctl`, the BMeet app, the Plasma widget and the Chrome extension |
 | [`docs/`](docs) | design notes, benchmarks, troubleshooting |
 
 ## Development
@@ -176,7 +200,10 @@ bmeet/app/tests/run-tests.sh --quick              # app + bmeet-ctl, offscreen, 
 bmeet/app/tests/run-tests.sh                      # + real Whisper runs on the NPU
 bmeet/plasmoid/tests/check_qml.py --strict bmeet/plasmoid/*/contents/ui/*.qml
 transcribe/tests/run-tests.sh /tmp/npt "NPU CPU"  # npu-transcribe benchmark / regression
-transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass (ru; --language en)
+transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass (ru; --language en,
+                                                  #   --remember, --muted, --in-person)
+python3 -I bmeet/chrome/tests/test_host.py        # Chrome extension's host (offline)
+bmeet/chrome/tests/test_extension.py              # the extension in a throwaway headless Chrome
 bash voxtype/verify.sh                            # health check of an installed system
 ```
 
@@ -189,9 +216,11 @@ database, and never open your real one.
 - **One language per dictation session:** the OpenVINO engine has no auto-detection. Switch with Meta+Shift+H. File transcription does detect the language.
 - **voxtype can't rename meetings yet.**
 - **Speakers:**
-  - Only the system audio is split by voice. Everyone on your microphone (people in the same room) is *You*.
+  - In an online meeting only the system audio is split by voice, and everyone on your microphone is *You*. For people in the room with you, use an in-person meeting. Hybrid meetings (people in the room and on the call) are not split on both sides yet.
+  - In person, everyone shares one microphone: a quick reply between two lines of someone else can end up under them.
   - When two people talk at the same time, the words go to whoever is louder.
   - People are numbered until you name them in the app; only remembered voices are named automatically.
+- **Muted in the call:** only Google Meet and Slack in Chrome (or another Chromium-based browser), with the extension loaded. Desktop call apps (Zoom, Teams) are not seen. The first second or so after you mute can still be transcribed.
 - **Opening the app from the widget** may only flash it in the task bar (Wayland focus-stealing prevention).
 - **Only Ubuntu/Kubuntu 26.04 has been tested;** the pinned packages are built for it.
 

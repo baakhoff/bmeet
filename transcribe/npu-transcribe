@@ -22,7 +22,9 @@ also on the NPU) and every line is labelled Speaker 1, Speaker 2, ... in the ord
 first speak.
 --meeting DIR turns a BMeet meeting recording (DIR/part-N-mic.wav + part-N-remote.wav,
 written by bmeet-meeting-audio) into a Markdown transcript: the microphone is "You",
-the voices in the system audio become Person 1, Person 2, ...
+the voices in the system audio become Person 1, Person 2, ... Your words from when the
+browser call could not hear you (muted in Meet or Slack; BMeet's Chrome extension logs
+it) are left out. An in-person meeting (microphone only) is split by voice: You, Person 1, ...
 
 Examples:
   npu-transcribe meeting.m4a
@@ -97,7 +99,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -166,6 +168,17 @@ ECHO_MARGIN = 2.0             # meeting: a mic word at most this much louder tha
                               # expected from the system audio at that moment is the echo
 ECHO_WINDOW = 2.0             # without word timestamps: look this far around a mic line ...
 ECHO_SHARE = 0.6              # ... and drop it when this share of its words was said remotely
+# Microphone off in the call: BMeet's Chrome extension logs whether the browser call sent
+# sound from your microphone (call-mic.jsonl, see read_call_log). Where a call was on and it
+# sent nothing (muted in Meet or Slack), the microphone track is silenced before transcribing.
+CALL_STALE = 15.0             # a log line holds at most this long (the extension repeats it every 5 s)
+LIVE_LEAD = 0.5               # keep this much before sound is logged (poll and recording delays)
+MIN_MUTED_SECONDS = 1.0       # shorter stretches without sound are left alone
+# Your own voice (remembered voices on): learned from your microphone in online meetings, so
+# that the microphone of an in-person meeting can be split into you and the others.
+SELF_MIN_SECONDS = 15         # learn only from meetings with at least this much of your speech
+SELF_OUTLIER = 0.5            # a meeting's fingerprint less similar than this to yours is not learned
+MAX_SELF_PRINTS = 10          # your fingerprints kept: the latest meetings
 PROG = "npu-transcribe"
 STDERR_LOCK = threading.Lock()  # log() and the progress ticker share stderr
 UMASK = os.umask(0o022)
@@ -1122,15 +1135,16 @@ def echo_gain(mic: np.ndarray, remote: np.ndarray) -> float:
 
 
 def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
-              remote: np.ndarray) -> tuple[list[Segment], int]:
+              remote: np.ndarray, gain: float | None = None) -> tuple[list[Segment], int]:
     """Meeting without headphones: the microphone also hears the other side, and Whisper
     writes their words into your track too, often in the same sentence as your own.
 
     With word timestamps, a word is the echo when the microphone is not clearly louder
     (ECHO_MARGIN) than the echo the system audio would cause at that moment; those words
     are cut out. Without them, a whole line goes when ECHO_SHARE of its words were said
-    remotely within ECHO_WINDOW. Returns the kept segments and the number of words cut."""
-    gain = echo_gain(mic, remote)
+    remotely within ECHO_WINDOW. Returns the kept segments and the number of words cut.
+    gain: echo_gain() measured beforehand (when the microphone has been silenced since)."""
+    gain = echo_gain(mic, remote) if gain is None else gain
     kept: list[Segment] = []
     cut = 0
     for seg in mine:
@@ -1178,6 +1192,62 @@ def load_voices(folder: Path) -> dict[str, list[list[float]]]:
             if isinstance(v, dict) and v.get("fingerprints")}
 
 
+def load_self(folder: Path) -> list[list[float]]:
+    """Your own voice's fingerprints, from FOLDER/you.json (learn_self, or the BMeet app when
+    you name yourself in an in-person meeting). Another model's are ignored."""
+    try:
+        data = json.loads((folder / "you.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or data.get("model") != EMBEDDING_MODEL.name:
+        return []
+    return [f for f in data.get("fingerprints") or [] if isinstance(f, list) and f]
+
+
+def self_print(models: SpeakerModels, mic: np.ndarray, mine: list[Segment]) -> list[float] | None:
+    """Your fingerprint from an online meeting: what is left of your microphone track after
+    the echo and the muted stretches are taken out is you. The middle EMB_SECONDS of your
+    longest lines, up to FINGERPRINT_SECONDS; None with less than SELF_MIN_SECONDS of them."""
+    spans, total = [], 0.0
+    for seg in sorted(mine, key=lambda s: s.start - s.end):  # longest first
+        if total >= FINGERPRINT_SECONDS or seg.end - seg.start < 1.5:
+            break
+        mid, half = (seg.start + seg.end) / 2, models.EMB_SECONDS / 2
+        a, b = max(seg.start, mid - half), min(seg.end, mid + half)
+        spans.append((a, b))
+        total += b - a
+    if total < SELF_MIN_SECONDS:
+        return None
+    vecs = models.embed([mic[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])
+    return [round(float(x), 5) for x in unit(sum(v * (b - a) for v, (a, b) in zip(vecs, spans)))]
+
+
+def learn_self(folder: Path, fingerprint: list[float], meeting: str) -> bool:
+    """Keep this meeting's fingerprint of your voice in FOLDER/you.json (the latest
+    MAX_SELF_PRINTS meetings). Not when it sounds unlike the ones kept (SELF_OUTLIER: someone
+    else at your microphone), once there are two to compare with. Private file."""
+    kept = load_self(folder)
+    try:
+        meetings = json.loads((folder / "you.json").read_text(encoding="utf-8")).get("meetings") or []
+    except (OSError, ValueError, AttributeError):
+        meetings = []
+    if len(meetings) != len(kept):
+        meetings = [""] * len(kept)
+    if len(kept) >= 2:
+        similar = float(unit(np.mean([unit(f) for f in kept], axis=0)) @ unit(fingerprint))
+        if similar < SELF_OUTLIER:
+            log(f"your voice: not learned from this meeting (similarity {similar:.2f} to the "
+                f"{len(kept)} kept; someone else at your microphone?)")
+            return False
+    pairs = [(f, m) for f, m in zip(kept, meetings) if m != meeting][-(MAX_SELF_PRINTS - 1):]
+    pairs.append((fingerprint, meeting))
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data = {"version": 1, "model": EMBEDDING_MODEL.name, "fingerprints": [f for f, _ in pairs],
+            "meetings": [m for _, m in pairs], "updated": int(time.time())}
+    write_atomic(folder / "you.json", json.dumps(data) + "\n", private=True)
+    return True
+
+
 def number_speakers(segments: list[Segment], found: list[Turn], word: str, unknown: str,
                     names: dict[int, str] | None = None) -> tuple[list[Segment], dict[int, str]]:
     """Label (and split) segments by speaker as "<word> 1", "<word> 2", ... numbered in the
@@ -1199,14 +1269,22 @@ def number_speakers(segments: list[Segment], found: list[Turn], word: str, unkno
 PART_NAME = re.compile(r"^part-(\d+)-(mic|remote)\.wav$")
 
 
-def read_meeting(folder: Path) -> tuple[np.ndarray, np.ndarray]:
+@dataclass
+class Part:
+    offset: float           # where it starts in the joined audio (seconds)
+    length: float
+    wall: float | None      # when it started (epoch seconds, from part-N.start), if known
+
+
+def read_meeting(folder: Path) -> tuple[np.ndarray, np.ndarray, list[Part]]:
     """A recording by bmeet-meeting-audio: part-N-mic.wav + part-N-remote.wav for each
-    stretch between pauses, joined in order. The two tracks of a part are padded to the
-    same length so they stay in step across pauses."""
+    stretch between pauses, joined in order (an in-person meeting has no remote tracks: they
+    come back as silence). The two tracks of a part are padded to the same length so they
+    stay in step across pauses. Also returns where each part is (Part)."""
     parts = sorted({int(m[1]) for f in folder.iterdir() if (m := PART_NAME.match(f.name))})
     if not parts:
         raise RuntimeError(f"no recording in {folder}")
-    mics, remotes = [], []
+    mics, remotes, placed, offset = [], [], [], 0
     for n in parts:
         tracks = []
         for kind in ("mic", "remote"):
@@ -1219,7 +1297,82 @@ def read_meeting(folder: Path) -> tuple[np.ndarray, np.ndarray]:
         length = max(t.size for t in tracks)
         mics.append(np.pad(tracks[0], (0, length - tracks[0].size)))
         remotes.append(np.pad(tracks[1], (0, length - tracks[1].size)))
-    return np.concatenate(mics), np.concatenate(remotes)
+        try:
+            wall: float | None = float((folder / f"part-{n}.start").read_text().strip())
+        except (OSError, ValueError):
+            wall = None
+        placed.append(Part(offset / SAMPLE_RATE, length / SAMPLE_RATE, wall))
+        offset += length
+    return np.concatenate(mics), np.concatenate(remotes), placed
+
+
+def read_call_log(folder: Path) -> list[tuple[float, bool, bool]]:
+    """What the browser call did with your microphone while the meeting recorded, written to
+    FOLDER/call-mic.jsonl by bmeet-chrome-host for BMeet's Chrome extension: one line
+    {"t": epoch seconds, "call": bool, "live": bool} per change and every 5 s. call: a tab is
+    in a call with audio (Meet, Slack huddle); live: it sent sound from your microphone in
+    the last second (muted, it sends none). Sorted (t, call, live); [] without the extension."""
+    try:
+        text = (folder / "call-mic.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        try:
+            d = json.loads(line)
+            out.append((float(d["t"]), bool(d["call"]), bool(d["live"])))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return sorted(out)
+
+
+def subtract(spans: list[tuple[float, float]], holes: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    for ha, hb in holes:
+        spans = [p for a, b in spans for p in ((a, min(b, ha)), (max(a, hb), b)) if p[1] > p[0]]
+    return spans
+
+
+def join_spans(spans: list[tuple[float, float]], gap: float = 0.0) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + gap:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def muted_spans(log_lines: list[tuple[float, bool, bool]], parts: list[Part]) -> list[tuple[float, float]]:
+    """When the call could not hear you, in seconds of the joined meeting audio: a call was on
+    and sent no sound from your microphone. Each log line holds until the next one, at most
+    CALL_STALE; LIVE_LEAD before each stretch with sound is kept (it is logged late), and
+    stretches shorter than MIN_MUTED_SECONDS are ignored. Nothing when the log never saw any
+    sound sent: then the extension cannot see this call's microphone, and silencing you
+    would be a guess. Parts without a start time cannot be placed and are left alone."""
+    if not any(call and live for _, call, live in log_lines):
+        return []
+    muted, live = [], []
+    for i, (t, call, is_live) in enumerate(log_lines):
+        end = min(log_lines[i + 1][0] if i + 1 < len(log_lines) else math.inf, t + CALL_STALE)
+        if call and is_live:
+            live.append((t - LIVE_LEAD, end))
+        elif call:
+            muted.append((t, end))
+    wall = join_spans(subtract(join_spans(muted), live))
+    out = []
+    for part in parts:
+        if part.wall is None:
+            continue
+        for a, b in wall:
+            s, e = max(0.0, a - part.wall), min(part.length, b - part.wall)
+            if e - s >= MIN_MUTED_SECONDS:
+                out.append((part.offset + s, part.offset + e))
+    return out
+
+
+def silence(samples: np.ndarray, spans: list[tuple[float, float]]) -> None:
+    for a, b in spans:
+        samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] = 0.0
 
 
 # --------------------------------------------------------------------------- output
@@ -1447,8 +1600,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
     p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
     p.add_argument("--voices", type=Path, metavar="DIR",
-                   help="--meeting: give voices remembered in DIR/voices.json their names, and keep "
-                        "this meeting's voice fingerprints in DIR/meetings/ (BMeet's 'remember voices')")
+                   help="--meeting: give voices remembered in DIR/voices.json their names, keep "
+                        "this meeting's voice fingerprints in DIR/meetings/, and learn your own voice "
+                        "in DIR/you.json (BMeet's 'remember voices')")
     args = p.parse_args(argv)
     if args.num_speakers < 0:
         p.error("--num-speakers: expected a positive number")
@@ -1551,24 +1705,40 @@ def save_meeting_voices(folder: Path, transcript: Path, people: dict[str, list[f
 
 def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: dict) -> int:
     """--meeting DIR: both tracks transcribed, the system audio split by voice, your
-    microphone as "You", interleaved by time into --output (Markdown)."""
+    microphone as "You", interleaved by time into --output (Markdown). Where the browser call
+    could not hear you (muted; read_call_log), your microphone is left out.
+
+    In person (DIR/meeting.json says "in_person", or nobody spoke through the speakers): the
+    microphone is split by voice instead. The voice that sounds like you (learned from your
+    microphone in online meetings, with --voices) is You, a single voice is You too, the
+    others are Person 1, Person 2, ..."""
     folder, out = args.meeting.expanduser(), args.output.expanduser()
     try:
         info = json.loads((folder / "meeting.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         info = {}
     title = args.title or info.get("title") or "Meeting"
+    in_person = bool(info.get("in_person"))
+    voices_dir = args.voices.expanduser() if args.voices else None
     # voxtype-meeting-toggle has already saved voxtype's own transcript there; it is replaced
     # unless it changed meanwhile (then the result goes next to it).
     before = out.stat().st_mtime_ns if out.exists() else None
     try:
-        mic, remote = read_meeting(folder)
+        mic, remote, parts = read_meeting(folder)
+        if in_person:  # (nothing is recorded; voxtype's live transcript still has it)
+            remote = np.zeros(0, np.float32)
         duration = max(mic.size, remote.size) / SAMPLE_RATE
-        log(f"meeting: {hms(duration)} of audio")
+        log(f"meeting: {hms(duration)} of audio" + (", in person (microphone only)" if in_person else ""))
         t0 = time.monotonic()
+        gain, muted = 0.0, []
+        if not in_person:
+            gain = echo_gain(mic, remote)  # before the silencing, which would make it look like headphones
+            if muted := muted_spans(read_call_log(folder), parts):
+                silence(mic, muted)
+                log(f"microphone off in the call: {hms(sum(b - a for a, b in muted))} left out")
         audible = {name: samples.size > 0 and peak_dbfs(samples) >= SILENCE_DBFS
                    for name, samples in (("system audio", remote), ("microphone", mic))}
-        remembered = load_voices(args.voices.expanduser()) if args.voices else {}
+        remembered = load_voices(voices_dir) if voices_dir else {}
         # One language per meeting, detected on the other side (your track may hold little
         # speech of your own; detected there it went wrong, and Whisper then translated).
         engine, language = engines.choose(args.language, array_blocks(
@@ -1579,18 +1749,30 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
                                   gen_kwargs) if audible[name] else None
                  for name, samples in (("system audio", remote), ("microphone", mic))}
         theirs, yours = heard["system audio"], heard["microphone"]
-        remote_segments, labels, prints, names = [], {}, {}, {}
-        speakers_on = ""
-        if theirs and theirs.segments:
+        room = in_person or not (theirs and theirs.segments)
+        segments, labels, prints, names = [], {}, {}, {}
+        speakers_on, echoes, me = "", 0, None
+        if room and yours and yours.segments:  # everyone is on the microphone
+            known = dict(remembered)
+            if voices_dir and (mine := load_self(voices_dir)):
+                known["You"] = mine
+            found, prints, names = diarize(engines.speakers(), mic, args.num_speakers, known)
+            speakers_on = engines.speakers().device
+            if not names and len({t.speaker for t in found}) == 1:
+                names = {found[0].speaker: "You"}  # one voice at your microphone: you
+            segments, labels = number_speakers(yours.segments, found, "Person", "Person ?", names)
+        elif not room:
             found, prints, names = diarize(engines.speakers(), remote, args.num_speakers, remembered)
             speakers_on = engines.speakers().device
             remote_segments, labels = number_speakers(theirs.segments, found, "Person", "Remote", names)
-        people = len(set(labels.values()))
-        my_segments = [Segment(s.start, s.end, s.text, s.words, "You") for s in yours.segments] \
-            if yours else []
-        my_segments, echoes = drop_echo(my_segments, theirs.segments if theirs else [], mic, remote)
+            my_segments = [Segment(s.start, s.end, s.text, s.words, "You") for s in yours.segments] \
+                if yours else []
+            my_segments, echoes = drop_echo(my_segments, theirs.segments, mic, remote, gain)
+            if voices_dir and my_segments:
+                me = self_print(engines.speakers(), mic, my_segments)
+            segments = sorted(my_segments + remote_segments, key=lambda s: s.start)
         del mic, remote
-        segments = sorted(my_segments + remote_segments, key=lambda s: s.start)
+        people = len({label for label in labels.values() if label != "You"})
         wall = time.monotonic() - t0
         langs = {who: t.language for who, t in (("you", yours), ("others", theirs)) if t and t.language != "?"}
         meta = {
@@ -1599,8 +1781,14 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             "Transcribed": f"{engine_label(engine)} on {engine.device} in {hms(wall)}"
                            + (f"; voices told apart on {speakers_on}" if speakers_on else ""),
         }
-        if recognised := sorted({names[v] for v in labels if v in names}):
+        if room:
+            meta["Microphone"] = "split by voice (" + (
+                "in-person meeting)" if in_person else "nobody spoke through the speakers)")
+        if recognised := sorted({names[v] for v in labels if v in names and names[v] != "You"}):
             meta["Recognised by voice"] = ", ".join(recognised)
+        if muted:
+            meta["Microphone off"] = (f"{hms(sum(b - a for a, b in muted))} in which the call could "
+                                      "not hear you (muted) were left out")
         if echoes:
             meta["Echo"] = (f"{echoes} word(s) your microphone picked up from the speakers "
                             "were left out")
@@ -1609,12 +1797,14 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             dest = out.with_name(f"{out.stem}-speakers.md")
             log(f"{out.name} changed while this ran; writing {dest.name} instead")
         write_atomic(dest, meeting_md(title, info.get("started"), duration, segments, meta))
-        if args.voices and prints:  # so the people can be named and remembered later
+        if voices_dir and prints:  # so the people can be named and remembered later
             people_prints: dict[str, list[float]] = {}
             for v, label in labels.items():  # (a name can cover two voices: keep the longer)
                 if v in prints and label not in people_prints:
                     people_prints[label] = prints[v]
-            save_meeting_voices(args.voices.expanduser(), dest, people_prints)
+            save_meeting_voices(voices_dir, dest, people_prints)
+        if me and learn_self(voices_dir, me, dest.stem):
+            log("your voice: learned from this meeting's microphone")
     except Exception as exc:
         log(f"ERROR: {exc}")
         if args.notify:
@@ -1623,10 +1813,10 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
         return 1
     print(dest, flush=True)
     log(f"done: {hms(duration)} in {hms(wall)}, {people} other voice(s)"
-        + (f" ({', '.join(recognised)} recognised)" if names and recognised else "") + ", "
+        + (f" ({', '.join(recognised)} recognised)" if recognised else "") + ", "
         f"{len(segments)} segment(s)" + (f", {echoes} echo word(s) left out" if echoes else ""))
     if args.notify:
-        who = ", ".join(sorted(set(labels.values()), key=list(labels.values()).index))
+        who = ", ".join(label for label in dict.fromkeys(labels.values()) if label != "You")
         notify(True, [f"{people} other voice(s): {who}" if people else "no other voices", str(dest)],
                "Meeting speakers identified")
     return 0

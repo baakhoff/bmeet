@@ -41,7 +41,7 @@ OLD_CONFIG_MARKER="# npu-voicenotes:"   # before 0.2.0 (BMeet was called npu-voi
 OLD_LANG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/npu-voicenotes/languages"
 DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voxtype.service.d"
 DROPIN="$DROPIN_DIR/10-npu-setup.conf"
-APPS="voxtype-dictate voxtype-meeting voxtype-lang"
+APPS="voxtype-dictate voxtype-meeting voxtype-meeting-in-person voxtype-lang"
 # Whisper's language codes (openai/whisper tokenizer.py LANGUAGES)
 WHISPER_LANGS="en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro
 da hu ta no th ur hr bg lt la mi ml cy sk te fa lv bn sr az sl kn et mk br eu is hy ne mn bs
@@ -73,7 +73,7 @@ uninstall() {
     systemctl --user stop ydotool.service 2>/dev/null || true
     # speaker passes still running: stop them (their ExecStopPost deletes the audio)
     systemctl --user stop bmeet-meeting-audio.service 'bmeet-speakers-*.service' 2>/dev/null || true
-    rm -rf "$XDG_RUNTIME_DIR/bmeet/meeting-audio"
+    rm -rf "$XDG_RUNTIME_DIR/bmeet/meeting-audio" "$XDG_RUNTIME_DIR/bmeet/recording"
     rmdir "$XDG_RUNTIME_DIR/bmeet" 2>/dev/null || true
     rm -f "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang" "$BIN_DIR/bmeet-meeting-audio"
     for f in $APPS; do
@@ -181,7 +181,7 @@ install -m 0755 "$HERE/bin/voxtype-meeting-toggle" "$HERE/bin/voxtype-lang" \
     "$HERE/bin/bmeet-meeting-audio" "$BIN_DIR/"
 ls -l "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang" "$BIN_DIR/bmeet-meeting-audio"
 
-step "5/8 launchers + KDE global shortcuts (Meta+H, Meta+Alt+H, Meta+Alt+M, Meta+Shift+H)"
+step "5/8 launchers + KDE global shortcuts (Meta+H, Meta+Alt+H, Meta+Alt+M, Meta+Alt+Shift+M, Meta+Shift+H)"
 install -d -m 0755 "$APP_DIR" "$KGA_DIR"
 for f in $APPS; do
     sed "s|@HOME@|$HOME|g" "$HERE/applications/$f.desktop" > "$APP_DIR/$f.desktop"

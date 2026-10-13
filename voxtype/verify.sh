@@ -85,11 +85,53 @@ if [ "$speakers" = on ]; then
         n=$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["voices"]))' \
             "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices/voices.json" 2>/dev/null || echo 0)
         info "remembered voices: on, $n person/people (BMeet app: Name speakers… > Remembered voices…)"
+        n=$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["fingerprints"]))' \
+            "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices/you.json" 2>/dev/null || echo 0)
+        if [ "$n" -gt 0 ]; then
+            info "your own voice: learned from $n meeting(s); in-person meetings label it You"
+        else
+            info "your own voice: not learned yet (it is, from your microphone in online meetings)"
+        fi
     else
         info "remembered voices: off (people are numbered; turn on in the app's Name speakers… dialog)"
     fi
 else
     info "telling speakers apart is off: meetings are labelled You / Remote (installer --no-speakers)"
+fi
+
+echo "== microphone off in browser calls (BMeet's Chrome extension)"
+host_manifest="${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome/NativeMessagingHosts/io.github.baakhoff.bmeet.json"
+if [ -x "$HOME/.local/bin/bmeet-chrome-host" ] && [ -f "$host_manifest" ]; then
+    ok "native host for Google Chrome (bmeet-chrome-host)"
+elif [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome" ]; then
+    bad "bmeet-chrome-host or its Chrome manifest missing (run the installer again)"
+fi
+# Which Chrome profiles have the extension (an unpacked one is listed in the profile's preferences).
+loaded=$(python3 -I - "${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome" <<'PY' 2>/dev/null
+import json, sys
+from pathlib import Path
+root, ext = Path(sys.argv[1]), "pfhnhicfaajjfidmknapnoekclpjoaoc"
+try:
+    names = json.loads((root / "Local State").read_text())["profile"]["info_cache"]
+except (OSError, ValueError, KeyError):
+    names = {}
+found = []
+for prefs in sorted(root.glob("*/*Preferences")):
+    try:
+        settings = json.loads(prefs.read_text()).get("extensions", {}).get("settings", {})
+    except (OSError, ValueError):
+        continue
+    if ext in settings and prefs.parent.name not in found:
+        found.append(prefs.parent.name)
+print(", ".join(names.get(d, {}).get("name", d) for d in found))
+PY
+)
+if [ -n "$loaded" ]; then
+    ok "extension loaded in Chrome: $loaded"
+else
+    info "extension not loaded: words said while muted in Meet/Slack stay in transcripts."
+    info "  Load it once: chrome://extensions -> Developer mode -> Load unpacked ->"
+    info "  ${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/src/bmeet/chrome/extension"
 fi
 
 echo "== synthetic transcription (separate process, same config)"

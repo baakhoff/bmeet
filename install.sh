@@ -32,7 +32,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.4.0
+    local VERSION=0.5.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -286,6 +286,9 @@ with open(sys.argv[2], "wb") as f:
     say "BMeet app"
     bash "$src/bmeet/app/install-user.sh"
 
+    say "Chrome extension (leaves out what you say while muted in Meet / Slack)"
+    bash "$src/bmeet/chrome/install-user.sh"
+
     say "BMeet panel widget"
     if command -v kpackagetool6 >/dev/null; then
         bash "$src/bmeet/plasmoid/install-user.sh" ${panel:+--add-to-panel}
@@ -305,9 +308,14 @@ with open(sys.argv[2], "wb") as f:
   Meta+H          dictate: press, speak, press again -> text is typed at the cursor
   Meta+Alt+H      dictate to the clipboard only (for terminals: then Ctrl+Shift+V)
   Meta+Alt+M      start / stop a meeting transcript (microphone + system audio)
+  Meta+Alt+Shift+M  the same for a meeting in the room (microphone only, split by voice)
   Meta+Shift+H    next dictation language ($(cat "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/languages" 2>/dev/null || echo en))
   BMeet           app menu, or the microphone in the panel: meetings, transcripts, files
   Dolphin         right-click an audio/video file -> Transcribe (NPU)
+
+  Chrome          load the extension once, so words said while muted in Meet/Slack are left
+                  out: chrome://extensions -> Developer mode -> Load unpacked ->
+                  $src/bmeet/chrome/extension
 
   Check the setup:  bash $src/voxtype/verify.sh
   Uninstall:        bash $src/uninstall.sh

@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-10-13
+
+Words you say while muted in the call are left out, and meetings in the room work too.
+
+### Added
+- **Muted in Meet or Slack: left out.** BMeet records your microphone itself, so it heard you even when the call didn't. A small Chrome extension now watches how much of your microphone's sound a Meet or Slack tab sends into the call. It sends none while you're muted, however the app mutes. The speaker pass silences your microphone for those stretches, and the transcript says how long was left out.
+  - It reads sound levels only, never the audio, and only on meet.google.com and app.slack.com. Its helper writes the state into the meeting being recorded (in RAM) and nowhere else.
+  - Load it once: chrome://extensions → Developer mode → Load unpacked → `~/.local/share/bmeet/src/bmeet/chrome/extension`. Without it, nothing changes.
+  - Tested in headless Chrome: a disabled track, a removed track, a silent track and a paused sender were each caught within about a second.
+- **In-person meetings** (Meta+Alt+Shift+M, the app's *In person* button, the widget, `bmeet-ctl meeting start --in-person`). Only the microphone is recorded, and the speaker pass splits it by voice into You, Person 1, Person 2, … Remembered people get their names.
+  - **Your own voice** is learned from your microphone in online meetings (with remembered voices on), so in the room the voice that sounds like you is labelled You. A single voice is labelled You too.
+  - If you start a normal meeting in the room by habit, nobody speaks through the speakers, and the microphone is split by voice anyway.
+  - In the naming dialog of an in-person meeting you can write *You* for yourself. *Remembered voices…* lists your own voice and can forget it.
+
+### Changed
+- `bmeet-meeting-audio` writes each part's start time (`part-N.start`), so events can be placed in the audio, and `--mic-only` records the microphone alone.
+
 ## [0.4.0] - 2026-10-13
 
 Russian is transcribed with GigaAM v3, and everything runs on the NPU, including telling the speakers apart.
@@ -89,6 +106,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.5.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.0
 [0.4.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.4.0
 [0.3.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.1
 [0.3.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.0

@@ -40,6 +40,10 @@ APP_PATH = HERE.parent / "bmeet"
 CTL_PATH = HERE.parent.parent / "bmeet-ctl"
 REPO = HERE.parents[2]
 NPU_TRANSCRIBE = REPO / "transcribe/npu-transcribe"
+# The installed models: the tests point XDG_DATA_HOME at a scratch folder (below), and
+# npu-transcribe looks for its models under it.
+NPU_MODELS = os.environ.get("NPU_MODELS_DIR") or str(
+    Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MAKE_SPEECH = REPO / "transcribe/tests/make_speech.py"
 NPU_PYTHON = os.environ.get("NPU_PYTHON") or str(
     Path.home() / ".local/share/bmeet/venv/bin/python")
@@ -176,6 +180,7 @@ ENV = {
     "FAKE_VOXTYPE_LOG": str(WORK / "voxtype-calls.log"),
     "BMEET_DRY_RUN": "1",
     "BMEET_SOCKET": str(WORK / "bmeet.sock"),
+    "NPU_MODELS_DIR": NPU_MODELS,
 }
 os.environ.update(ENV)
 os.environ.pop("XDG_ACTIVATION_TOKEN", None)
@@ -409,6 +414,49 @@ class A_DataTests(unittest.TestCase):
             shutil.rmtree(voices, ignore_errors=True)
             vn.REMEMBER_FILE.unlink(missing_ok=True)
 
+    IN_PERSON_MD = ("# In-person meeting\n\n## Meeting Info\n\n- **Speakers:** You, Person 1\n"
+                    "- **Microphone:** split by voice (in-person meeting)\n\n## Transcript\n\n"
+                    "### You\n\n*[00:00]* Shall we start?\n\n### Person 1\n\n*[00:03]* Yes.\n")
+
+    def test_in_person_you_can_be_named(self):
+        self.assertTrue(vn.mic_split(self.IN_PERSON_MD))
+        self.assertFalse(vn.mic_split(self.SPEAKER_MD))
+        self.assertEqual(vn.md_speakers(self.IN_PERSON_MD), [("You", "Shall we start?"), ("Person 1", "Yes.")])
+        self.assertIsNotNone(vn.name_problem("You"))
+        self.assertIsNone(vn.name_problem("You", you_allowed=True))
+        self.assertIsNotNone(vn.name_problem("Person ?", you_allowed=True))
+        out = vn.rename_speakers(self.IN_PERSON_MD, {"You": "Anna", "Person 1": "You"})
+        self.assertIn("### Anna\n\n*[00:00]* Shall we start?", out)
+        self.assertIn("### You\n\n*[00:03]* Yes.", out)
+        self.assertIn("- **Speakers:** Anna, You\n", out)
+
+    def test_remember_your_own_voice(self):
+        voices = WORK / "voices"
+        md = str(WORK / "Meetings/2026-10-13_1500-meeting.md")
+        side = vn.meeting_voices_path(md)
+        try:
+            side.parent.mkdir(parents=True)
+            # npu-transcribe learned your voice from an online meeting before
+            (voices / "you.json").write_text(json.dumps({"version": 1, "model": "m.onnx",
+                                                         "fingerprints": [[0.0, 1.0]], "meetings": ["online"]}))
+            # in person it took Anna for you, and you for Person 1
+            side.write_text(json.dumps({"model": "m.onnx", "people": {"You": [1.0, 0.0], "Person 1": [0.0, 0.9]}}))
+            self.assertEqual(vn.own_voice_meetings(), 1)
+            self.assertEqual(sorted(vn.remember_named(md, {"You": "Anna", "Person 1": "You"})), ["Anna", "You"])
+            own = json.loads((voices / "you.json").read_text())
+            self.assertEqual(own["fingerprints"], [[0.0, 1.0], [0.0, 0.9]])
+            self.assertEqual(own["meetings"], ["online", side.stem])
+            self.assertEqual(vn.remembered_voices(), {"Anna": 1})  # You is not a remembered name
+            self.assertEqual(json.loads(side.read_text())["people"], {"Anna": [1.0, 0.0], "You": [0.0, 0.9]})
+            # changed your mind: that was Boris after all
+            vn.remember_named(md, {"You": "Boris"})
+            self.assertEqual(json.loads((voices / "you.json").read_text())["fingerprints"], [[0.0, 1.0]])
+            self.assertEqual(vn.remembered_voices(), {"Anna": 1, "Boris": 1})
+            vn.forget_own_voice()
+            self.assertEqual(vn.own_voice_meetings(), 0)
+        finally:
+            shutil.rmtree(voices, ignore_errors=True)
+
     def test_ctl_speakers_pending(self):
         audio = WORK / "meeting-audio"
         self.assertEqual(vn.ctl.status()["speakers_pending"], [])   # no folder at all
@@ -572,10 +620,16 @@ class B_WindowTests(unittest.TestCase):
             self.assertEqual(detached[-1][1:], ["stop"])
             self.assertEqual(w.meet_label.text(), "Saving transcript…")
             self.assertFalse(w.act_meet_start.isEnabled())
+            self.assertFalse(w.act_meet_room.isEnabled())
             (WORK / "run" / "meeting_state").write_text("idle\n")
             self.assertTrue(wait_until(lambda: (w.poll(), w.meet_label.text())[1] == "No meeting", 5))
             self.assertEqual(w.statusBar().currentMessage(), "Meeting saved")
             self.assertEqual(w.meetings_page.current_key(), FIX["ids"]["D"])  # newest meeting selected
+            self.assertTrue(w.act_meet_room.isEnabled())
+            w.act_meet_room.trigger()  # in person: microphone only
+            self.assertEqual(detached[-1][1:], ["start", "--in-person"])
+            self.assertEqual(w.meet_label.text(), "Starting…")
+            w._meeting_pending = None  # (the fake never starts it)
         finally:
             vn.run_detached = orig
             vn.DRY_RUN = True
@@ -648,7 +702,7 @@ class B_WindowTests(unittest.TestCase):
         before = md.read_text()
         side = vn.meeting_voices_path(str(md))
         asked = []
-        p.ask_names = lambda speakers, has_fp: asked.append((speakers, has_fp)) or (
+        p.ask_names = lambda speakers, has_fp, you_allowed: asked.append((speakers, has_fp, you_allowed)) or (
             {"Person 1": "Viktor"}, True)
         try:
             md.write_text(A_DataTests.SPEAKER_MD)
@@ -660,6 +714,7 @@ class B_WindowTests(unittest.TestCase):
             p.act_names.trigger()
             self.assertEqual(asked[0][0][0], ("Person 1", "Hello, Person 2 here is late."))
             self.assertTrue(asked[0][1])  # this meeting has fingerprints
+            self.assertFalse(asked[0][2])  # an online meeting: You is your microphone
             self.assertIn("### Viktor", md.read_text())
             self.assertEqual(vn.remembered_voices(), {"Viktor": 1})
             self.assertTrue(vn.remember_voices_on())
@@ -691,6 +746,10 @@ class B_WindowTests(unittest.TestCase):
             dlg.accept()
             self.assertFalse(dlg.isHidden() and dlg.result() == vn.QDialog.DialogCode.Accepted)
             self.assertIn("Person 7", dlg.error.text())
+            dlg.fields["Person 1"].setText("You")  # online: You is your microphone
+            self.assertTrue(dlg.problems())
+            dlg.you_allowed = True                  # in person: you can name yourself
+            self.assertEqual(dlg.problems(), [])
             dlg.fields["Person 1"].setText(" Anna ")
             dlg.remember.setChecked(True)
             self.assertIn("next meeting", dlg.note.text())  # no fingerprints in this one
@@ -1103,7 +1162,7 @@ class D_RealTranscribeTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         outputs = r.stdout.split("\n")[:-1]
         self.assertEqual([Path(o).suffix for o in outputs], [".srt", ".md"])  # stdout unchanged: just paths
-        self.assertRegex(r.stderr, r"\nnpu-transcribe: done: hello clip\.ogg: 00:00:0\d of audio in [\d.]+ s on ")
+        self.assertRegex(r.stderr, r"\nnpu-transcribe: done: hello clip\.ogg: 00:00:0\d of audio in [\d.]+ s with \S+ on ")
         lines = history_lines(hist)
         self.assertEqual(len(lines), 1)
         h = json.loads(lines[0])

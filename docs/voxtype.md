@@ -110,6 +110,7 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
 ## Meeting mode
 
 - **Starting and stopping:** Meta+Alt+M, the widget (also a middle-click on it), the app, or `voxtype-meeting-toggle [start|stop]`.
+- **In person:** Meta+Alt+Shift+M, *In person* in the app or widget, or `voxtype-meeting-toggle [start|stop] --in-person`. voxtype runs the same meeting (its live transcript still has *You* / *Remote*), but `bmeet-meeting-audio --mic-only` records only the microphone, and `meeting.json` says `"in_person": true`. The speaker pass then splits the microphone by voice.
 - **What is recorded:** the default microphone (labelled **You**) and system audio (labelled **Remote**).
   - System audio is `@DEFAULT_MONITOR@`, the monitor of the *current* default output. voxtype's `auto` can pick an idle HDMI monitor instead.
   - Switching outputs mid-meeting isn't followed.
@@ -124,6 +125,7 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
   - `voxtype-meeting-toggle` starts `bmeet-meeting-audio` (systemd user unit) right after `voxtype meeting start`. It records the default microphone and the default output's monitor (the same sources voxtype uses) with `pw-record` as 16 kHz mono WAV into `$XDG_RUNTIME_DIR/bmeet/meeting-audio/STAMP/` (RAM, mode 0700). It follows voxtype's meeting state: nothing while paused, a new part after each pause, and it stops when the meeting ends.
   - After the stop and voxtype's own export, `npu-transcribe --meeting` runs as the unit `bmeet-speakers-STAMP` (see [npu-transcribe.md](npu-transcribe.md#speakers)) and replaces the Markdown copy. The unit's `ExecStopPost` deletes the audio however the pass ends; a meeting start also removes recordings no unit works on any more.
   - `~/.config/bmeet/speakers` (`on`/`off`) switches it; the installer's `--no-speakers` writes `off`.
+  - Each part's start time goes to `part-N.start`. While it records, `$XDG_RUNTIME_DIR/bmeet/recording` names the folder, so `bmeet-chrome-host` (the native helper of BMeet's Chrome extension) can write the browser call's microphone state there (`call-mic.jsonl`). The pass leaves out what you said while the call could not hear you ([npu-transcribe.md](npu-transcribe.md#muted-in-the-call)).
 
 ## Is it really on the NPU?
 

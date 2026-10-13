@@ -11,13 +11,21 @@
 #
 # DIR is under $XDG_RUNTIME_DIR, which is in RAM (~230 MB per hour): the audio never
 # reaches the disk. voxtype-meeting-toggle deletes it once the speaker pass is done.
-#   bmeet-meeting-audio DIR
+# --mic-only (in-person meetings): only the microphone, no part-N-remote.wav.
+# Each part's start time goes to DIR/part-N.start (epoch seconds), and while it records,
+# $XDG_RUNTIME_DIR/bmeet/recording names DIR: bmeet-chrome-host writes the browser call's
+# microphone state there (DIR/call-mic.jsonl), and the start times place it in the audio.
+#   bmeet-meeting-audio [--mic-only] DIR
 # Env (tests): BMEET_STATE_FILE (default: voxtype's), BMEET_MIC_TARGET / BMEET_REMOTE_TARGET
-# (PipeWire node names instead of the default source / the default sink's monitor).
+# (PipeWire node names instead of the default source / the default sink's monitor),
+# BMEET_RECORDING_FILE (instead of $XDG_RUNTIME_DIR/bmeet/recording).
 set -u
 
-dir=${1:?usage: bmeet-meeting-audio DIR}
+mic_only=""
+[ "${1:-}" = --mic-only ] && { mic_only=1; shift; }
+dir=${1:?usage: bmeet-meeting-audio [--mic-only] DIR}
 state_file="${BMEET_STATE_FILE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voxtype/meeting_state}"
+pointer="${BMEET_RECORDING_FILE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bmeet/recording}"
 part=0 restarts=0 mic="" remote=""
 
 meeting_state() {  # first line of the daemon's state file: recording|paused|idle
@@ -26,11 +34,16 @@ meeting_state() {  # first line of the daemon's state file: recording|paused|idl
 
 start_part() {
     part=$((part + 1))
+    date +%s.%N > "$dir/part-$part.start"
     # pw-record without --target uses the default source; stream.capture.sink makes it
     # record the default sink's monitor instead. PipeWire converts to 16 kHz mono.
     pw-record ${BMEET_MIC_TARGET:+--target "$BMEET_MIC_TARGET"} --rate 16000 --channels 1 \
         --format s16 "$dir/part-$part-mic.wav" &
     mic=$!
+    if [ -n "$mic_only" ]; then
+        remote=$mic
+        return
+    fi
     pw-record -P '{ stream.capture.sink = true }' ${BMEET_REMOTE_TARGET:+--target "$BMEET_REMOTE_TARGET"} \
         --rate 16000 --channels 1 --format s16 "$dir/part-$part-remote.wav" &
     remote=$!
@@ -43,7 +56,13 @@ stop_part() {
     mic="" remote=""
 }
 
-trap 'stop_part; exit 0' INT TERM
+finish() {
+    stop_part
+    # (only our own: a newer recording may have taken it over)
+    [ "$(cat "$pointer" 2>/dev/null)" = "$dir" ] && rm -f "$pointer"
+}
+
+trap 'finish; exit 0' INT TERM
 install -d -m 0700 "$dir" || exit 1
 
 # voxtype writes "recording" a moment after `voxtype meeting start` returns.
@@ -52,6 +71,7 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 [ "$(meeting_state)" = recording ] || { echo "the meeting did not start; not recording" >&2; exit 1; }
+install -d -m 0700 "$(dirname "$pointer")" && printf '%s\n' "$dir" > "$pointer"
 
 while :; do
     case "$(meeting_state)" in
@@ -72,4 +92,4 @@ while :; do
     esac
     sleep 0.5 & wait $!   # (wait, not sleep: lets the trap run right away)
 done
-stop_part
+finish

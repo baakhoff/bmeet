@@ -67,6 +67,9 @@ for m in whisper-small-int8-ov whisper-large-v3-turbo-int8-ov; do
     d="${NPU_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-models}/$m"
     [ -f "$d/openvino_encoder_model.xml" ] && ok "model $m" || info "model $m not installed"
 done
+[ -f "${NPU_MODELS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/npu-models}/gigaam-v3-ctc-ru/model.xml" ] \
+    && ok "model GigaAM v3 for Russian (prepared for the NPU)" \
+    || info "GigaAM v3 not installed (--no-gigaam): Russian is transcribed with Whisper"
 
 echo "== meeting speakers (You / Person 1 / Person 2 ...)"
 speakers=$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers" 2>/dev/null || echo off)
@@ -76,8 +79,6 @@ if [ "$speakers" = on ]; then
     for m in pyannote-segmentation-3-0.onnx nemo_en_titanet_small.onnx; do
         [ -f "$sd/$m" ] && ok "speaker model $m" || bad "speaker model $m missing (run the installer again)"
     done
-    "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/venv/bin/python" -I -c 'import sherpa_onnx' 2>/dev/null \
-        && ok "sherpa-onnx in the venv" || bad "sherpa-onnx missing from the venv (run the installer again)"
     command -v pw-record >/dev/null && [ -x "$HOME/.local/bin/bmeet-meeting-audio" ] \
         && ok "meeting audio recorder (pw-record, bmeet-meeting-audio)" || bad "pw-record or bmeet-meeting-audio missing"
     if [ "$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices" 2>/dev/null)" = on ]; then

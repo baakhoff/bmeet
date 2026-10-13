@@ -132,9 +132,8 @@ class Voices(unittest.TestCase):
     def test_split_turn_where_remembered_people_change(self):
         boris, viktor = nt.unit(self.vec(0, 1, 0)), nt.unit(self.vec(1, 0, 0))
 
-        def embed(a, b):  # Viktor speaks 11.5-14.5 s inside a turn the segmentation gave Boris
-            mid = (a + b) / 2
-            return viktor if 11.5 <= mid < 14.5 else boris
+        def embed(spans):  # Viktor speaks 11.5-14.5 s inside a turn the segmentation gave Boris
+            return [viktor if 11.5 <= (a + b) / 2 < 14.5 else boris for a, b in spans]
         out = nt.split_by_known_voices([Turn(0, 3, 0), Turn(8, 18, 0)], embed,
                                        {"Boris": boris, "Viktor": viktor})
         self.assertEqual([(t.start, t.speaker) for t in out[:2]], [(0, 0), (8, 0)])
@@ -146,11 +145,11 @@ class Voices(unittest.TestCase):
     def test_short_or_unclear_changes_do_not_split(self):
         boris, viktor = nt.unit(self.vec(0, 1, 0)), nt.unit(self.vec(1, 0, 0))
         blip = nt.split_by_known_voices(
-            [Turn(0, 10, 0)], lambda a, b: viktor if 5 <= (a + b) / 2 < 5.6 else boris,
+            [Turn(0, 10, 0)], lambda spans: [viktor if 5 <= (a + b) / 2 < 5.6 else boris for a, b in spans],
             {"Boris": boris, "Viktor": viktor})   # Viktor for < VOICE_MIN_RUN: not a change
         self.assertEqual(blip, [Turn(0, 10, 0)])
         unknown = nt.split_by_known_voices(
-            [Turn(0, 10, 0)], lambda a, b: nt.unit(self.vec(0, 0, 1)) if a > 4 else boris,
+            [Turn(0, 10, 0)], lambda spans: [nt.unit(self.vec(0, 0, 1)) if a > 4 else boris for a, b in spans],
             {"Boris": boris})                      # someone not remembered: left to the clustering
         self.assertEqual(unknown, [Turn(0, 10, 0)])
 
@@ -195,6 +194,54 @@ class Voices(unittest.TestCase):
             self.assertEqual((tmp / "v").stat().st_mode & 0o777, 0o700)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class NpuDiarizer(unittest.TestCase):
+    """The parts of the NPU diarizer that are plain arithmetic."""
+
+    def test_cluster(self):
+        a, b = np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
+        near = lambda v, e: (v + e) / np.linalg.norm(v + e)
+        embs = np.array([near(a, [0, .1, 0]), near(b, [.1, 0, 0]), near(a, [0, 0, .1]), near(b, [0, 0, .1])])
+        self.assertEqual(nt.cluster(embs, threshold=0.4).tolist(), [0, 1, 0, 1])
+        self.assertEqual(nt.cluster(embs, threshold=1.5).tolist(), [0, 0, 0, 0])   # merges all
+        self.assertEqual(nt.cluster(embs, num_speakers=1).tolist(), [0, 0, 0, 0])
+        self.assertEqual(nt.cluster(np.zeros((0, 3))).tolist(), [])
+
+    def test_reconstruct_two_voices_over_overlapping_windows(self):
+        step = nt.SpeakerModels.SEG_STEP
+        def window(start_frame_of_change):
+            act = np.zeros((589, 3), bool)
+            act[:start_frame_of_change, 0] = True        # local voice 0 first ...
+            act[start_frame_of_change:, 1] = True        # ... then local voice 1
+            return act
+        # the change is at ~5 s: frame 296 in the first window, frame 0 in the second one
+        windows = [(0, window(296)), (step, window(0))]
+        voice = {(0, 0): 0, (0, 1): 1, (1, 1): 1}
+        turns = nt.reconstruct(windows, voice, 15 * RATE)
+        self.assertEqual([t.speaker for t in turns], [0, 1])
+        self.assertAlmostEqual(turns[0].start, 0.0, delta=0.05)
+        self.assertAlmostEqual(turns[0].end, 5.0, delta=0.1)
+        self.assertAlmostEqual(turns[1].start, 5.0, delta=0.1)
+        self.assertAlmostEqual(turns[1].end, 15.0, delta=0.2)
+
+    def test_reconstruct_drops_blips_and_closes_gaps(self):
+        act = np.zeros((589, 3), bool)
+        act[0:200, 0] = act[210:400, 0] = True           # 0.17 s gap: closed
+        act[500:510, 1] = True                           # 0.17 s blip: dropped
+        turns = nt.reconstruct([(0, act)], {(0, 0): 0, (0, 1): 1}, 10 * RATE)
+        self.assertEqual(len(turns), 1)
+        self.assertAlmostEqual(turns[0].end - turns[0].start, 400 * 270 / RATE, delta=0.05)
+
+
+class Sentences(unittest.TestCase):
+    def test_sentences_from_ctc_words(self):
+        segs = nt.sentences(words("Привет.@0.0-0.4 Как@0.6-0.8 дела?@0.8-1.1 Это@1.3-1.5 я@1.5-1.6 "
+                                  "после@3.5-3.8 паузы.@3.8-4.2 «Цитата.»@4.4-5.0 хвост@5.2-5.5"))
+        self.assertEqual([s.text for s in segs],
+                         ["Привет.", "Как дела?", "Это я", "после паузы.", "«Цитата.»", "хвост"])
+        self.assertEqual((segs[2].start, segs[2].end), (1.3, 1.6))
+        self.assertEqual(len(segs[3].words), 2)
 
 
 class Hallucinations(unittest.TestCase):

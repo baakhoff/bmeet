@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""npu-transcribe - turn audio/video files into transcripts with Whisper on the Intel NPU.
+"""npu-transcribe - turn audio/video files into transcripts on the Intel NPU.
 
-Uses openvino_genai.WhisperPipeline on the Intel NPU (Core Ultra) and falls back
-to the CPU when the NPU is missing or fails. The installer runs it in its own
-venv through a wrapper in ~/.local/bin. Audio is decoded by the
-ffmpeg CLI straight into memory (16 kHz mono float32, no temp files) and fed to
-Whisper in blocks of at most 30 s (one Whisper window) cut at the quietest moment, so
+Russian is transcribed with GigaAM v3 (Sber), every other language with Whisper (OpenVINO
+GenAI's WhisperPipeline), which also detects the language. All models run on the Intel NPU
+(Core Ultra); the CPU is only the fallback when the NPU is missing or fails. The installer
+runs it in its own venv through a wrapper in ~/.local/bin. Audio is decoded by the
+ffmpeg CLI straight into memory (16 kHz mono float32, no temp files) and fed to the
+model in blocks of at most 30 s (one Whisper window) cut at the quietest moment, so
 memory stays flat for multi-hour recordings.
 
 Outputs (next to the input file unless --out is given):
@@ -16,8 +17,9 @@ Existing files are never overwritten (your own NAME.md notes, downloaded NAME.sr
 subtitles, an earlier transcript): the outputs then become NAME.2.*, NAME.3.*, ...
 unless --overwrite is given.
 
-With --speakers, the voices are told apart (sherpa-onnx speaker diarization on the
-CPU) and every line is labelled Speaker 1, Speaker 2, ... in the order they first speak.
+With --speakers, the voices are told apart (pyannote segmentation + TitaNet fingerprints,
+also on the NPU) and every line is labelled Speaker 1, Speaker 2, ... in the order they
+first speak.
 --meeting DIR turns a BMeet meeting recording (DIR/part-N-mic.wav + part-N-remote.wav,
 written by bmeet-meeting-audio) into a Markdown transcript: the microphone is "You",
 the voices in the system audio become Person 1, Person 2, ...
@@ -27,11 +29,16 @@ Examples:
   npu-transcribe --model small --format srt,md,txt --out ~/transcripts *.mp4
   npu-transcribe --language ru --translate interview.ogg   # Russian speech -> English text
   npu-transcribe --speakers interview.m4a                    # Speaker 1: ... Speaker 2: ...
-  npu-transcribe --speakers 3 panel.mp4                      # exactly three voices
+  npu-transcribe --num-speakers 3 panel.mp4                  # exactly three voices
+  npu-transcribe --engine whisper russian-talk.ogg           # Whisper even for Russian
   npu-transcribe --meeting DIR --output 2026-10-12_1041-meeting.md
 
 Notes:
-  * Models: turbo (default when installed) is the more accurate one and on the
+  * Russian (given with --language ru, or detected) goes to GigaAM v3 when it is installed:
+    ~20 % fewer word errors than Whisper turbo on Russian conversation and ~15x faster,
+    but it mangles English words inside Russian speech. --engine whisper keeps Whisper;
+    --translate always uses Whisper (docs/npu-transcribe.md).
+  * Whisper models: turbo (default when installed) is the more accurate one and on the
     NPU about as fast as small. small needs less RAM (~2.6 vs ~3.9 GB RSS), compiles faster and is
     ~3x faster on the CPU, so it is the better choice without the NPU.
   * The first NPU run compiles the model (small ~1 min, turbo ~4 min); the result
@@ -54,13 +61,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import fcntl
 import html
 import itertools
 import json
 import math
-import multiprocessing
 import os
 import re
 import shutil
@@ -80,19 +85,28 @@ from typing import Generator, Iterator
 # stub when the module cannot be imported, so make it unimportable for us.
 sys.modules["openvino_telemetry"] = None
 
+# The models run on the NPU. numpy's BLAS would start a thread per core for the small matrix
+# products of the audio features, and they busy-wait afterwards: in a 5-minute meeting that
+# was 12 s of CPU instead of 0.9 s, for the same wall time. One thread is plenty.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 try:
     import numpy as np  # noqa: E402  (must come after the telemetry block above)
 except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
     "turbo": MODELS_DIR / "whisper-large-v3-turbo-int8-ov",
     "small": MODELS_DIR / "whisper-small-int8-ov",
 }
+# GigaAM v3 e2e CTC (Sber, MIT; Russian only, with punctuation): sherpa-onnx's export, made
+# NPU-safe once by transcribe/prepare-models (fixed 30 s input; docs/npu-transcribe.md).
+GIGAAM_DIR = MODELS_DIR / "gigaam-v3-ctc-ru"
 CACHE_DIR = Path.home() / ".cache/npu-ov-cache"  # compiled NPU blobs
 HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
                or Path.home() / ".local/share/npu-transcribe/history.jsonl")
@@ -116,17 +130,18 @@ HALLUCINATIONS = (
 )
 PARAGRAPH_SECONDS = 30       # Markdown/text paragraph length (approximate)
 FORMATS = ("srt", "md", "txt")
-# Speaker diarization (sherpa-onnx): pyannote segmentation-3.0 finds who speaks when in
-# 10 s windows, a speaker-embedding model fingerprints each voice, and the fingerprints
-# are clustered. The installer downloads both models (sha256-pinned).
+# Speaker diarization on the NPU (SpeakerModels): pyannote segmentation-3.0 finds who speaks
+# when in 10 s windows, TitaNet-small fingerprints each voice, the fingerprints are
+# clustered. The installer downloads both models (sha256-pinned, sherpa-onnx's exports).
 SPEAKER_MODELS = MODELS_DIR / "speaker-diarization"
 SEGMENTATION_MODEL = SPEAKER_MODELS / "pyannote-segmentation-3-0.onnx"
 EMBEDDING_MODEL = SPEAKER_MODELS / "nemo_en_titanet_small.onnx"  # NVIDIA TitaNet-small, CC-BY-4.0
-# Clustering threshold for "same voice" when the number of speakers is not given: higher
-# merges more. With TitaNet, 0.8-0.9 found the right number of people in every test call
-# (0.7 split people, 1.0 merged two); see docs/npu-transcribe.md. Env NPU_SPEAKER_THRESHOLD
+# Clustering threshold (cosine distance, average linkage) for "same voice" when the number
+# of speakers is not given: higher merges more. On calls of 2-4 LibriSpeech readers through
+# Opus, 0.3-0.65 found the right number of people every time and 0.4 put the most speech
+# under the right one; 0.7 merged two (docs/npu-transcribe.md). Env NPU_SPEAKER_THRESHOLD
 # overrides it: lower when two people end up as one, higher when one person is split.
-SPEAKER_THRESHOLD = float(os.environ.get("NPU_SPEAKER_THRESHOLD") or 0.85)
+SPEAKER_THRESHOLD = float(os.environ.get("NPU_SPEAKER_THRESHOLD") or 0.4)
 WORD_SMOOTH_SECONDS = 0.6     # a speaker change shorter than this inside a sentence is noise
 # Remembered voices (--voices): a voice in a new meeting gets a remembered name when its
 # fingerprint is at least this similar (cosine). TitaNet on LibriSpeech readers through
@@ -139,6 +154,7 @@ VOICE_MARGIN = 0.1            # ... and at least this much more similar than to 
 # most like (or the nearest one in time); a voice at least SAME_VOICE similar to a bigger
 # one joins it.
 MIN_VOICE_SECONDS = 15
+MIN_LOCAL_SECONDS = 0.5       # a voice in a 10 s window needs this much clean speech to be fingerprinted
 MIN_VOICE_SHARE = 0.05
 SAME_VOICE = 0.65
 NEAREST_SECONDS = 30          # words no turn covers go to the nearest speaker within this
@@ -394,6 +410,112 @@ class Transcript:
     dropped: int     # segments discarded as silence hallucinations
 
 
+# --------------------------------------------------------------------------- gigaam
+
+def gigaam_ready() -> bool:
+    return all((GIGAAM_DIR / f).is_file() for f in ("model.xml", "model.bin", "tokens.txt"))
+
+
+class GigaAM:
+    """GigaAM v3 e2e CTC: Russian speech to punctuated text. On Russian conversation it made
+    ~20 % fewer word errors than Whisper large-v3-turbo, at ~200x realtime on the NPU, but
+    it knows no other language and mangles English words (docs/npu-transcribe.md)."""
+    language = "ru"
+    word_timestamps = True      # always: from the CTC output frames
+    MELS, N_FFT, HOP = 64, 320, 160
+    FRAMES = 1 + (BLOCK_SECONDS * SAMPLE_RATE - N_FFT) // HOP   # 2999 per 30 s block
+    STEP = 4 * HOP / SAMPLE_RATE                                # 40 ms per output frame
+
+    def __init__(self, devices: list[str]) -> None:
+        import openvino as ov
+        self.devices, self.device, self.model_dir = devices, "", GIGAAM_DIR
+        self.tokens = [line.rsplit(" ", 1)[0]
+                       for line in (GIGAAM_DIR / "tokens.txt").read_text(encoding="utf-8").splitlines()]
+        self.blank = len(self.tokens) - 1
+        self.window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.N_FFT) / self.N_FFT)  # periodic Hann
+        self.mel = self.mel_filters()
+        core = ov.Core()
+        while True:
+            dev = self.devices[0]
+            note = " (the first NPU run compiles it: ~1 min, cached afterwards)" if dev == "NPU" else ""
+            log(f"loading GigaAM v3 on {dev}{note}")
+            t0 = time.monotonic()
+            try:
+                self.req = core.compile_model(str(GIGAAM_DIR / "model.xml"), dev,
+                                              {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
+                                              ).create_infer_request()
+            except Exception as exc:
+                reason = " ".join(f"loading on {dev} failed: {exc}".split())
+                if len(self.devices) < 2:
+                    raise RuntimeError(reason)
+                log(f"WARNING: {reason}; falling back to {self.devices[1]}")
+                self.devices.pop(0)
+                continue
+            self.device = dev
+            log(f"model ready on {dev} in {time.monotonic() - t0:.1f} s")
+            return
+
+    @classmethod
+    def mel_filters(cls) -> np.ndarray:
+        """torchaudio's melscale_fbanks(161 bins, 0-8000 Hz, 64 mels, htk, no norm)"""
+        mel = lambda f: 2595.0 * np.log10(1.0 + f / 700.0)
+        hz = lambda m: 700.0 * (10 ** (m / 2595.0) - 1.0)
+        freqs = np.linspace(0, SAMPLE_RATE // 2, cls.N_FFT // 2 + 1)
+        pts = hz(np.linspace(mel(0.0), mel(SAMPLE_RATE / 2), cls.MELS + 2))
+        slopes = pts[None, :] - freqs[:, None]
+        down = -slopes[:, :-2] / np.diff(pts)[:-1]
+        up = slopes[:, 2:] / np.diff(pts)[1:]
+        return np.maximum(0.0, np.minimum(down, up))
+
+    def features(self, x: np.ndarray) -> np.ndarray:
+        """(64, frames) log-mel like gigaam.preprocess.FeatureExtractor (center=False)"""
+        n = 1 + (x.size - self.N_FFT) // self.HOP
+        idx = np.arange(self.N_FFT)[None, :] + self.HOP * np.arange(n)[:, None]
+        power = np.abs(np.fft.rfft(x[idx] * self.window, n=self.N_FFT)) ** 2
+        return np.log(np.clip(power @ self.mel, 1e-9, 1e9)).T.astype(np.float32)
+
+    def words(self, block: np.ndarray) -> list[Word]:
+        """A block (<= 30 s) -> its words, timed from the CTC output frames; punctuation
+        stays attached, and like Whisper's words each starts with a space."""
+        block = np.pad(block[:BLOCK_SECONDS * SAMPLE_RATE], (0, max(0, self.N_FFT - block.size)))
+        n = 1 + (block.size - self.N_FFT) // self.HOP
+        feats = np.zeros((1, self.MELS, self.FRAMES), np.float32)
+        feats[0, :, :n] = self.features(block)[:, :self.FRAMES]
+        out = self.req.infer({"features": feats, "feature_lengths": np.array([n], np.int64)})
+        ids = next(iter(out.values()))[0, :(n + 3) // 4].argmax(axis=-1)
+        words: list[Word] = []
+        prev = self.blank
+        for i, tok in enumerate(ids):
+            if tok != prev and tok != self.blank:
+                piece, at = self.tokens[tok], i * self.STEP
+                if piece.startswith("▁") or not words:
+                    words.append(Word(at, at + self.STEP, " " + piece.lstrip("▁")))
+                else:
+                    words[-1].end, words[-1].text = at + self.STEP, words[-1].text + piece
+            prev = tok
+        return [w for w in words if w.text.strip()]
+
+
+def sentences(words: list[Word], pause: float = 1.5) -> list[Segment]:
+    """Segments for a CTC model's words: one per sentence, or broken at a longer pause."""
+    out: list[Segment] = []
+    current: list[Word] = []
+
+    def close() -> None:
+        if current:
+            out.append(Segment(current[0].start, current[-1].end,
+                               " ".join("".join(w.text for w in current).split()), list(current)))
+            current.clear()
+    for w in words:
+        if current and w.start - current[-1].end > pause:
+            close()
+        current.append(w)
+        if w.text.rstrip("»\"')").endswith((".", "!", "?", "…")):
+            close()
+    close()
+    return out
+
+
 # --------------------------------------------------------------------------- progress
 
 class Progress:
@@ -443,7 +565,8 @@ class Progress:
 
 # --------------------------------------------------------------------------- transcription
 
-def transcribe(whisper: Whisper, name: str, blocks: Generator[tuple[float, np.ndarray], None, None],
+def transcribe(whisper: Whisper | GigaAM, name: str,
+               blocks: Generator[tuple[float, np.ndarray], None, None],
                duration: float | None, gen_kwargs: dict) -> Transcript:
     """Transcribe one recording block by block (blocks: audio_blocks() or array_blocks()).
 
@@ -451,6 +574,8 @@ def transcribe(whisper: Whisper, name: str, blocks: Generator[tuple[float, np.nd
     and then pinned for the rest of the file (like the openai-whisper CLI does);
     this keeps a file consistent and sidesteps the NPU detection bug above.
     """
+    if isinstance(whisper, GigaAM):
+        return transcribe_ctc(whisper, name, blocks, duration)
     language = gen_kwargs.get("language", "").strip("<|>")
     if not language:
         whisper.ready_for_detection()
@@ -496,6 +621,26 @@ def transcribe(whisper: Whisper, name: str, blocks: Generator[tuple[float, np.nd
     return Transcript(segments, done, time.monotonic() - t0, language or "?", dropped)
 
 
+def transcribe_ctc(model: GigaAM, name: str, blocks: Generator[tuple[float, np.ndarray], None, None],
+                   duration: float | None) -> Transcript:
+    """transcribe() for GigaAM: no language detection, no timestamp tokens, no stock phrases."""
+    progress = Progress(name, duration)
+    segments: list[Segment] = []
+    done = 0.0
+    t0 = time.monotonic()
+    try:
+        for start, block in blocks:
+            if peak_dbfs(block) >= SILENCE_DBFS:
+                segments += sentences([Word(start + w.start, start + w.end, w.text)
+                                       for w in model.words(block)])
+            done = start + block.size / SAMPLE_RATE
+            progress.update(done)
+    finally:
+        blocks.close()
+        progress.close()
+    return Transcript(segments, done, time.monotonic() - t0, model.language, 0)
+
+
 # --------------------------------------------------------------------------- speakers
 
 @dataclass
@@ -514,58 +659,241 @@ def unit(v) -> np.ndarray:
     return a / (np.linalg.norm(a) or 1.0)
 
 
-def diarize(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = False,
+class SpeakerModels:
+    """Who speaks when, on the NPU (OpenVINO; the CPU only when there is no NPU):
+    pyannote segmentation-3.0 finds up to 3 voices in each 10 s window, TitaNet-small
+    fingerprints them. Two patches make them right on the NPU's fp16 (titanet_npu_safe)."""
+    SEG_WINDOW = 10 * SAMPLE_RATE           # the segmentation model's input
+    SEG_STEP = 5 * SAMPLE_RATE              # windows overlap by half
+    FRAME = 270                             # samples per segmentation frame (receptive field shift)
+    CENTRE = 991 // 2                       # ... and the middle of a frame's receptive field
+    POWERSET = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                         [1, 1, 0], [1, 0, 1], [0, 1, 1]], bool)  # its 7 classes: who talks
+    EMB_SECONDS = 4.0                       # TitaNet input (shorter pieces are padded + masked)
+    EMB_BATCH = 16                          # fingerprints per NPU call: 13 ms each instead of 46
+    MELS, N_FFT, WIN, HOP = 80, 512, 400, 160
+
+    def __init__(self, devices: list[str]) -> None:
+        import openvino as ov
+        if missing := speaker_models_missing():
+            raise RuntimeError(f"speaker model missing: {missing[0]} - run the installer again")
+        core = ov.Core()
+        self.emb_frames = int(self.EMB_SECONDS * SAMPLE_RATE / self.HOP) + 1
+        while True:
+            dev = devices[0]
+            try:
+                seg = core.read_model(str(SEGMENTATION_MODEL))
+                seg.reshape({"x": [1, 1, self.SEG_WINDOW]})
+                emb = core.read_model(str(EMBEDDING_MODEL))
+                emb.reshape({"audio_signal": [self.EMB_BATCH, self.MELS, self.emb_frames],
+                             "length": [self.EMB_BATCH]})
+                titanet_npu_safe(emb)
+                config = {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
+                self.seg = core.compile_model(seg, dev, config).create_infer_request()
+                self.emb = core.compile_model(emb, dev, config).create_infer_request()
+            except Exception as exc:
+                reason = " ".join(f"speaker models on {dev} failed: {exc}".split())
+                if len(devices) < 2:
+                    raise RuntimeError(reason)
+                log(f"WARNING: {reason}; falling back to {devices[1]}")
+                devices = devices[1:]
+                continue
+            self.device = dev
+            break
+        self.emb_out = next(o for o in self.emb.model_outputs if "emb" in o.get_any_name())
+        self.mel = self.slaney_filters()
+        win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.WIN) / self.WIN)  # periodic Hann
+        self.window = np.pad(win, ((self.N_FFT - self.WIN) // 2, (self.N_FFT - self.WIN + 1) // 2))
+
+    @classmethod
+    def slaney_filters(cls) -> np.ndarray:
+        """librosa's mel filters (sr 16000, n_fft 512, 80 mels, slaney scale and norm): (257, 80)"""
+        f_sp, min_log_hz, min_log_mel, logstep = 200.0 / 3, 1000.0, 15.0, np.log(6.4) / 27.0
+        to_mel = lambda f: np.where(f >= min_log_hz, min_log_mel + np.log(np.maximum(f, 1e-10) / min_log_hz)
+                                    / logstep, f / f_sp)
+        to_hz = lambda m: np.where(m >= min_log_mel, min_log_hz * np.exp(logstep * (m - min_log_mel)), f_sp * m)
+        hz = to_hz(np.linspace(to_mel(np.float64(0)), to_mel(np.float64(SAMPLE_RATE / 2)), cls.MELS + 2))
+        freqs = np.linspace(0, SAMPLE_RATE / 2, cls.N_FFT // 2 + 1)
+        ramps = hz[:, None] - freqs[None, :]
+        w = np.maximum(0, np.minimum(-ramps[:-2] / np.diff(hz)[:-1, None], ramps[2:] / np.diff(hz)[1:, None]))
+        return (w * (2.0 / (hz[2:] - hz[:-2]))[:, None]).T.astype(np.float32)
+
+    def features(self, x: np.ndarray) -> np.ndarray:
+        """NeMo's: preemphasis 0.97, centred STFT, power, log mel, normalised per feature"""
+        x = np.concatenate([x[:1], x[1:] - 0.97 * x[:-1]])
+        x = np.pad(x, (self.N_FFT // 2, self.N_FFT // 2))
+        n = 1 + (x.size - self.N_FFT) // self.HOP
+        idx = np.arange(self.N_FFT)[None, :] + self.HOP * np.arange(n)[:, None]
+        feats = np.log((np.abs(np.fft.rfft(x[idx] * self.window, n=self.N_FFT)) ** 2) @ self.mel + 2 ** -24).T
+        std = feats.std(axis=1, ddof=1, keepdims=True) if n > 1 else 1.0
+        return ((feats - feats.mean(axis=1, keepdims=True)) / (std + 1e-5)).astype(np.float32)
+
+    def segment(self, samples: np.ndarray) -> list[tuple[int, np.ndarray]]:
+        """[(window start in samples, (frames, 3) bool: which local voice talks)]"""
+        out = []
+        for start in range(0, max(1, samples.size - self.SEG_WINDOW // 2), self.SEG_STEP):
+            window = samples[start:start + self.SEG_WINDOW]
+            if peak_dbfs(window) < SILENCE_DBFS:
+                continue
+            x = np.zeros((1, 1, self.SEG_WINDOW), np.float32)
+            x[0, 0, :window.size] = window
+            logits = next(iter(self.seg.infer({"x": x}).values()))[0]
+            out.append((start, self.POWERSET[logits.argmax(axis=-1)]))
+        return out
+
+    def embed(self, pieces: list[np.ndarray]) -> np.ndarray:
+        """(n, 192) unit-length fingerprints of the pieces (each up to EMB_SECONDS)"""
+        out = np.zeros((len(pieces), 192))
+        for b in range(0, len(pieces), self.EMB_BATCH):
+            batch = pieces[b:b + self.EMB_BATCH]
+            feats = np.zeros((self.EMB_BATCH, self.MELS, self.emb_frames), np.float32)
+            lengths = np.ones(self.EMB_BATCH, np.int64)
+            for i, piece in enumerate(batch):
+                f = self.features(piece[:int(self.EMB_SECONDS * SAMPLE_RATE)])[:, :self.emb_frames]
+                feats[i, :, :f.shape[1]], lengths[i] = f, f.shape[1]
+            v = self.emb.infer({"audio_signal": feats, "length": lengths})[self.emb_out][:len(batch)]
+            out[b:b + len(batch)] = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
+        return out
+
+
+def titanet_npu_safe(model, scale: float = 64.0) -> None:
+    """TitaNet's attentive statistics pooling underflows in the NPU's fp16 (attention
+    weights ~1/T times squared deviations ~1e-3 give ~1e-6), and its fingerprints came out
+    ~0.67 similar to the CPU's. Feed the four statistics ops scale*x and scale the means
+    and standard deviations back where they leave: the same maths, now 0.9993 similar."""
+    import openvino.opset13 as ops
+    by = {op.get_friendly_name().rsplit("/", 1)[-1]: op for op in model.get_ordered_ops()
+          if "/decoder/_pooling/" in op.get_friendly_name()}
+    x = by["Sub"].input_value(0)
+    xs = ops.multiply(x, ops.constant(np.float32(scale)))
+    for name in ("Mul", "Mul_2"):            # weights * x
+        node = by[name]
+        for i, iv in enumerate(node.input_values()):
+            if iv.get_node().get_friendly_name() == x.get_node().get_friendly_name():
+                node.input(i).replace_source_output(xs.output(0))
+    for name in ("Sub", "Sub_1"):            # x - mean
+        by[name].input(0).replace_source_output(xs.output(0))
+    inv = ops.constant(np.float32(1.0 / scale))
+    by["Expand"].input(0).replace_source_output(ops.multiply(by["Unsqueeze_4"].output(0), inv).output(0))
+    by["Unsqueeze_9"].input(0).replace_source_output(ops.multiply(by["Sqrt"].output(0), inv).output(0))
+    out = ops.multiply(by["Concat_5"].output(0), inv)
+    for target in list(by["Concat_5"].output(0).get_target_inputs()):
+        if target.get_node().get_friendly_name() != out.get_friendly_name():
+            target.replace_source_output(out.output(0))
+    model.validate_nodes_and_infer_types()
+
+
+def cluster(embs: np.ndarray, num_speakers: int = 0, threshold: float | None = None) -> np.ndarray:
+    """Average-linkage agglomerative clustering of unit vectors by cosine distance: merge
+    while the closest pair of clusters is nearer than `threshold` (or down to num_speakers).
+    Returns cluster numbers 0, 1, ... in order of first appearance."""
+    threshold = SPEAKER_THRESHOLD if threshold is None else threshold
+    n = len(embs)
+    if n == 0:
+        return np.zeros(0, int)
+    sim = embs @ embs.T
+    np.fill_diagonal(sim, -np.inf)
+    size, alive, label = np.ones(n), np.ones(n, bool), np.arange(n)
+    while alive.sum() > max(1, num_speakers):
+        i, j = np.unravel_index(np.argmax(sim), sim.shape)
+        if not num_speakers and 1 - sim[i, j] >= threshold:
+            break
+        row = (size[i] * sim[i] + size[j] * sim[j]) / (size[i] + size[j])
+        sim[i], sim[:, i] = row, row
+        sim[i, i] = -np.inf
+        sim[j], sim[:, j] = -np.inf, -np.inf
+        size[i] += size[j]
+        alive[j] = False
+        label[label == j] = i
+    order: dict[int, int] = {}
+    return np.array([order.setdefault(int(x), len(order)) for x in label])
+
+
+def reconstruct(windows: list[tuple[int, np.ndarray]], voice: dict[tuple[int, int], int],
+                total: int, frame: int = SpeakerModels.FRAME, centre: int = SpeakerModels.CENTRE,
+                min_on: float = 0.3, min_off: float = 0.5) -> list[Turn]:
+    """Turns from the windows' local voices (pyannote's way): add up each voice's activity
+    over the overlapping windows, estimate how many talk in each frame, keep that many of
+    the most active voices, then drop turns under min_on and close gaps under min_off."""
+    voices = max(voice.values(), default=-1) + 1
+    if not voices:
+        return []
+    frames = total // frame + 1
+    active, cover, count = np.zeros((frames, voices)), np.zeros(frames), np.zeros(frames)
+    for w, (start, act) in enumerate(windows):
+        g0 = int(round(start / frame))
+        n = min(act.shape[0], frames - g0)
+        if n <= 0:
+            continue
+        cover[g0:g0 + n] += 1
+        count[g0:g0 + n] += act[:n].sum(axis=1)
+        for local in range(act.shape[1]):
+            if (w, local) in voice:
+                active[g0:g0 + n, voice[(w, local)]] += act[:n, local]
+    talking = np.rint(count / np.maximum(cover, 1)).astype(int)
+    ranked = np.argsort(-active, axis=1)
+    on = np.zeros_like(active, bool)
+    rows = np.arange(frames)
+    for r in range(min(voices, int(talking.max(initial=0)))):
+        pick = talking > r
+        on[rows[pick], ranked[pick, r]] = active[rows[pick], ranked[pick, r]] > 0
+    to_time = lambda g: (g * frame + centre) / SAMPLE_RATE
+    turns = []
+    for v in range(voices):
+        runs, prev = [], None
+        for g in np.flatnonzero(on[:, v]):
+            if prev is not None and g == prev + 1:
+                runs[-1][1] = g
+            else:
+                runs.append([g, g])
+            prev = g
+        merged: list[list[float]] = []
+        for a, b in runs:
+            s, e = to_time(a) - frame / 2 / SAMPLE_RATE, to_time(b) + frame / 2 / SAMPLE_RATE
+            if merged and s - merged[-1][1] < min_off:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+        turns += [Turn(max(0.0, s), e, v) for s, e in merged if e - s >= min_on]
+    turns.sort(key=lambda t: t.start)
+    order: dict[int, int] = {}
+    return [Turn(t.start, t.end, order.setdefault(t.speaker, len(order))) for t in turns]
+
+
+def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
             known: dict[str, list[list[float]]] | None = None
             ) -> tuple[list[Turn], dict[int, list[float]], dict[int, str]]:
-    """Who speaks when, on the CPU (sherpa-onnx). num_speakers=0: find out how many.
-
-    Returns the turns, each voice's fingerprint (with fingerprints or known; see
-    voice_prints) and the remembered names found among the voices (known; see identify)."""
-    try:
-        import sherpa_onnx
-    except ImportError:
-        raise RuntimeError("sherpa-onnx is missing from the venv - run the installer again")
-    if missing := speaker_models_missing():
-        raise RuntimeError(f"speaker model missing: {missing[0]} - run the installer again")
-    threads = max(1, min(4, (os.cpu_count() or 2) // 2))
-    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
-        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
-                model=str(SEGMENTATION_MODEL)),
-            num_threads=threads),
-        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-            model=str(EMBEDDING_MODEL), num_threads=threads),
-        clustering=sherpa_onnx.FastClusteringConfig(
-            num_clusters=num_speakers or -1, threshold=SPEAKER_THRESHOLD),
-        min_duration_on=0.3, min_duration_off=0.5)
-    if not config.validate():
-        raise RuntimeError("the speaker models could not be loaded - run the installer again")
-    sd = sherpa_onnx.OfflineSpeakerDiarization(config)
-    log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, {threads} CPU threads)")
+    """Who speaks when. num_speakers=0: find out how many. Returns the turns, each voice's
+    fingerprint (voice_prints) and the remembered names found among them (identify)."""
+    log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, on {models.device})")
     t0 = time.monotonic()
-    result = sd.process(samples).sort_by_start_time()
-    order: dict[int, int] = {}
-    turns = [Turn(r.start, r.end, order.setdefault(r.speaker, len(order))) for r in result]
+    windows = models.segment(samples)
+    keys, pieces = [], []
+    for w, (start, act) in enumerate(windows):
+        alone = act & (act.sum(axis=1, keepdims=True) == 1)   # without overlapping speech
+        for local in range(act.shape[1]):
+            frames = np.flatnonzero(alone[:, local])
+            if frames.size * models.FRAME < MIN_LOCAL_SECONDS * SAMPLE_RATE:
+                continue
+            spans = [samples[start + f * models.FRAME:start + (f + 1) * models.FRAME] for f in frames]
+            keys.append((w, local))
+            pieces.append(np.concatenate(spans))
+    labels = cluster(models.embed(pieces), num_speakers)
+    turns = reconstruct(windows, dict(zip(keys, (int(x) for x in labels))), samples.size)
     prints: dict[int, list[float]] = {}
     names: dict[int, str] = {}
     if turns:
-        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-            model=str(EMBEDDING_MODEL), num_threads=threads))
-
-        def embed(start: float, end: float) -> np.ndarray:
-            stream = extractor.create_stream()
-            stream.accept_waveform(SAMPLE_RATE, samples[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)])
-            stream.input_finished()
-            return unit(extractor.compute(stream))
+        def embed_spans(spans: list[tuple[float, float]]) -> np.ndarray:
+            return models.embed([samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])
 
         if known:
-            turns = split_by_known_voices(turns, embed, remembered_voices(known))
-        vecs: dict[int, tuple[np.ndarray, float]] = {}
-        for i, t in enumerate(turns):
-            if t.end - t.start >= 1.0:
-                mid = (t.start + t.end) / 2
-                start, end = max(t.start, mid - 7.5), min(t.end, mid + 7.5)  # at most 15 s
-                vecs[i] = (embed(start, end), end - start)
+            turns = split_by_known_voices(turns, embed_spans, remembered_voices(known))
+        long = [i for i, t in enumerate(turns) if t.end - t.start >= 1.0]
+        spans = []
+        for i in long:   # the middle EMB_SECONDS of each turn
+            mid, half = (turns[i].start + turns[i].end) / 2, models.EMB_SECONDS / 2
+            spans.append((max(turns[i].start, mid - half), min(turns[i].end, mid + half)))
+        vecs = {i: (v, b - a) for i, v, (a, b) in zip(long, embed_spans(spans), spans)}
         turns, vecs = merge_voices(turns, vecs)
         if known:
             turns, names = identify(turns, vecs, known)
@@ -631,16 +959,20 @@ def who_is(v: np.ndarray, voices: dict[str, np.ndarray]) -> str | None:
 
 def split_by_known_voices(turns: list[Turn], embed, voices: dict[str, np.ndarray]) -> list[Turn]:
     """Split turns in which remembered people take turns: with similar voices the
-    segmentation can miss the change. embed(start, end) -> embedding. Turns of
+    segmentation can miss the change. embed([(start, end), ...]) -> embeddings. Turns of
     2 * VOICE_WINDOW or more are checked in VOICE_WINDOW windows every VOICE_HOP; a
     remembered person heard for VOICE_MIN_RUN or more gets their own piece."""
+    long = [t for t in turns if t.end - t.start >= 2 * VOICE_WINDOW]
+    all_starts = {id(t): np.arange(t.start, t.end - VOICE_WINDOW + 1e-6, VOICE_HOP) for t in long}
+    spans = [(a, a + VOICE_WINDOW) for t in long for a in all_starts[id(t)]]
+    vectors = iter(embed(spans) if spans else [])
     out: list[Turn] = []
     for t in turns:
         if t.end - t.start < 2 * VOICE_WINDOW:
             out.append(t)
             continue
-        starts = np.arange(t.start, t.end - VOICE_WINDOW + 1e-6, VOICE_HOP)
-        ids = [who_is(embed(a, a + VOICE_WINDOW), voices) for a in starts]
+        starts = all_starts[id(t)]
+        ids = [who_is(next(vectors), voices) for _ in starts]
         for order in (range(len(ids)), reversed(range(len(ids)))):  # unclear windows: neighbour's
             last = None
             for i in order:
@@ -714,18 +1046,6 @@ def voice_prints(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]) -
         if acc.size:
             prints[voice] = [round(float(x), 5) for x in unit(acc)]
     return prints
-
-
-def diarize_aside(samples: np.ndarray, num_speakers: int = 0, fingerprints: bool = False,
-                  known: dict[str, list[list[float]]] | None = None) -> concurrent.futures.Future:
-    """diarize() in a second process, so the CPU tells voices apart while Whisper runs on
-    the NPU (sherpa-onnx holds the GIL: in a thread Whisper would just wait). "spawn",
-    not fork: the parent may hold the NPU."""
-    pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
-    try:
-        return pool.submit(diarize, samples, num_speakers, fingerprints, known)
-    finally:
-        pool.shutdown(wait=False)
 
 
 def speaker_at(turns: list[Turn], start: float, end: float) -> int | None:
@@ -1115,6 +1435,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true",
                    help="replace existing NAME.srt/.md/.txt instead of writing NAME.2.* etc.")
     p.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    p.add_argument("--engine", default="auto", choices=("auto", "whisper", "gigaam"),
+                   help="speech model: auto (default: GigaAM for Russian if installed, Whisper for "
+                        "other languages and --translate), whisper, or gigaam (Russian only)")
     p.add_argument("--speakers", action="store_true",
                    help="tell the voices apart: Speaker 1, Speaker 2, ... (in the order they first speak)")
     p.add_argument("--num-speakers", type=int, default=0, metavar="N",
@@ -1153,6 +1476,68 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+class Engines:
+    """The models, each loaded when first needed (on the NPU; the CPU only without one):
+    Whisper (language detection, every language but Russian, translation), GigaAM
+    (Russian) and the speaker models."""
+
+    def __init__(self, args: argparse.Namespace, model_dir: Path, devices: list[str]) -> None:
+        self.args, self.model_dir, self.devices = args, model_dir, devices
+        self._whisper: Whisper | None = None
+        self._gigaam: GigaAM | None = None
+        self._speakers: SpeakerModels | None = None
+
+    def whisper(self) -> Whisper:
+        if self._whisper is None:
+            self._whisper = Whisper(self.model_dir, list(self.devices), word_timestamps=self.args.speakers)
+        return self._whisper
+
+    def gigaam(self) -> GigaAM:
+        if self._gigaam is None:
+            self._gigaam = GigaAM(list(self.devices))
+        return self._gigaam
+
+    def speakers(self) -> SpeakerModels:
+        if self._speakers is None:
+            self._speakers = SpeakerModels(list(self.devices))
+        return self._speakers
+
+    def detect(self, blocks: Generator[tuple[float, np.ndarray], None, None]) -> str:
+        """Whisper's guess of the language of the first block with sound ("?" if none)."""
+        try:
+            for _, block in blocks:
+                if peak_dbfs(block) >= SILENCE_DBFS:
+                    whisper = self.whisper()
+                    whisper.ready_for_detection()
+                    result = whisper.generate(block, return_timestamps=False, task="transcribe")
+                    language = (result.language or "?").strip("<|>")
+                    log(f"language: {language} (detected from the first 30 s with sound)")
+                    return language
+        finally:
+            blocks.close()
+        return "?"
+
+    def choose(self, language: str, blocks) -> tuple[Whisper | GigaAM, str]:
+        """(the model for this recording, its language): GigaAM for Russian unless told
+        otherwise (--engine) or translating. With --language auto the language is detected
+        once here, on `blocks`, so that every track of a meeting gets the same one."""
+        if self.args.engine == "gigaam":
+            blocks.close()
+            return self.gigaam(), "ru"
+        if language == "auto":
+            language = self.detect(blocks)
+        else:
+            blocks.close()
+        if (self.args.engine == "auto" and language == "ru" and not self.args.translate
+                and gigaam_ready()):
+            return self.gigaam(), "ru"
+        return self.whisper(), language
+
+
+def engine_label(engine: Whisper | GigaAM) -> str:
+    return "gigaam-v3-ctc" if isinstance(engine, GigaAM) else engine.model_dir.name
+
+
 def save_meeting_voices(folder: Path, transcript: Path, people: dict[str, list[float]]) -> None:
     """FOLDER/meetings/<transcript name>.json: this meeting's voice fingerprints by label, so
     the BMeet app can remember the people you name. Private (0700 folders, 0600 file)."""
@@ -1164,9 +1549,8 @@ def save_meeting_voices(folder: Path, transcript: Path, people: dict[str, list[f
     write_atomic(meetings / f"{transcript.stem}.json", json.dumps(data) + "\n", private=True)
 
 
-def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Path,
-                       gen_kwargs: dict) -> int:
-    """--meeting DIR: both tracks through Whisper, the system audio split by voice, your
+def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: dict) -> int:
+    """--meeting DIR: both tracks transcribed, the system audio split by voice, your
     microphone as "You", interleaved by time into --output (Markdown)."""
     folder, out = args.meeting.expanduser(), args.output.expanduser()
     try:
@@ -1185,19 +1569,21 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
         audible = {name: samples.size > 0 and peak_dbfs(samples) >= SILENCE_DBFS
                    for name, samples in (("system audio", remote), ("microphone", mic))}
         remembered = load_voices(args.voices.expanduser()) if args.voices else {}
-        voices = diarize_aside(remote, args.num_speakers, args.voices is not None, remembered) \
-            if audible["system audio"] else None
-        theirs = transcribe(whisper, "system audio", array_blocks(remote), remote.size / SAMPLE_RATE,
-                            gen_kwargs) if audible["system audio"] else None
-        if "language" not in gen_kwargs and theirs and theirs.language != "?":
-            # One language per meeting: detecting it again on your track, which may hold little
-            # speech of your own, can go wrong (and Whisper then translates).
-            gen_kwargs = dict(gen_kwargs, language=f"<|{theirs.language}|>")
-        yours = transcribe(whisper, "microphone", array_blocks(mic), mic.size / SAMPLE_RATE,
-                           gen_kwargs) if audible["microphone"] else None
+        # One language per meeting, detected on the other side (your track may hold little
+        # speech of your own; detected there it went wrong, and Whisper then translated).
+        engine, language = engines.choose(args.language, array_blocks(
+            remote if audible["system audio"] else mic))
+        if not isinstance(engine, GigaAM) and language not in ("auto", "?"):
+            gen_kwargs = dict(gen_kwargs, language=f"<|{language}|>")
+        heard = {name: transcribe(engine, name, array_blocks(samples), samples.size / SAMPLE_RATE,
+                                  gen_kwargs) if audible[name] else None
+                 for name, samples in (("system audio", remote), ("microphone", mic))}
+        theirs, yours = heard["system audio"], heard["microphone"]
         remote_segments, labels, prints, names = [], {}, {}, {}
-        if voices and theirs and theirs.segments:
-            found, prints, names = voices.result()
+        speakers_on = ""
+        if theirs and theirs.segments:
+            found, prints, names = diarize(engines.speakers(), remote, args.num_speakers, remembered)
+            speakers_on = engines.speakers().device
             remote_segments, labels = number_speakers(theirs.segments, found, "Person", "Remote", names)
         people = len(set(labels.values()))
         my_segments = [Segment(s.start, s.end, s.text, s.words, "You") for s in yours.segments] \
@@ -1210,8 +1596,8 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
         meta = {
             "Language": (", ".join(sorted(set(langs.values()))) if len(set(langs.values())) < 2
                          else ", ".join(f"{who} {lang}" for who, lang in langs.items())) or "-",
-            "Transcribed": f"{model_dir.name} on {whisper.device} in {hms(wall)}; "
-                           "voices told apart by sherpa-onnx",
+            "Transcribed": f"{engine_label(engine)} on {engine.device} in {hms(wall)}"
+                           + (f"; voices told apart on {speakers_on}" if speakers_on else ""),
         }
         if recognised := sorted({names[v] for v in labels if v in names}):
             meta["Recognised by voice"] = ", ".join(recognised)
@@ -1246,6 +1632,13 @@ def transcribe_meeting(args: argparse.Namespace, whisper: Whisper, model_dir: Pa
     return 0
 
 
+def history_model(engine: Whisper | GigaAM | None, args: argparse.Namespace, model_dir: Path) -> str:
+    """The "model" of a history line: gigaam, or --model as given (turbo, small, a path)."""
+    if isinstance(engine, GigaAM):
+        return "gigaam"
+    return args.model if args.model in MODELS else str(model_dir)
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     for tool in ("ffmpeg", "ffprobe"):
@@ -1266,27 +1659,10 @@ def main(argv: list[str]) -> int:
         except OSError as exc:
             raise SystemExit(f"{PROG}: cannot create --out directory: {exc}")
 
-    model_label = args.model if args.model in MODELS else str(model_dir)  # for the history
     forced_language = args.language if args.language != "auto" else "?"
-    devices: list[str] = []
-    try:
-        devices = pick_devices(args.device)
-        whisper = Whisper(model_dir, devices, word_timestamps=args.speakers)
-    except Exception as exc:  # every device failed to load the model
-        log(f"ERROR: {exc}")
-        if args.meeting:
-            if args.notify:
-                notify(False, [f"could not load {model_dir.name}: {exc}"], "Meeting speakers failed")
-            return 1
-        for src in args.files:  # every file failed
-            record_history(src.expanduser(), [], model_label, forced_language,
-                           devices[0] if devices else args.device, None, ok=False)
-        if args.notify:
-            notify(False, [f"could not load {model_dir.name}: {exc}"])
-        return 1
-
+    engines = Engines(args, model_dir, pick_devices(args.device))
     if args.meeting:
-        return transcribe_meeting(args, whisper, model_dir, gen_kwargs)
+        return transcribe_meeting(args, engines, gen_kwargs)
 
     report: list[str] = []
     failed = 0
@@ -1295,33 +1671,36 @@ def main(argv: list[str]) -> int:
         written: list[Path] = []
         t: Transcript | None = None
         speakers: int | None = None
+        engine: Whisper | GigaAM | None = None
         if len(args.files) > 1:
             log(f"[{i}/{len(args.files)}] {src}")
         try:
             if not src.is_file():
                 raise RuntimeError("no such file")
             out_dir = output_dir(src, args.out)  # checked before the expensive part
+            engine, language = engines.choose(args.language, audio_blocks(src))
+            kwargs = dict(gen_kwargs, language=f"<|{language}|>") \
+                if not isinstance(engine, GigaAM) and language not in ("auto", "?") else gen_kwargs
             if args.speakers:  # diarization needs the whole recording at once
                 samples = decode_all(src)
-                voices = diarize_aside(samples, args.num_speakers)
-                t = transcribe(whisper, src.name, array_blocks(samples), samples.size / SAMPLE_RATE,
-                               gen_kwargs)
+                t = transcribe(engine, src.name, array_blocks(samples), samples.size / SAMPLE_RATE, kwargs)
                 t0 = time.monotonic()
-                found = voices.result()[0] if t.segments else []  # (turns, prints, names)
+                found = diarize(engines.speakers(), samples, args.num_speakers)[0] if t.segments else []
                 t.segments, labels = number_speakers(t.segments, found, "Speaker", "Speaker ?")
-                speakers = len(labels)
-                t.wall += time.monotonic() - t0  # the part of the diarization Whisper did not hide
+                speakers = len(set(labels.values()))
+                t.wall += time.monotonic() - t0
                 del samples
             else:
-                t = transcribe(whisper, src.name, audio_blocks(src), probe_duration(src), gen_kwargs)
+                t = transcribe(engine, src.name, audio_blocks(src), probe_duration(src), kwargs)
             speed = t.duration / t.wall if t.wall > 0 else 0.0
             lang = f"{t.language} ({'given' if args.language != 'auto' else 'detected'})" \
                 if t.language != "?" else "- (no speech found)"
+            model_name = engine_label(engine)
             meta = {
                 "File": src.name,
                 "Duration": hms(t.duration),
                 "Language": lang + (", translated to English" if args.translate else ""),
-                "Model": f"{model_dir.name} on {whisper.device}, {speed:.1f}x realtime",
+                "Model": f"{model_name} on {engine.device}, {speed:.1f}x realtime",
                 "Created": f"{datetime.now():%Y-%m-%d %H:%M} by {PROG}",
             }
             if speakers is not None:
@@ -1344,17 +1723,18 @@ def main(argv: list[str]) -> int:
             failed += 1
             log(f"ERROR: {src.name}: {exc}")
             report.append(f"FAILED {src.name}: {exc}")
-            record_history(src, written, model_label, t.language if t else forced_language,
-                           whisper.device, t.duration if t else None, ok=False)
+            record_history(src, written, history_model(engine, args, model_dir),
+                           t.language if t else forced_language,
+                           engine.device if engine else args.device, t.duration if t else None, ok=False)
             continue
-        record_history(src, written, model_label, t.language, whisper.device, t.duration, ok=True,
-                       speakers=speakers)
-        log(f"done: {src.name}: {hms(t.duration)} of audio in {t.wall:.1f} s on {whisper.device} "
+        record_history(src, written, history_model(engine, args, model_dir), t.language, engine.device,
+                       t.duration, ok=True, speakers=speakers)
+        log(f"done: {src.name}: {hms(t.duration)} of audio in {t.wall:.1f} s with {model_name} on {engine.device} "
             f"({speed:.1f}x realtime), {len(t.segments)} segment(s), language {lang}"
             + (f", {speakers} speaker(s)" if speakers is not None else "")
             + (f", dropped {t.dropped} segment(s) over silence" if t.dropped else ""))
         report.append(f"{src.name} → {out_dir / stem}.{{{','.join(args.formats)}}} "
-                      f"({hms(t.duration)} in {t.wall:.0f} s, {whisper.device})")
+                      f"({hms(t.duration)} in {t.wall:.0f} s, {engine.device})")
 
     if args.notify:
         notify(failed == 0, report)

@@ -15,6 +15,7 @@
 #   --no-turbo           skip whisper-large-v3-turbo (~1 GB; best for file transcripts)
 #   --no-speakers        do not tell meeting speakers apart (no meeting audio is kept, not
 #                        even in RAM; no speaker models)
+#   --no-gigaam          skip GigaAM v3 (~460 MB; Russian is then transcribed with Whisper)
 #   --no-panel           do not add the BMeet widget to the panel
 #   --no-npu-driver      do not install Intel's NPU driver even if it is missing
 #   --skip-system        skip the sudo part (it must have run before)
@@ -31,7 +32,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.3.1
+    local VERSION=0.4.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -46,12 +47,13 @@ main() {
     die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
     # --- options -------------------------------------------------------------------
-    local languages="" turbo=1 speakers=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
+    local languages="" turbo=1 speakers=1 gigaam=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
     while [ $# -gt 0 ]; do
         case "$1" in
             --languages) languages="${2:?--languages needs a value, e.g. \"en de\"}"; shift ;;
             --no-turbo) turbo= ;;
             --no-speakers) speakers= ;;
+            --no-gigaam) gigaam= ;;
             --no-panel) panel= ;;
             --no-npu-driver) system_args+=(--no-npu-driver) ;;
             --skip-system) system= ;;
@@ -59,7 +61,7 @@ main() {
             --force) system_args+=(--force) ;;
             --version) echo "BMeet installer $VERSION"; return 0 ;;
             -h|--help)
-                if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,27p' "${BASH_SOURCE[0]}"
+                if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,28p' "${BASH_SOURCE[0]}"
                 else echo "See https://github.com/$REPO#install"; fi
                 return 0 ;;
             *) die "unknown option: $1 (see --help)" ;;
@@ -188,28 +190,68 @@ import openvino_genai, numpy; print("  openvino-genai", openvino_genai.__version
             --local-dir "$dir" >/dev/null
     done
 
-    # --- 4b. speaker models (meetings: Person 1, Person 2, ...; npu-transcribe --speakers) ---
-    # sherpa-onnx's exports, sha256-pinned: pyannote segmentation-3.0 (MIT) and the
-    # speaker-embedding model (see docs/npu-transcribe.md for the choice and its license).
+    # Models from sherpa-onnx's releases (exports of the original models), sha256-pinned.
+    local dl="$CACHE/downloads" rel=https://github.com/k2-fsa/sherpa-onnx/releases/download
+    mkdir -p "$dl"
+    fetch() {  # file url sha256: download into the cache once, check it every time
+        if ! echo "$3  $dl/$1" | sha256sum -c --status >/dev/null 2>&1; then
+            curl -fL --retry 3 --progress-bar -o "$dl/$1.part" "$2" && mv "$dl/$1.part" "$dl/$1"
+            echo "$3  $dl/$1" | sha256sum -c --status \
+                || { rm -f "$dl/$1"; die "checksum mismatch for $1 - run the installer again"; }
+        fi
+    }
+
+    # --- 4b. Russian speech recognition: GigaAM v3 (Sber, MIT), made NPU-safe once -------
+    # ~20 % fewer word errors than Whisper on Russian conversation (docs/npu-transcribe.md).
+    # transcribe/prepare-models rewrites it for the NPU and compiles it there (~2 min, once).
+    local giga_dir="$MODELS_DIR/gigaam-v3-ctc-ru"
+    local giga_name=sherpa-onnx-nemo-ctc-punct-giga-am-v3-russian-2025-12-16
+    local giga_tar_sha=20e41e160efa6f2460a7ef6554cdbbb9e8fffb2b92e6bc708e9406bd8b9256ea
+    local giga_onnx_sha=d5fea8df94263c285e54b21e5774b707c707192d3bdbeffd7b1eb07fb6743b35
+    if [ -n "$gigaam" ]; then
+        say "Russian speech model (GigaAM v3) -> $giga_dir"
+        # re-prepared only when the model or the preparation changes
+        local giga_stamp
+        giga_stamp="$giga_onnx_sha $(sha256sum "$src/transcribe/prepare-models" | cut -c1-16)"
+        if [ -f "$giga_dir/model.xml" ] && [ "$(cat "$giga_dir/.prepared" 2>/dev/null)" = "$giga_stamp" ]; then
+            echo "  present"
+        else
+            fetch "$giga_name.tar.bz2" "$rel/asr-models/$giga_name.tar.bz2" "$giga_tar_sha"
+            local giga_tmp
+            giga_tmp="$(mktemp -d "$CACHE/gigaam.XXXXXX")"
+            "$venv/bin/python" -I -c 'import sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    for name in ("model.int8.onnx", "tokens.txt"):
+        with open(f"{sys.argv[2]}/{name}", "wb") as f:
+            f.write(t.extractfile(f"{sys.argv[3]}/{name}").read())' \
+                "$dl/$giga_name.tar.bz2" "$giga_tmp" "$giga_name"
+            echo "$giga_onnx_sha  $giga_tmp/model.int8.onnx" | sha256sum -c --status \
+                || { rm -rf "$giga_tmp"; die "unexpected model in $giga_name.tar.bz2"; }
+            if ! "$venv/bin/python" -I "$src/transcribe/prepare-models" "$giga_tmp" "$giga_dir" --compile; then
+                rm -rf "$giga_tmp"
+                die "preparing GigaAM for the NPU failed (--no-gigaam installs without it)"
+            fi
+            rm -rf "$giga_tmp"
+            echo "$giga_stamp" > "$giga_dir/.prepared"
+        fi
+    else
+        echo "  skipped (--no-gigaam): Russian is transcribed with Whisper"
+    fi
+
+    # --- 4c. speaker models (meetings: Person 1, Person 2, ...; npu-transcribe --speakers) ---
+    # pyannote segmentation-3.0 (MIT) and NVIDIA TitaNet-small (CC-BY-4.0); both run on the
+    # NPU (docs/npu-transcribe.md for the choice and the NPU fixes).
     local speakers_file="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
     mkdir -p "$(dirname "$speakers_file")"
     if [ -n "$speakers" ]; then
-        local sd="$MODELS_DIR/speaker-diarization" dl="$CACHE/downloads"
-        local rel=https://github.com/k2-fsa/sherpa-onnx/releases/download
+        local sd="$MODELS_DIR/speaker-diarization"
         local seg_tar=sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
         local seg_tar_sha=24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
         local seg_sha=220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079
         local emb=nemo_en_titanet_small.onnx
         local emb_sha=ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
         say "Speaker models -> $sd"
-        mkdir -p "$sd" "$dl"
-        fetch() {  # file url sha256: download into the cache once, check it every time
-            if ! echo "$3  $dl/$1" | sha256sum -c --status >/dev/null 2>&1; then
-                curl -fL --retry 3 --progress-bar -o "$dl/$1.part" "$2" && mv "$dl/$1.part" "$dl/$1"
-                echo "$3  $dl/$1" | sha256sum -c --status \
-                    || { rm -f "$dl/$1"; die "checksum mismatch for $1 - run the installer again"; }
-            fi
-        }
+        mkdir -p "$sd"
         if ! echo "$seg_sha  $sd/pyannote-segmentation-3-0.onnx" | sha256sum -c --status >/dev/null 2>&1; then
             fetch "$seg_tar" "$rel/speaker-segmentation-models/$seg_tar" "$seg_tar_sha"
             "$venv/bin/python" -I -c 'import sys, tarfile

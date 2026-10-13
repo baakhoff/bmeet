@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-13
+
+Russian is transcribed with GigaAM v3, and everything runs on the NPU, including telling the speakers apart.
+
+### Added
+- **GigaAM v3 for Russian** (Sber, MIT), used automatically for Russian meetings and files (detected or `--language ru`).
+  - On Russian conversation (Podlodka podcast, 16 min) it made 6.5 % word errors against Whisper turbo's 8.2 %, at ~215x realtime instead of 14x.
+  - The trade-off: English terms inside Russian speech come out mangled.
+  - `npu-transcribe --engine auto|whisper|gigaam`, installer `--no-gigaam`.
+- **`transcribe/prepare-models`** makes sherpa-onnx's int8 GigaAM export run correctly on the NPU, once, at install time. On the NPU that export wrote garbage. The int8 weights become float again, and the rotary position step, which the NPU compiler gets wrong, is folded into the query and key projections.
+
+### Changed
+- **Speaker separation runs on the NPU** (OpenVINO) instead of the CPU (sherpa-onnx). It's a new pipeline:
+  - pyannote segmentation-3.0 finds up to 3 voices per 10 s window.
+  - TitaNet-small fingerprints them, in batches of 16, with its statistics pooling scaled so the NPU's fp16 does not underflow.
+  - Average-linkage clustering, threshold 0.4, then pyannote-style turn reconstruction.
+  - The right number of people was found in all four test calls, at ~110x realtime.
+- **CPU time:** numpy is kept to one thread, because its BLAS threads busy-waited. A 5-minute meeting now takes 8 s of CPU in total, down from 26 s.
+- **Language detection:** the language is detected once per recording (for meetings, on the other side), also when Whisper is chosen.
+- **Requirements:** `sherpa-onnx` is no longer needed; `onnx` is (install time only).
+
 ## [0.3.1] - 2026-10-12
 
 Better Russian text and far fewer phantom speakers, tuned on a real Russian call.
@@ -68,6 +89,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.4.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.4.0
 [0.3.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.1
 [0.3.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.0
 [0.2.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.2.0

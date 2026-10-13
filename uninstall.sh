@@ -41,7 +41,7 @@ bash "$src/voxtype/user-setup.sh" --uninstall || true
 if [ -n "$purge" ]; then
     say "Models and caches"
     rm -rf "$models/whisper-small-int8-ov" "$models/whisper-large-v3-turbo-int8-ov" \
-           "$models/speaker-diarization" \
+           "$models/speaker-diarization" "$models/gigaam-v3-ctc-ru" \
            "$cache/npu-ov-cache" "$cache/bmeet"
     rmdir "$models" 2>/dev/null || true
 fi

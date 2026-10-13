@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Prepare GigaAM v3 (Russian speech recognition) for the Intel NPU, once, at install time.
+
+sherpa-onnx publishes GigaAM v3 e2e CTC as an onnxruntime "dynamic int8" ONNX. On the NPU
+that model gives garbage, for two reasons (measured with OpenVINO 2026.4.1, Lunar Lake):
+
+1. Its activations are quantised at run time (DynamicQuantizeLinear + MatMulInteger /
+   ConvInteger), which falls apart in the NPU's fp16. The int8 weights are turned back
+   into float weights ((w - zero_point) * scale): the same model without the run-time
+   rounding.
+2. The NPU compiler gets the rotary position step wrong: Add(x*cos, rotate(x)*sin) on
+   (T, 1, heads, 48) tensors comes out ~0.76 off although both products are right, and
+   reshaping it does not compile. The step feeds only the query and key projections, so
+   it is folded into them: (x*cos + rotate(x)*sin) W == [x*cos, x*sin'] @ [W; P W], with P
+   the signed half-swap permutation of rotate_half and sin' sin with its halves swapped.
+
+The result has a fixed 30 s input (2999 feature frames), fp16 weights (~460 MB), and
+makes the same 6.4-6.5 % word errors on the NPU as the original on the CPU.
+
+Usage: prepare-models GIGAAM_SRC OUT_DIR [--compile]
+  GIGAAM_SRC  the unpacked sherpa-onnx-nemo-ctc-punct-giga-am-v3-russian-2025-12-16
+  OUT_DIR     receives model.xml, model.bin, tokens.txt
+  --compile   also compile it for the NPU into ~/.cache/npu-ov-cache (~2 min, once)
+Run with the npu-transcribe venv's Python (openvino, onnx, numpy).
+"""
+from __future__ import annotations
+
+import collections
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+sys.modules["openvino_telemetry"] = None  # (see npu-transcribe)
+import numpy as np  # noqa: E402
+
+FRAMES = 2999  # 30 s at hop 160 with n_fft 320, center=False
+
+
+def dequantize(src: Path, dst: Path) -> int:
+    """MatMulInteger/ConvInteger fed by DynamicQuantizeLinear -> float MatMul/Conv."""
+    import onnx
+    from onnx import helper, numpy_helper
+    m = onnx.load(str(src))
+    g = m.graph
+    inits = {i.name: i for i in g.initializer}
+    prod = {o: n for n in g.node for o in n.output}
+    cons = collections.defaultdict(list)
+    for n in g.node:
+        for i in n.input:
+            cons[i].append(n)
+
+    def const(name: str) -> np.ndarray:
+        return numpy_helper.to_array(inits[name]) if name in inits else \
+            numpy_helper.to_array(prod[name].attribute[0].t)
+
+    replace, new_inits = {}, []
+    for n in g.node:
+        if n.op_type not in ("MatMulInteger", "ConvInteger"):
+            continue
+        dql = prod[n.input[0]]
+        cast = cons[n.output[0]][0]
+        mul = cons[cast.output[0]][0]
+        if (dql.op_type, cast.op_type, mul.op_type) != ("DynamicQuantizeLinear", "Cast", "Mul"):
+            raise SystemExit(f"unexpected pattern around {n.name}: is this the right model?")
+        scale_mul = prod[next(i for i in mul.input if i != cast.output[0])]
+        w = const(n.input[1]).astype(np.float32)
+        zero = const(n.input[3]).astype(np.float32) if len(n.input) > 3 and n.input[3] else np.float32(0)
+        scale = const(next(i for i in scale_mul.input if i != dql.output[1])).astype(np.float32)
+        if n.op_type == "ConvInteger":  # per output channel: broadcast over the kernel
+            shape = (-1,) + (1,) * (w.ndim - 1)
+            scale = scale.reshape(shape) if scale.ndim == 1 else scale
+            zero = zero.reshape(shape) if np.ndim(zero) == 1 else zero
+        name = n.input[1] + "_dequant"
+        new_inits.append(numpy_helper.from_array(((w - zero) * scale).astype(np.float32), name))
+        node = helper.make_node("MatMul" if n.op_type == "MatMulInteger" else "Conv",
+                                [dql.input[0], name], [mul.output[0]], name=n.name + "_float")
+        if n.op_type == "ConvInteger":
+            node.attribute.extend(n.attribute)
+        replace[id(mul)] = node
+    nodes = [replace.get(id(n), n) for n in g.node]
+    need, alive = {o.name for o in g.output}, []
+    for n in reversed(nodes):  # keep only what the outputs need
+        if any(o in need for o in n.output):
+            alive.append(n)
+            need.update(i for i in n.input if i)
+    del g.node[:]
+    g.node.extend(reversed(alive))
+    g.initializer.extend(new_inits)
+    used = {i for n in g.node for i in n.input}
+    kept = [i for i in g.initializer if i.name in used]
+    del g.initializer[:]
+    g.initializer.extend(kept)
+    onnx.save(m, str(dst), save_as_external_data=True, location=dst.name + ".data")
+    return len(replace)
+
+
+def fold_rotary(model, cos: np.ndarray, sin: np.ndarray) -> int:
+    """Each layer's rotary step + Q/K projections -> one MatMul (see the module doc)."""
+    import openvino.opset13 as ops
+    t, d = cos.shape[0], cos.shape[-1]
+    half = d // 2
+    P = np.zeros((d, d), np.float32)  # (z P)_j = sign_j * z_pi(j): rotate_half
+    for j in range(d):
+        if j < half:
+            P[j + half, j] = -1.0
+        else:
+            P[j - half, j] = 1.0
+    folded = 0
+    for op in list(model.get_ordered_ops()):
+        if op.get_type_name() != "Add" or not op.get_friendly_name().endswith("self_attn/Add"):
+            continue
+        x4 = op.input_values()[0].get_node().input_value(0)            # x * cos: (T, 1, heads, d)
+        heads = x4.get_partial_shape()[2].get_length()
+        width = heads * d
+        c = np.tile(cos.reshape(t, 1, d), (1, heads, 1)).reshape(t, 1, width)
+        s = np.tile(np.concatenate([sin[..., half:], sin[..., :half]], -1).reshape(t, 1, d),
+                    (1, heads, 1)).reshape(t, 1, width)
+        x3 = ops.reshape(x4, ops.constant(np.array([t, 1, width], np.int64)), False)
+        both = ops.concat([ops.multiply(x3, ops.constant(c)), ops.multiply(x3, ops.constant(s))], -1)
+        both = ops.transpose(both, ops.constant(np.array([1, 0, 2], np.int64)))  # (1, T, 2*width)
+        reshaped = next(ti.get_node() for ti in op.output(0).get_target_inputs())
+        transposed = next(ti.get_node() for ti in reshaped.output(0).get_target_inputs()
+                          if ti.get_node().get_type_name() == "Transpose")
+        full_p = np.kron(np.eye(heads, dtype=np.float32), P)
+        for target in list(transposed.output(0).get_target_inputs()):
+            mm = target.get_node()
+            if mm.get_type_name() != "MatMul":
+                continue
+            w = mm.input_value(1).get_node().get_data().astype(np.float32)
+            w = w.T if mm.get_transpose_b() else w
+            new = ops.matmul(both, ops.constant(np.concatenate([w, full_p @ w], 0)), False, False)
+            for t2 in list(mm.output(0).get_target_inputs()):
+                t2.replace_source_output(new.output(0))
+            folded += 1
+    model.validate_nodes_and_infer_types()
+    return folded
+
+
+def prepare_gigaam(src: Path, out: Path, compile_npu: bool) -> None:
+    import openvino as ov
+    import openvino.passes as passes
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        flt = Path(tmp) / "model.onnx"
+        n = dequantize(src / "model.int8.onnx", flt)
+        print(f"  {n} quantised layers back to float")
+        core = ov.Core()
+        m = core.read_model(str(flt))
+        m.reshape({"features": [1, 64, FRAMES], "feature_lengths": [1]})
+        manager = passes.Manager()
+        manager.register_pass(passes.ConstantFolding())
+        manager.run_passes(m)
+        add = next(op for op in m.get_ordered_ops() if op.get_friendly_name().endswith("layers.0/self_attn/Add"))
+        tables = [mul.input_value(1).get_node() for mul in (iv.get_node() for iv in add.input_values())]
+        if any(t.get_type_name() != "Constant" for t in tables):
+            raise SystemExit("the rotary tables did not fold to constants: is this the right model?")
+        cos, sin = (t.get_data().astype(np.float32) for t in tables)
+        print(f"  rotary step folded into {fold_rotary(m, cos, sin)} query/key projections")
+        manager.run_passes(m)
+        ov.save_model(m, str(out / "model.xml"), compress_to_fp16=True)
+    shutil.copyfile(src / "tokens.txt", out / "tokens.txt")
+    print(f"  {out}/model.xml ready")
+    if compile_npu:
+        import time
+        if "NPU" not in core.available_devices:
+            print("  no NPU: not compiling")
+            return
+        t0 = time.monotonic()
+        core.compile_model(str(out / "model.xml"), "NPU", {"CACHE_DIR": str(Path.home() / ".cache/npu-ov-cache")})
+        print(f"  compiled for the NPU in {time.monotonic() - t0:.0f} s (cached)")
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if a != "--compile"]
+    if len(args) != 2:
+        print(__doc__.split("Usage:")[1].split("Run with")[0].strip(), file=sys.stderr)
+        return 2
+    prepare_gigaam(Path(args[0]), Path(args[1]), "--compile" in sys.argv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

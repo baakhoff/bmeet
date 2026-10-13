@@ -18,13 +18,15 @@ machine, and the CPU and GPU are left alone.
 - **Meeting transcripts, with who said what:**
   - Press **Meta+Alt+M** to record your microphone and the system audio. Each 30 s chunk is transcribed on the NPU while the meeting runs.
   - When you stop, a Markdown transcript is saved to `~/Documents/Meetings` right away.
-  - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. About 1/7 of the meeting's length on a Core Ultra 7 258V (a 1-hour meeting takes ~8 minutes).
+  - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 2 minutes on a Core Ultra 7 258V (other languages, with Whisper: ~8 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
   - **Names:** *Name speakers…* in the app turns *Person 1* into *Viktor*. If you let it remember voices, later meetings call Viktor by name on their own.
 - **File transcription:**
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - `--speakers` (or *Transcribe with speakers* in Dolphin) labels the lines Speaker 1, Speaker 2, …
   - Whisper large-v3-turbo runs at ~25x realtime on the NPU.
+- **Russian with GigaAM v3** (Sber): about 20 % fewer word errors than Whisper on Russian conversation, at ~200x realtime on the NPU. It's used for Russian meetings and files automatically; English terms inside Russian speech come out worse than with Whisper (details in [docs/npu-transcribe.md](docs/npu-transcribe.md#russian-gigaam-v3)).
+- **Everything on the NPU:** speech recognition, language detection and telling the speakers apart. The CPU only decodes audio and does small arithmetic.
 - **BMeet app:**
   - Meeting history, transcribed files and a transcription queue, with search.
   - Export, copy and delete transcripts.
@@ -79,6 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 | `--languages "en de"` | dictation languages for Meta+Shift+H (Whisper codes; default: English + your desktop language) |
 | `--no-turbo` | skip Whisper large-v3-turbo (~1 GB); file transcription then uses small |
 | `--no-speakers` | don't tell meeting speakers apart: transcripts keep the *You* / *Remote* labels, and no meeting audio is held, not even in RAM |
+| `--no-gigaam` | skip GigaAM v3 (~480 MB): Russian is then transcribed with Whisper |
 | `--no-panel` | don't add the widget to the panel |
 | `--no-npu-driver` | don't install Intel's NPU driver |
 | `--skip-system` | skip the sudo part (it must have run before) |
@@ -150,7 +153,8 @@ bash ~/.local/share/bmeet/src/uninstall.sh
  BMeet app (PyQt6) ───┘    (JSON)      (systemd --user)    (C SDK, /opt/intel)
          │
          └──────────────> npu-transcribe ──> OpenVINO GenAI (Python venv) ──> NPU, CPU fallback
-                          (+ Dolphin menu) ─> sherpa-onnx speaker diarization ──> CPU
+                          (+ Dolphin menu)    GigaAM v3 for Russian ────────────> NPU
+                                              speakers: pyannote + TitaNet ────> NPU
 
  meeting: voxtype-meeting-toggle ─> bmeet-meeting-audio (pw-record, RAM) ─> npu-transcribe --meeting
           (live You/Remote transcript from voxtype first, replaced by You/Person 1/... when done)
@@ -198,7 +202,8 @@ More in [docs/troubleshooting.md](docs/troubleshooting.md).
 - [voxtype](https://github.com/peteonrails/voxtype) (peteonrails/voxtype).
 - [OpenVINO](https://github.com/openvinotoolkit/openvino) and the [Intel NPU driver](https://github.com/intel/linux-npu-driver) by Intel.
 - [Whisper](https://github.com/openai/whisper) by OpenAI, in the int8 OpenVINO exports from [huggingface.co/OpenVINO](https://huggingface.co/OpenVINO).
-- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0): speaker diarization, and the GTCRN speech enhancement model.
-- [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT) and NVIDIA's [TitaNet-small](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) (CC-BY-4.0) speaker models, in sherpa-onnx's ONNX exports.
+- [GigaAM v3](https://github.com/salute-developers/GigaAM) by Sber (MIT): Russian speech recognition.
+- [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT) and NVIDIA's [TitaNet-small](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) (CC-BY-4.0): the speaker models.
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0): the ONNX exports of these models, and the GTCRN speech enhancement model.
 
 They're downloaded at install time under their own licenses. This repository is [MIT](LICENSE).

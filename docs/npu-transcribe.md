@@ -1,7 +1,8 @@
 # npu-transcribe
 
-`npu-transcribe` turns audio and video files into subtitles and readable transcripts
-with Whisper on the Intel NPU. It falls back to the CPU when the NPU is missing or fails.
+`npu-transcribe` turns audio and video files into subtitles and readable transcripts on
+the Intel NPU: Russian with GigaAM v3, every other language with Whisper. It falls back to
+the CPU only when the NPU is missing or fails.
 
 ```bash
 npu-transcribe meeting.m4a                                  # -> meeting.srt + meeting.md
@@ -30,6 +31,36 @@ npu-transcribe --help
 - **Dolphin:** right-click audio or video → **Transcribe (NPU)**. It runs in a Konsole window and sends a notification when done.
 - **BMeet app:** the **Transcribe a file** page has a queue and progress display.
 
+## Russian: GigaAM v3
+
+For Russian, npu-transcribe uses [GigaAM v3](https://github.com/salute-developers/GigaAM) (Sber, MIT; the *e2e CTC* variant, which writes punctuation and capitals). Whisper still detects the language, and it handles every other language and `--translate`. `--engine whisper` keeps Whisper for Russian too.
+
+**Measured** on 40 utterances (16 min, 2,286 words) of the Russian IT podcast [Podlodka](https://huggingface.co/datasets/bond005/podlodka_speech) (its test and validation splits). WER is on lower-case words without punctuation, ё = е.
+
+| model | WER clean | WER through 16 kbit/s Opus | English terms right | speed | runs on |
+|---|---|---|---|---|---|
+| **GigaAM v3 CTC, prepared for the NPU** | **6.5 %** | 7.1 % | 4 / 40 | **215x** | NPU |
+| GigaAM v3 CTC (sherpa-onnx, int8) | 6.4 % | 6.6 % | 4 / 40 | 42x | CPU |
+| GigaAM v3 RNNT (sherpa-onnx, int8) | 7.2 % | 7.4 % | | 16-23x | CPU |
+| Whisper large-v3 | 7.1 % | 8.5 % | 22 / 40 | 3.9x | NPU |
+| Whisper large-v3-turbo (before 0.4) | 8.2 % | 7.9 % | 18 / 40 | 14x | NPU |
+| NVIDIA Parakeet-TDT-0.6B v3 | 10.1 % | 11.6 % | | 20x | CPU |
+| Whisper small (voxtype's live meeting text) | 14.7 % | 16.6 % | | 10x | NPU |
+
+**Trade-offs:**
+- **Better:** GigaAM gets Russian words right that Whisper misses ("тимлидом" where Whisper wrote "тем лидом", "чатик" where it wrote "чат").
+- **Worse:** English terms inside Russian speech come out mangled, for example "Superviselening" or "Perfomance".
+- **Through the call codec:** the margin over Whisper turbo shrinks to 7.1 % vs 7.9 %.
+
+**Making it run on the NPU.** `transcribe/prepare-models` does this once, at install time (~7 s, plus a ~1 min NPU compile).
+- **The starting point:** sherpa-onnx's export is an onnxruntime "dynamic int8" model. On the NPU it wrote garbage (WER 99 %).
+- **1. Run-time quantisation:** it quantises its activations at run time (DynamicQuantizeLinear, then MatMulInteger/ConvInteger), which falls apart in fp16. The int8 weights are turned back into float weights ((w − zero point) × scale), which gives the same model without the run-time rounding. That brought it to WER 34 %.
+- **2. An NPU compiler bug in the rotary position step:** `Add(x·cos, rotate(x)·sin)` on (T, 1, heads, 48) tensors comes out wrong (0.76 relative error) although both products are right, and reshaping it does not compile.
+  - The step feeds only the query and key projections, so it is folded into them: (x·cos + rotate(x)·sin)·W = [x·cos, x·sin′]·[W; P·W], with P the signed half-swap of rotate_half.
+  - The rotary tables come from constant folding at the fixed 30 s input (750 positions).
+- **The result:** WER 6.5 %, the same as on the CPU, at ~215x realtime on the NPU. The model is saved with fp16 weights (~480 MB in `~/.local/share/npu-models/gigaam-v3-ctc-ru`).
+- **At run time:** the features (64-band log-mel, n_fft 320, hop 160, like `gigaam.preprocess`) are computed in numpy, and the output is decoded greedily. Words get their times from the 40 ms output frames.
+
 ## Block length
 
 npu-transcribe used to give Whisper 2-minute blocks and let OpenVINO GenAI chain the 30 s windows inside them. On a real Russian call (10 min, the system-audio track, turbo on the NPU) that cost a lot:
@@ -53,11 +84,12 @@ numbered in the order they first speak); `--num-speakers N` fixes the count when
 the voices in the system audio become **Person 1**, **Person 2**, …
 
 **How it works:**
-1. **Who speaks when:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s offline speaker diarization runs on the CPU in a second process, at the same time as Whisper on the NPU.
-   - pyannote **segmentation-3.0** finds the speech turns.
-   - NVIDIA **TitaNet-small** turns each turn into a voice fingerprint.
-   - The fingerprints are clustered: threshold 0.85 (env `NPU_SPEAKER_THRESHOLD`), or exactly `--num-speakers` clusters.
-2. **Words, not sentences:** Whisper runs with word timestamps (a separate NPU compile of ~1 min, cached; each block takes ~8 % longer). Every word goes to the voice that speaks during it, so a sentence that crosses a change of speaker is split there. A change shorter than 0.6 s inside a sentence is treated as noise.
+1. **Who speaks when**, on the NPU (OpenVINO; until 0.3 this ran on the CPU through sherpa-onnx):
+   - **Speech per window:** pyannote **segmentation-3.0** looks at 10 s windows, every 5 s, and finds up to 3 voices in each (78 ms per window on the NPU).
+   - **Fingerprints:** NVIDIA **TitaNet-small** fingerprints each voice's clean speech in each window, 16 per NPU call (13 ms each).
+   - **Clustering:** the fingerprints are clustered by average-linkage agglomerative clustering, threshold 0.4 on cosine distance (env `NPU_SPEAKER_THRESHOLD`), or into exactly `--num-speakers` clusters.
+   - **Turns:** they are rebuilt pyannote's way. Each voice's activity is added up over the overlapping windows, the number of voices per frame is estimated, and that many of the most active ones are kept. Turns under 0.3 s are dropped, and gaps under 0.5 s are closed.
+2. **Words, not sentences:** GigaAM's words come with their times from its output frames. Whisper runs with word timestamps (a separate NPU compile of ~1 min, cached; each block takes ~8 % longer). Every word goes to the voice that speaks during it, so a sentence that crosses a change of speaker is split there. A change shorter than 0.6 s inside a sentence is treated as noise.
 3. **Echo (meetings):** without headphones the microphone also hears the other side, and Whisper writes their words into your track too, often in the same sentence as your own.
    - First, how loud the system audio comes back through the microphone is measured: the median mic/remote ratio while the other side talks.
    - A word on your track is cut when the microphone is less than 2x louder than that predicted echo at that moment.
@@ -82,21 +114,29 @@ On 10 minutes of a real three-person call, the old pass made You, Remote and Per
 | WeSpeaker ResNet34-LM (VoxCeleb) | 0.81, 0.65 | 0.58, 0.84 | 14 % |
 | 3D-Speaker CAM++ (VoxCeleb) | 0.50, 0.01 | 0.39, 0.95 | 43 % |
 
-**Threshold.** Four synthetic calls (2-4 readers, 2.5-4 min each, 24-40 turns) through the whole pipeline with TitaNet. Each cell shows people found and the share of speech given to the right person:
+**Threshold.** Four synthetic calls (2-4 readers, 2.5-4 min each, 24-40 turns, through Opus) through the whole NPU pipeline. Each cell shows people found and the share of speech given to the right person:
 
 | threshold | 3 readers | 2 readers | 4 readers | 4 readers |
 |---|---|---|---|---|
-| 0.6 | 4, 91 % | 4, 81 % | 9, 84 % | 6, 89 % |
-| 0.7 | 4, 91 % | 2, 100 % | 5, 99 % | 4, 98 % |
-| **0.8-0.9** | **3, 97 %** | **2, 100 %** | **4, 99 %** | **4, 98 %** |
-| 1.0 | 2, 78 % | 2, 100 % | 4, 99 % | 4, 98 % |
+| 0.3 | 3, 99 % | 2, 100 % | 4, 95 % | 4, 94 % |
+| **0.4** | **3, 99 %** | **2, 100 %** | **4, 97 %** | **4, 95 %** |
+| 0.5-0.65 | 3, 93 % | 2, 100 % | 4, 97 % | 4, 95 % |
+| 0.7 | 2, 79 % | 2, 100 % | 4, 97 % | 4, 95 % |
+| 0.85 | 2, 79 % | 2, 100 % | 3, 87 % | 3, 77 % |
+
+This ran at ~110x realtime on the NPU. Under sherpa-onnx's CPU diarization (0.2-0.3, its own threshold scale) the right range was 0.8-0.9.
+
+**Making the speaker models right on the NPU.** Both models load in OpenVINO, but:
+- **Segmentation** runs as it is: its speech decisions match the CPU's in 99.8 % of the frames. Batching it does not compile in reasonable time, so it runs one window at a time.
+- **TitaNet's** statistics pooling underflows in the NPU's fp16. Attention weights ~1/400 times squared deviations ~1e-3 make products ~1e-6, and fingerprints came out only 0.67 similar to the CPU's. The pooling is fed the features ×64, and its means and standard deviations are scaled back. That's the same maths, now 0.9993 similar.
+- **TitaNet's features** (NeMo's: pre-emphasis 0.97, 25 ms Hann window, Slaney mel, per-feature normalisation) are computed in numpy. Fingerprints from the same reader across recordings stay ≥ 0.79 similar, and others ≤ 0.39.
 
 **End to end** (`--meeting` on the NPU): a 2:55 meeting (three readers in the system audio, a fourth on the microphone, the system audio leaking into the microphone at -22 dB, a pause in the middle) took 24 s.
 - All 3 people were found.
 - 100 % of the text was under the right label.
 - 244 echo words were cut, and none of yours.
 
-`tests/meeting_test.py` builds the same kind of meeting from espeak-ng voices in Russian and English and checks it. espeak's voices are much more alike than people (similarity ~0.35 between its variants), so the test sets a stricter threshold (0.7).
+`tests/meeting_test.py` builds the same kind of meeting from espeak-ng voices in Russian and English and checks it. It uses `--engine whisper`, because GigaAM, trained on real speech, writes almost nothing for espeak's robotic Russian.
 
 **Remembered voices** (`--meeting … --voices DIR`; BMeet passes it when *remember voices* is on):
 - **Fingerprints:** each voice's fingerprint is the duration-weighted mean of the TitaNet embeddings of its longest turns, up to 60 s of speech, at unit length. They go to `DIR/meetings/<transcript>.json` (0600, folders 0700). Naming people in the BMeet app copies theirs to `DIR/voices.json`, at most 10 per person.
@@ -104,14 +144,15 @@ On 10 minutes of a real three-person call, the old pass made You, Remote and Per
   - Long turns are split where the recognised person changes for 1.5 s or more. Two similar voices can share one turn in the segmentation.
   - A voice whose recognised speech is mostly one person's takes their name. Their turns inside another voice (two people the clustering merged) move to them.
   - Everyone else is numbered as before, *Person 1*, *Person 2*, …, skipping the names.
-- **Why 0.55:** fingerprints of the same LibriSpeech reader from different recordings (through Opus) were at least 0.80 similar, and those of different readers at most 0.40. One utterance against a fingerprint scored at least 0.65 for the same reader and at most 0.41 for others.
+- **Why 0.55:** fingerprints of the same LibriSpeech reader from different recordings (through Opus) were at least 0.79 similar, and those of different readers at most 0.39. One utterance against a fingerprint scored at least 0.63 for the same reader and at most 0.39 for others.
 - **Test:** in `tests/meeting_test.py --remember`, a second meeting with new sentences, where the people speak in another order, came out as Anna, Boris and Viktor. That was 100 % in English and 90 % in Russian, where espeak's synthetic Russian makes Whisper's word timing blur at one change of speaker. Without the window check, two of espeak's similar voices shared one turn and one name.
 - **Language:** a meeting's language is detected on the system audio and used for your microphone too. Detecting it again on a track that may hold little speech of your own went wrong in the tests, and Whisper then translated.
 
-**Speed:** about 1/7 of the recording's length.
-- Whisper runs ~15x realtime with word timestamps, once per track.
-- Diarization runs ~16x realtime on 4 CPU threads, hidden behind Whisper.
-- A 1-hour meeting takes ~8 minutes, a 1-hour file with `--speakers` ~4.
+**Speed and CPU:** a 5-minute Russian meeting (real podcast speech in both tracks, echo included) took 10 s.
+- **CPU time:** 4 s of user and 4 s of system time in total, mostly loading the models.
+- **Why so little:** numpy is kept to one thread. Its BLAS would otherwise start a thread per core for the small matrix products of the features, and they busy-wait: that was 26 s of CPU for the same meeting.
+- **Per hour of a Russian meeting:** about 2 minutes. GigaAM takes ~30 s for both tracks, and the speakers ~1.5 min.
+- **Other languages:** Whisper turbo is slower, at ~15x realtime per track.
 
 ## Models
 

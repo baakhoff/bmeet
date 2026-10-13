@@ -18,8 +18,7 @@ meeting with other sentences, in which the people speak in another order, must c
 as Anna, Boris and Viktor.
 
 Usage: meeting_test.py WORKDIR [--language ru|en] [--headphones] [--remember]
-Env:   NPU_PYTHON  Python with openvino-genai + sherpa-onnx (default: the installer's venv)
-       NPU_SPEAKER_THRESHOLD  default 0.7 here (synthetic voices, see main())
+Env:   NPU_PYTHON  Python with openvino-genai (default: the installer's venv)
 Exit status 0 = passed. Writes only below WORKDIR (plus the OpenVINO compile cache).
 """
 from __future__ import annotations
@@ -189,7 +188,9 @@ def score(md: str, lines: list[tuple[str, str]], named: bool = False) -> tuple[b
 
 def speaker_pass(python: str, folder: Path, out: Path, env: dict, voices: Path | None) -> bool:
     out.write_text("# placeholder (voxtype's transcript)\n")
-    cmd = [python, "-I", str(TOOL), "--meeting", str(folder), "--output", str(out)]
+    # Whisper: GigaAM (the default for Russian) was trained on real speech and writes almost
+    # nothing for espeak's robotic Russian; its accuracy is measured on real speech instead.
+    cmd = [python, "-I", str(TOOL), "--meeting", str(folder), "--output", str(out), "--engine", "whisper"]
     run = subprocess.run(cmd + (["--voices", str(voices)] if voices else []), env=env,
                          capture_output=True, text=True)
     for line in run.stderr.splitlines():
@@ -220,10 +221,6 @@ def main() -> int:
     python = os.environ.get("NPU_PYTHON") or str(Path.home() / ".local/share/bmeet/venv/bin/python")
     name = f"meeting-{args.language}{'-headphones' if args.headphones else ''}"
     env = dict(os.environ, NPU_TRANSCRIBE_HISTORY=str(args.work / "history.jsonl"))
-    # One synthesizer's voices are more alike than real people (TitaNet similarity ~0.35
-    # vs ~0.1), so they need a stricter "same voice" threshold than real meetings (0.85;
-    # tuned on LibriSpeech readers). This test checks the pipeline, not that tuning.
-    env.setdefault("NPU_SPEAKER_THRESHOLD", "0.7")
     voices = args.work / f"{name}-voices" if args.remember else None
     if voices:
         shutil.rmtree(voices, ignore_errors=True)

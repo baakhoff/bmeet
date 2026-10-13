@@ -308,6 +308,26 @@ class A_DataTests(unittest.TestCase):
         vn.assign_meeting_mds([m2, m3, m1], d)
         self.assertEqual((m1.md_path, m2.md_path, m3.md_path), (str(first), str(second), None))
 
+    def test_assign_neighbouring_minute_by_title(self):
+        # The toggle stamped the file 15:32; voxtype said the meeting started at 15:33:00.
+        d = WORK / "next-minute"
+        d.mkdir(exist_ok=True)
+        t0 = epoch(2026, 10, 13, 15, 33, 0)
+        mine = d / f"{minute_stamp(t0 - 5)}-meeting.md"
+        mine.write_text("# In-person meeting 2026-10-13 15:32\n\ntext\n")
+        other = d / f"{minute_stamp(t0 + 60)}-meeting.md"   # someone else's, a minute later
+        other.write_text("# Meeting 2026-10-13 15:34\n")
+        m = vn.Meeting("1", "In-person meeting 2026-10-13 15:32", t0)
+        n = vn.Meeting("2", "Another title", t0 + 200)
+        vn.assign_meeting_mds([m, n], d)
+        self.assertEqual((m.md_path, n.md_path), (str(mine), None))
+        saved, vn.ctl.MEETING_MD_DIR = vn.ctl.MEETING_MD_DIR, d  # bmeet-ctl recent (the widget)
+        try:
+            self.assertEqual(vn.ctl.meeting_md(t0, "In-person meeting 2026-10-13 15:32"), str(mine))
+            self.assertIsNone(vn.ctl.meeting_md(t0, "Something else"))
+        finally:
+            vn.ctl.MEETING_MD_DIR = saved
+
     def test_history_load_and_remove(self):
         path = WORK / "hist-copy.jsonl"
         shutil.copy(WORK / "history.jsonl", path)

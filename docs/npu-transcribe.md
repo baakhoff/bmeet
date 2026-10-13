@@ -149,6 +149,11 @@ This ran at ~110x realtime on the NPU. Under sherpa-onnx's CPU diarization (0.2-
 - **Test:** in `tests/meeting_test.py --remember`, a second meeting with new sentences, where the people speak in another order, came out as Anna, Boris and Viktor. That was 100 % in English and 90 % in Russian, where espeak's synthetic Russian makes Whisper's word timing blur at one change of speaker. Without the window check, two of espeak's similar voices shared one turn and one name.
 - **Language:** a meeting's language is detected on the system audio and used for your microphone too. Detecting it again on a track that may hold little speech of your own went wrong in the tests, and Whisper then translated.
 
+**Robustness on the NPU:**
+- **Token cap:** a Whisper block writes at most 400 tokens; fast speech needs ~250 per 30 s. Without the cap, a loop over unclear audio ran until the NPU decoder overflowed ("roi_end <= max_dim"). That block and every later one then failed.
+- **Retry and skip:** a failed block is retried once with a fresh pipeline and then skipped. Only 3 failed blocks in a row switch to the CPU: once, one bad block had moved a 10-minute meeting onto the CPU, which took 23 minutes of CPU time.
+- **Loops:** a phrase repeated 3 or more times in a row is kept once (a single word: 5 or more times), and so is the same line 3 or more times in a row.
+
 **Speed and CPU:** a 5-minute Russian meeting (real podcast speech in both tracks, echo included) took 10 s.
 - **CPU time:** 4 s of user and 4 s of system time in total, mostly loading the models.
 - **Why so little:** numpy is kept to one thread. Its BLAS would otherwise start a thread per core for the small matrix products of the features, and they busy-wait: that was 26 s of CPU for the same meeting.
@@ -174,6 +179,25 @@ microphone is diarized like the system audio, and then:
 - **Learning your voice:** in online meetings, what is left of your microphone after the echo and the muted stretches is you. Its fingerprint is the duration-weighted mean of the middle 4 s of your longest lines, up to 60 s. It needs at least 15 s, and the last 10 meetings are kept. A meeting whose fingerprint is under 0.5 similar to the ones kept (someone else at your microphone) is skipped once there are two to compare with. In the app you can also name yourself (*You*) in an in-person meeting.
 - **Nobody through the speakers:** an online meeting in which the system audio held no speech is split the same way. That covers starting a normal meeting in the room by habit, and a call whose system audio was not captured, where the others leak into your microphone.
 - **Test:** `tests/meeting_test.py --in-person`. espeak's male voices are too alike for one microphone (TitaNet: m1/m3 0.84, as for one person), so it uses four voices at most 0.41 alike, like different people. You are learned in an online meeting, the people are named, and a second meeting in the room comes out as You, Anna, Boris and Viktor. That was 96 % of the words under the right label in English and 87 % in Russian; the misses were quick replies between two lines of someone else.
+
+## Tidying the text
+
+The outputs (meetings, `.md`, `.txt`, `.srt`) leave out what the speech models write for hesitations and slips, by fixed rules (`tidy()`; `--verbatim` keeps it all):
+- **Fillers:** э-э, а-а, м-м, эм, хмм, um, uh, with the commas around them. A lone "м" or "а" between commas counts as well; the conjunction "а" elsewhere is kept.
+- **Stutters:** a word said twice in a row ("мы мы"), a cut-off start of the next word ("функцио функционал"), and stretched sounds ("и-и-и"). Words said several times on purpose stay: да, нет, так, ну, вот, очень and a few more, and anything with punctuation between ("нет, нет, нет").
+- **Mixed scripts:** a word that mixes Latin and Cyrillic letters is written in the script most of it is in. GigaAM switches mid-word on English terms ("oкей" → "окей", "Viкl" → "Vikl", "реetention" → "reetention"). This makes them readable and searchable, though not the right word.
+- **Spacing:** "Подожди,подожди" → "Подожди, подожди", ".." → ".", "....." → "...". A comma inside a number ("5,3") stays.
+
+On a real 65-minute Russian meeting this changed 134 of 195 paragraphs and removed 1.1 % of the words.
+
+**A language model for more was tried and not shipped.** The idea was to fix punctuation and misheard words with an instruction model on the NPU: OpenVINO GenAI `LLMPipeline`, thinking off, greedy decoding. The test was a 5-minute stretch of a real Russian analytics meeting (16 paragraphs, ~900 words):
+
+| model (NPU build) | rewriting paragraphs | listing misheard terms only |
+|---|---|---|
+| Qwen3-8B, int4 channel-wise (`OpenVINO/Qwen3-8B-int4-cw-ov`) | Left most fillers. Inserted Chinese ("Переходим на рет和其他") and cut words ("визуализацию" → "виз"). 3.5 min for the stretch, compile included. | Echoed the transcript, looped on one pair 30 times, broke endings ("дашборде" → "дашборд"). |
+| Qwen3-4B-Instruct-2507, int4 channel-wise with AWQ (third-party build) | – | One right fix ("афелит" → "affiliate"). Also translated Russian ("глобально" → "globally"), dropped words, invented terms ("дажет qвиsiton" → "previous quarter"), and repeated the prompt's examples. |
+
+The NPU runs these models only with int4 channel-wise weights, and their Russian suffers from that. A better candidate is a Russian fine-tune (T-Tech T-lite-it-2.1, Apache-2.0) converted with AWQ and scale estimation. That needs a 16 GB download and a heavy conversion, and it wasn't tried.
 
 ## Models
 

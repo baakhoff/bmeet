@@ -99,7 +99,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -118,6 +118,11 @@ SAMPLE_RATE = 16_000          # what Whisper expects
 # after the first window and misheard more words (docs/npu-transcribe.md), at no speed gain.
 BLOCK_SECONDS = 30
 CUT_SEARCH_SECONDS = 10       # cut each block at the quietest 100 ms of its last 10 s
+# Tokens Whisper may write per block. Without a cap a loop runs on until the decoder is full,
+# and the NPU pipeline with word timestamps then fails ("roi_end <= max_dim") on that block
+# and every later one. 400 is plenty: fast speech is ~250 tokens per 30 s.
+WHISPER_MAX_TOKENS = 400
+MAX_FAILED_BLOCKS = 3         # blocks failing in a row before the next device (CPU) is used
 SILENCE_DBFS = -50.0          # blocks/segments with a lower peak are treated as silence
 SILENCE_AMPLITUDE = 10 ** (SILENCE_DBFS / 20)
 CUE_MARGIN = 0.2              # seconds kept around the audible part of a cue
@@ -192,6 +197,13 @@ def log(msg: str) -> None:
         print(f"{prefix}{PROG}: {msg}", file=sys.stderr, flush=True)
 
 
+def cpu_seconds() -> float:
+    """CPU time used so far by this process and its finished children (ffmpeg), in seconds.
+    Logged per stage: the models are meant to run on the NPU, the CPU only does the glue."""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
 def hms(seconds: float) -> str:
     s = int(seconds)
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
@@ -209,6 +221,52 @@ def hallucination(text: str) -> bool:
         if words and words.replace(phrase, " ").strip() == "":
             return True
     return False
+
+
+# Whisper sometimes loops over audio it cannot make out ("Я в рейтинге. Я в рейтинге. ..."
+# for a minute on a real call). A phrase of 2-12 words said this many times in a row in one
+# segment is kept once (a single word: REPEAT_WORD times, so "нет, нет, нет" stays).
+REPEAT_PHRASE = 3
+REPEAT_WORD = 5
+
+
+def collapse_repeats(seg: Segment) -> Segment:
+    """The segment with Whisper's loops (REPEAT_PHRASE / REPEAT_WORD) said once."""
+    units = seg.words or seg.text.split()
+    keys = [re.sub(r"\W+", "", (u.text if isinstance(u, Word) else u).lower()) for u in units]
+    kept, i, cut = [], 0, False
+    while i < len(units):
+        step = 1
+        for size in range(1, 13):
+            need = REPEAT_WORD if size == 1 else REPEAT_PHRASE
+            phrase = keys[i:i + size]
+            if i + size * need > len(units):
+                break
+            if not all(phrase):
+                continue
+            count = 1
+            while keys[i + count * size:i + (count + 1) * size] == phrase:
+                count += 1
+            if count >= need:
+                step, cut = size * count, True
+                break
+        kept += units[i:i + (size if step > 1 else 1)]
+        i += step
+    if not cut:
+        return seg
+    if seg.words:
+        return Segment(seg.start, kept[-1].end, " ".join("".join(w.text for w in kept).split()),
+                       kept, seg.speaker)
+    return Segment(seg.start, seg.end, " ".join(kept), [], seg.speaker)
+
+
+def drop_repeated_segments(segments: list[Segment]) -> list[Segment]:
+    """A loop across segments: the same words REPEAT_PHRASE or more times in a row are kept once."""
+    out: list[Segment] = []
+    for _, group in itertools.groupby(segments, key=lambda seg: tuple(tokens(seg.text)) or id(seg)):
+        group = list(group)
+        out += group[:1] if len(group) >= REPEAT_PHRASE else group
+    return out
 
 
 def peak_dbfs(samples: np.ndarray) -> float:
@@ -337,6 +395,7 @@ class Whisper:
         self.word_timestamps = word_timestamps
         self.device = ""
         self.used = False  # has generate() run since the last load?
+        self.failures = 0  # blocks that failed in a row
         self._load()
 
     def _load(self) -> None:
@@ -383,19 +442,39 @@ class Whisper:
         self.devices.pop(0)
 
     def generate(self, samples: np.ndarray, **kwargs):
-        """pipe.generate(); on failure reload on the next device and retry this block.
+        """pipe.generate(), or None when this block cannot be transcribed.
 
-        Known NPU failure: openvino.genai issue #4222 ("invalid unordered_map<K, T> key"
-        at the first generate() with some Whisper exports on Lunar Lake).
+        A failure is retried once with a fresh pipeline (after an error the NPU pipeline
+        can stay broken). A block that fails again is skipped: one bad block must not move
+        the rest of a long meeting to the CPU, which once took 23 min of CPU time for 10 min
+        of audio. Only after MAX_FAILED_BLOCKS failed blocks in a row (the device itself is
+        broken) does it go on with the next device. Known NPU failures: openvino.genai issue
+        #4222 ("invalid unordered_map<K, T> key" at the first generate() with some Whisper
+        exports on Lunar Lake), and a decoder overflow on loops (WHISPER_MAX_TOKENS).
         """
-        while True:
+        kwargs.setdefault("max_new_tokens", WHISPER_MAX_TOKENS)
+        for attempt in (1, 2):
             try:
                 self.used = True
-                return self.pipe.generate(samples, **kwargs)
+                result = self.pipe.generate(samples, **kwargs)
+                self.failures = 0
+                return result
             except Exception as exc:
-                self._fall_back(f"transcription on {self.device} failed: {exc}")
+                reason = " ".join(str(exc).split())  # OpenVINO errors span several lines
                 del self.pipe
-                self._load()
+                if attempt == 1:
+                    log(f"WARNING: transcription on {self.device} failed: {reason}; "
+                        "retrying this block with a fresh pipeline")
+                    self._load()
+        self.failures += 1
+        if self.failures >= MAX_FAILED_BLOCKS:
+            self._fall_back(f"transcription on {self.device} failed for {self.failures} blocks in a row")
+            self.failures = 0
+            self._load()
+            return self.generate(samples, **kwargs)
+        self._load()
+        log(f"WARNING: a block could not be transcribed on {self.device}: skipped")
+        return None
 
 
 @dataclass
@@ -606,6 +685,11 @@ def transcribe(whisper: Whisper | GigaAM, name: str,
             if peak_dbfs(block) >= SILENCE_DBFS:
                 kwargs = dict(gen_kwargs, language=f"<|{language}|>") if language else gen_kwargs
                 result = whisper.generate(block, **kwargs)
+                if result is None:
+                    dropped += 1
+                    done = start + length
+                    progress.update(done)
+                    continue
                 if not language and result.language:
                     language = result.language.strip("<|>")
                     log(f"language: {language} (auto-detected from the first block)")
@@ -621,16 +705,19 @@ def transcribe(whisper: Whisper | GigaAM, name: str,
                         sum(1 for _ in itertools.takewhile(lambda w: (w.start + w.end) / 2 <= e, words))
                     mine, words = words[:n], words[n:]
                     span = audible_span(block, s, e)
-                    if span is None or hallucination(text):
+                    if span is None or hallucination(text) or not re.search(r"\w", text):
                         dropped += 1
                         continue
-                    segments.append(Segment(start + span[0], start + span[1], text,
-                                            [Word(start + w.start, start + w.end, w.text) for w in mine]))
+                    segments.append(collapse_repeats(Segment(
+                        start + span[0], start + span[1], text,
+                        [Word(start + w.start, start + w.end, w.text) for w in mine])))
             done = start + length
             progress.update(done)
     finally:
         blocks.close()  # stops ffmpeg right away if we bail out early
         progress.close()
+    if (looped := len(segments) - len(segments := drop_repeated_segments(segments))) > 0:
+        log(f"{looped} repeated segment(s) left out (Whisper looping)")
     return Transcript(segments, done, time.monotonic() - t0, language or "?", dropped)
 
 
@@ -643,9 +730,10 @@ def transcribe_ctc(model: GigaAM, name: str, blocks: Generator[tuple[float, np.n
     t0 = time.monotonic()
     try:
         for start, block in blocks:
-            if peak_dbfs(block) >= SILENCE_DBFS:
-                segments += sentences([Word(start + w.start, start + w.end, w.text)
-                                       for w in model.words(block)])
+            if peak_dbfs(block) >= SILENCE_DBFS:  # (a lone "." or "—" is no sentence)
+                segments += [seg for seg in sentences([Word(start + w.start, start + w.end, w.text)
+                                                       for w in model.words(block)])
+                             if re.search(r"\w", seg.text)]
             done = start + block.size / SAMPLE_RATE
             progress.update(done)
     finally:
@@ -879,7 +967,7 @@ def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
     """Who speaks when. num_speakers=0: find out how many. Returns the turns, each voice's
     fingerprint (voice_prints) and the remembered names found among them (identify)."""
     log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, on {models.device})")
-    t0 = time.monotonic()
+    t0, c0 = time.monotonic(), cpu_seconds()
     windows = models.segment(samples)
     keys, pieces = [], []
     for w, (start, act) in enumerate(windows):
@@ -900,7 +988,10 @@ def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
             return models.embed([samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])
 
         if known:
+            t1, c1 = time.monotonic(), cpu_seconds()
             turns = split_by_known_voices(turns, embed_spans, remembered_voices(known))
+            log(f"long turns checked for {len(known)} remembered voice(s) in "
+                f"{time.monotonic() - t1:.1f} s (CPU {cpu_seconds() - c1:.1f} s)")
         long = [i for i, t in enumerate(turns) if t.end - t.start >= 1.0]
         spans = []
         for i in long:   # the middle EMB_SECONDS of each turn
@@ -911,7 +1002,8 @@ def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
         if known:
             turns, names = identify(turns, vecs, known)
         prints = voice_prints(turns, vecs)
-    log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s"
+    log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s "
+        f"(CPU {cpu_seconds() - c0:.1f} s)"
         + (f", recognised: {', '.join(sorted(set(names.values())))}" if names else ""))
     return turns, prints, names
 
@@ -1377,6 +1469,86 @@ def silence(samples: np.ndarray, spans: list[tuple[float, float]]) -> None:
 
 # --------------------------------------------------------------------------- output
 
+# Tidying (not with --verbatim): what the speech models write for hesitations and slips,
+# removed by rules that cannot change what was said. A language model on the NPU was tried
+# for more (misheard words) and made things worse: Qwen3 8B and 4B, int4 as the NPU needs
+# them, inserted Chinese characters, cut and translated words and invented terms on a real
+# Russian meeting (docs/npu-transcribe.md).
+FILLER = (r"(?:э+(?:[-.]+э+)*|а(?:[-.]+а+)+|а{3,}|м(?:-м+)+|м{3,}|эм+|э-м+|хм+|"
+          r"uh+|um+|uhm|hmm+|erm)")
+FILLER_BETWEEN_COMMAS = rf"(?:{FILLER}|м|а)"   # a lone "м" or "а" between commas is a hesitation too
+WORD_EDGE = (r"(?<![\w-])", r"(?![\w-])")
+KEEP_DOUBLED = {"да", "нет", "так", "ну", "вот", "очень", "давай", "давайте", "ага", "угу",
+                "ок", "окей", "ой", "yes", "no", "very", "so", "bye"}
+CYR_TO_LAT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                      ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n",
+                       "o", "p", "r", "s", "t", "u", "f", "h", "ts", "ch", "sh", "sch", "", "y", "",
+                       "e", "yu", "ya"]))
+LAT_TO_CYR = dict(zip("abcdefghijklmnopqrstuvwxyz",  # letters that look alike first, then sound
+                      ["а", "б", "с", "д", "е", "ф", "г", "х", "и", "дж", "к", "л", "м", "н", "о",
+                       "р", "к", "р", "с", "т", "у", "в", "в", "х", "у", "з"]))
+VERBATIM = False   # --verbatim
+
+
+def _case(src: str, dst: str) -> str:
+    return dst.capitalize() if src.isupper() and dst else dst
+
+
+def one_script(word: str) -> str:
+    """A word that mixes Cyrillic and Latin letters ("oкей", "Viкl", "реetention": the speech
+    model switching mid-word) in the script most of it is in (ties: its first letter's)."""
+    cyr = sum(1 for c in word if "а" <= c.lower() <= "я" or c.lower() == "ё")
+    lat = sum(1 for c in word if "a" <= c.lower() <= "z")
+    if not cyr or not lat:
+        return word
+    to_latin = lat > cyr or (lat == cyr and "a" <= word[0].lower() <= "z")
+    table = CYR_TO_LAT if to_latin else LAT_TO_CYR
+    return "".join(_case(c, table[c.lower()]) if c.lower() in table else c for c in word)
+
+
+def tidy(text: str) -> str:
+    """Fillers (э-э, а-а, хмм, um), stutters ("функцио функционал", "мы мы"), stretched
+    sounds ("и-и-и"), mixed-script words, and spacing around punctuation."""
+    if VERBATIM:
+        return text
+    a, b = WORD_EDGE
+    f = rf"{a}{FILLER}{b}"
+    t = " ".join(text.split())
+    t = re.sub(r"—{2,}", "—", t)
+    t = re.sub(rf"\s*,\s*{a}{FILLER_BETWEEN_COMMAS}{b}\s*,\s*", " ", t, flags=re.I)  # "что, хмм, показал"
+    t = re.sub(rf"(^|[.!?…]\s+){f}\s*[,.!?…]*\s*(\w?)", lambda m: m[1] + m[2].upper(), t,
+               flags=re.I)                                                            # at a sentence start
+    t = re.sub(rf"\s*,?\s*{f}\s*(?=[.!?…])", "", t, flags=re.I)                       # at a sentence end
+    t = re.sub(rf"\s*,?\s*{f},?", "", t, flags=re.I)                                 # anywhere else
+    t = re.sub(r"(?<![\w-])(\w)(?:-\1)+(?![\w-])", r"\1", t, flags=re.I)              # "и-и-и" -> "и"
+    t = re.sub(r"\b(\w{4,})\s+(\1\w{2,})\b", r"\2", t, flags=re.I)                     # "функцио функционал"
+
+    def doubled(m: re.Match) -> str:
+        return m[0] if m[1].lower() in KEEP_DOUBLED or m[1].isdigit() else m[1]
+    for _ in range(3):  # (three in a row)
+        t = re.sub(r"\b(\w+)\s+\1\b", doubled, t, flags=re.I)
+    t = re.sub(r"\w+", lambda m: one_script(m[0]), t)
+    t = re.sub(r"\s+([,.!?…:;])", r"\1", t)
+    t = re.sub(r"([,;:])(?=[^\W\d_])", r"\1 ", t)                                     # "Подожди,подожди"
+    t = re.sub(r"(?<![.])\.\.(?![.])", ".", t)                                         # "пожалуйста.."
+    t = re.sub(r"\.{4,}", "...", t)
+    t = re.sub(r",\s*([.!?…])", r"\1", t)
+    t = re.sub(r"(^|[.!?…]\s)[,;:]\s*", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,;")
+    if t and text.lstrip()[:1].isupper():
+        t = t[0].upper() + t[1:]
+    return t if re.search(r"\w", t) else ""
+
+
+def tidy_segments(segments: list[Segment]) -> list[Segment]:
+    """Segments with tidy() text; those left without words are dropped."""
+    out = []
+    for seg in segments:
+        if text := tidy(seg.text):
+            out.append(seg if text == seg.text else Segment(seg.start, seg.end, text, seg.words, seg.speaker))
+    return out
+
+
 def paragraphs(segments: list[Segment]) -> list[tuple[float, str]]:
     """Join segments into ~PARAGRAPH_SECONDS paragraphs, preferably at sentence ends."""
     out: list[tuple[float, str]] = []
@@ -1409,20 +1581,20 @@ def speaker_paragraphs(segments: list[Segment]) -> list[tuple[float, str, str]]:
 def to_srt(t: Transcript) -> str:
     cues = [f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n"
             f"{f'{s.speaker}: ' if s.speaker else ''}{s.text}\n"
-            for i, s in enumerate(t.segments, 1)]
+            for i, s in enumerate(tidy_segments(t.segments), 1)]
     return "\n".join(cues)
 
 
 def to_md(t: Transcript, src: Path, meta: dict[str, str]) -> str:
     head = [f"# {src.stem}", ""] + [f"- **{k}:** {v}" for k, v in meta.items()]
     body = [f"[{hms(start)}] " + (f"**{spk}:** " if spk else "") + text
-            for start, spk, text in speaker_paragraphs(t.segments)]
+            for start, spk, text in speaker_paragraphs(tidy_segments(t.segments))]
     return "\n".join(head) + "\n\n" + "\n\n".join(body or ["*(no speech detected)*"]) + "\n"
 
 
 def to_txt(t: Transcript) -> str:
     return "\n\n".join((f"{spk}: " if spk else "") + text
-                       for _, spk, text in speaker_paragraphs(t.segments)) + "\n"
+                       for _, spk, text in speaker_paragraphs(tidy_segments(t.segments))) + "\n"
 
 
 def meeting_time(seconds: float) -> str:
@@ -1435,6 +1607,7 @@ def meeting_md(title: str, started: float | None, duration: float, segments: lis
                meta: dict[str, str]) -> str:
     """The meeting transcript, laid out like `voxtype meeting export --format markdown`
     (which it replaces): a heading per change of speaker, a [mm:ss] mark per paragraph."""
+    segments = tidy_segments(segments)
     speakers = sorted({s.speaker for s in segments},
                       key=lambda n: (n != "You", int(n.split()[-1]) if n[-1:].isdigit() else 0, n))
     info = ([f"- **Date:** {datetime.fromtimestamp(started):%Y-%m-%d %H:%M}"] if started else []) + [
@@ -1599,6 +1772,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="transcribe a BMeet meeting recording (see above) instead of files")
     p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
     p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
+    p.add_argument("--verbatim", action="store_true",
+                   help="keep fillers (э-э, а-а, um), stutters and repeated words; by default they are "
+                        "left out")
     p.add_argument("--voices", type=Path, metavar="DIR",
                    help="--meeting: give voices remembered in DIR/voices.json their names, keep "
                         "this meeting's voice fingerprints in DIR/meetings/, and learn your own voice "
@@ -1657,19 +1833,36 @@ class Engines:
         return self._speakers
 
     def detect(self, blocks: Generator[tuple[float, np.ndarray], None, None]) -> str:
-        """Whisper's guess of the language of the first block with sound ("?" if none)."""
+        """Whisper's guess of the language of the first block with sound ("?" if none).
+        A language that is not one of yours (~/.config/bmeet/languages) is checked on the
+        next block with sound: one of yours there wins. (Whisper took synthetic Russian for
+        Polish and Latin; GenAI gives no language probabilities to compare.)"""
+        first = None
         try:
             for _, block in blocks:
-                if peak_dbfs(block) >= SILENCE_DBFS:
-                    whisper = self.whisper()
-                    whisper.ready_for_detection()
-                    result = whisper.generate(block, return_timestamps=False, task="transcribe")
-                    language = (result.language or "?").strip("<|>")
+                if peak_dbfs(block) < SILENCE_DBFS:
+                    continue
+                whisper = self.whisper()
+                whisper.ready_for_detection()
+                result = whisper.generate(block, return_timestamps=False, task="transcribe")
+                if result is None:
+                    continue
+                language = (result.language or "?").strip("<|>")
+                if first is None:
                     log(f"language: {language} (detected from the first 30 s with sound)")
+                    yours = user_languages()
+                    if not yours or language in yours:
+                        return language
+                    first = language
+                    continue
+                if language in user_languages():
+                    log(f"language: {language} on the next 30 s with sound, one of yours: "
+                        f"using it rather than {first}")
                     return language
+                return first
         finally:
             blocks.close()
-        return "?"
+        return first or "?"
 
     def choose(self, language: str, blocks) -> tuple[Whisper | GigaAM, str]:
         """(the model for this recording, its language): GigaAM for Russian unless told
@@ -1686,6 +1879,16 @@ class Engines:
                 and gigaam_ready()):
             return self.gigaam(), "ru"
         return self.whisper(), language
+
+
+def user_languages() -> set[str]:
+    """The languages you speak, from BMeet's dictation languages (~/.config/bmeet/languages,
+    e.g. "en ru"); empty if unknown."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "bmeet/languages"
+    try:
+        return {w.lower() for w in path.read_text(encoding="utf-8").split() if re.fullmatch(r"[a-z]{2,3}", w.lower())}
+    except OSError:
+        return set()
 
 
 def engine_label(engine: Whisper | GigaAM) -> str:
@@ -1729,7 +1932,7 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             remote = np.zeros(0, np.float32)
         duration = max(mic.size, remote.size) / SAMPLE_RATE
         log(f"meeting: {hms(duration)} of audio" + (", in person (microphone only)" if in_person else ""))
-        t0 = time.monotonic()
+        t0, c0 = time.monotonic(), cpu_seconds()
         gain, muted = 0.0, []
         if not in_person:
             gain = echo_gain(mic, remote)  # before the silencing, which would make it look like headphones
@@ -1745,9 +1948,13 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             remote if audible["system audio"] else mic))
         if not isinstance(engine, GigaAM) and language not in ("auto", "?"):
             gen_kwargs = dict(gen_kwargs, language=f"<|{language}|>")
-        heard = {name: transcribe(engine, name, array_blocks(samples), samples.size / SAMPLE_RATE,
-                                  gen_kwargs) if audible[name] else None
-                 for name, samples in (("system audio", remote), ("microphone", mic))}
+        heard = {}
+        for name, samples in (("system audio", remote), ("microphone", mic)):
+            t1, c1 = time.monotonic(), cpu_seconds()
+            heard[name] = transcribe(engine, name, array_blocks(samples), samples.size / SAMPLE_RATE,
+                                     gen_kwargs) if audible[name] else None
+            if heard[name]:
+                log(f"{name}: transcribed in {time.monotonic() - t1:.1f} s (CPU {cpu_seconds() - c1:.1f} s)")
         theirs, yours = heard["system audio"], heard["microphone"]
         room = in_person or not (theirs and theirs.segments)
         segments, labels, prints, names = [], {}, {}, {}
@@ -1760,7 +1967,9 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
             speakers_on = engines.speakers().device
             if not names and len({t.speaker for t in found}) == 1:
                 names = {found[0].speaker: "You"}  # one voice at your microphone: you
-            segments, labels = number_speakers(yours.segments, found, "Person", "Person ?", names)
+            # (no voice found at all, as in a few seconds of speech: that is you too)
+            segments, labels = number_speakers(yours.segments, found, "Person",
+                                               "Person ?" if found else "You", names)
         elif not room:
             found, prints, names = diarize(engines.speakers(), remote, args.num_speakers, remembered)
             speakers_on = engines.speakers().device
@@ -1812,7 +2021,7 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
                    "Meeting speakers failed")
         return 1
     print(dest, flush=True)
-    log(f"done: {hms(duration)} in {hms(wall)}, {people} other voice(s)"
+    log(f"done: {hms(duration)} in {hms(wall)} (CPU {cpu_seconds() - c0:.0f} s), {people} other voice(s)"
         + (f" ({', '.join(recognised)} recognised)" if recognised else "") + ", "
         f"{len(segments)} segment(s)" + (f", {echoes} echo word(s) left out" if echoes else ""))
     if args.notify:
@@ -1830,7 +2039,9 @@ def history_model(engine: Whisper | GigaAM | None, args: argparse.Namespace, mod
 
 
 def main(argv: list[str]) -> int:
+    global VERBATIM
     args = parse_args(argv)
+    VERBATIM = args.verbatim
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise SystemExit(f"{PROG}: {tool} not found in PATH")

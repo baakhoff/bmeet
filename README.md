@@ -20,6 +20,7 @@ machine, and the CPU and GPU are left alone.
   - When you stop, a Markdown transcript is saved to `~/Documents/Meetings` right away.
   - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 2 minutes on a Core Ultra 7 258V (other languages, with Whisper: ~8 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
+  - **Tidy text:** fillers (э-э, а-а, хмм, um), stutters and doubled words are left out (`npu-transcribe --verbatim` keeps them).
   - **Names:** *Name speakers…* in the app turns *Person 1* into *Viktor*. If you let it remember voices, later meetings call Viktor by name on their own.
   - **Muted means muted:** with the small Chrome extension loaded, what you say while muted in Google Meet or a Slack huddle is left out of the transcript (see [Chrome extension](#chrome-extension)).
 - **In-person meetings:** press **Meta+Alt+Shift+M** (or *In person* in the app or widget) for a meeting in the room. Only your microphone is recorded, and the voices on it are told apart: **You**, **Person 1**, **Person 2**, … BMeet knows your voice from your online meetings, and remembered people get their names.

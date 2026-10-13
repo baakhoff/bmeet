@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-10-13
+
+Fixes from the first real in-person meeting, tidier text, and nothing slips onto the CPU.
+
+### Fixed
+- **Missing transcripts:** the app and the widget showed voxtype's rough live draft ("no Markdown copy") instead of the speaker pass's transcript. That happened when voxtype's start time fell in the next minute after the file's stamp: a meeting stamped 15:32 was started at 15:33:00 by voxtype's clock. A file stamped a minute either side now counts when its title is the meeting's.
+- **Whisper loops** ("Я в рейтинге. Я в рейтинге. …" for a minute) are said once. That covers a phrase repeated 3 or more times, a word 5 or more times, and the same line 3 or more times in a row.
+- **Never quietly onto the CPU:**
+  - A Whisper block now writes at most 400 tokens. Without that cap, a loop overflowed the NPU decoder, and every later block failed on the NPU.
+  - A block that still fails is retried once on the NPU and then skipped.
+  - Before, the first failure moved the rest of the run to the CPU: 23 minutes of CPU time for 10 minutes of meeting. The CPU is now used only after 3 failed blocks in a row, which means the NPU itself is broken.
+- **Odd language guesses:** a language that is not one of yours (`~/.config/bmeet/languages`) is checked on the next 30 s. Whisper had taken synthetic Russian for Polish and Latin.
+- **In person:** a few seconds with no voice found are now *You*, not *Person ?*, and a line that was only a punctuation mark is dropped.
+
+### Added
+- **Tidier text:** fillers (э-э, а-а, хмм, эмм, um), stutters ("функцио функционал", "мы мы", "и-и-и"), Latin/Cyrillic mix-ups inside a word ("oкей", "Viкl"), and spacing around punctuation are cleaned up by fixed rules. On a real 65-minute meeting that removed 1.1 % of the words. Words said several times on purpose ("нет, нет, нет", "да да") stay. `npu-transcribe --verbatim` keeps everything.
+- **CPU time per stage** in npu-transcribe's log (the speaker pass's journal), to find what still runs on the CPU.
+
+### Tried, not shipped
+- **Cleaning up the text with a language model on the NPU:** Qwen3-8B and Qwen3-4B-Instruct-2507, int4 as the NPU needs them, on a real Russian meeting. Asked to rewrite paragraphs, they inserted Chinese characters, cut words and left most fillers. Asked only for misheard terms, they translated Russian words, dropped words and invented terms. That would make transcripts worse in ways that are hard to spot (docs/npu-transcribe.md).
+
 ## [0.5.0] - 2026-10-13
 
 Words you say while muted in the call are left out, and meetings in the room work too.
@@ -106,6 +127,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.5.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.1
 [0.5.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.0
 [0.4.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.4.0
 [0.3.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.3.1

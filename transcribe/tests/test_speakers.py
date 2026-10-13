@@ -253,6 +253,75 @@ class Hallucinations(unittest.TestCase):
             self.assertFalse(nt.hallucination(text), text)
 
 
+class Loops(unittest.TestCase):
+    def test_phrase_loop_in_a_segment(self):
+        text = "Ну, непонятно. " + "Я в рейтинге. " * 40 + "Поговорим по параметрам."
+        out = nt.collapse_repeats(Seg(0, 60, " ".join(text.split())))
+        self.assertEqual(out.text, "Ну, непонятно. Я в рейтинге. Поговорим по параметрам.")
+
+    def test_loop_with_word_timestamps(self):
+        ws = words("Hi@0-0.5 there@0.5-1") + [Word(1 + i * 0.4, 1.3 + i * 0.4, w)
+                                               for i, w in enumerate([" the", " end."] * 6)]
+        out = nt.collapse_repeats(Seg(0, 6, "x", ws, "You"))
+        self.assertEqual(out.text, "Hi there the end.")
+        self.assertAlmostEqual(out.end, 1.7)
+        self.assertEqual((len(out.words), out.speaker), (4, "You"))
+
+    def test_real_repetition_stays(self):
+        for text in ("Нет, нет, нет, так нельзя.", "Да. Да. Хорошо, хорошо.", "мы мы говорим"):
+            self.assertEqual(nt.collapse_repeats(Seg(0, 5, text)).text, text)
+        self.assertEqual(nt.collapse_repeats(Seg(0, 5, "the the the the the end")).text, "the end")
+
+    def test_repeated_segments(self):
+        segs = [Seg(0, 1, "Hello."), Seg(1, 2, "Thanks."), Seg(2, 3, "Thanks!"), Seg(3, 4, "Hello."),
+                Seg(4, 5, "Я в рейтинге."), Seg(5, 6, "Я в рейтинге."), Seg(6, 7, "я в рейтинге"),
+                Seg(7, 8, "Я в рейтинге."), Seg(8, 9, "Bye.")]
+        self.assertEqual([s.text for s in nt.drop_repeated_segments(segs)],
+                         ["Hello.", "Thanks.", "Thanks!", "Hello.", "Я в рейтинге.", "Bye."])
+
+
+class Tidy(unittest.TestCase):
+    def check(self, before, after):
+        self.assertEqual(nt.tidy(before), after)
+
+    def test_fillers(self):
+        self.check("Э-э, я созванивалась с бренд-донором, а-а, на прошлой неделе, он сказал, что, "
+                   "хмм, показал мне схему, по которой,м, вообще.",
+                   "Я созванивалась с бренд-донором на прошлой неделе, он сказал, что показал мне "
+                   "схему, по которой вообще.")
+        self.check("Вот. А-а. И мы, э-э-э, начали. А..а, какую-то, хмм, условно.",
+                   "Вот. И мы начали. Какую-то условно.")
+        self.check("So, um, we start, uh, now.", "So we start now.")
+        self.check("Э-э.", "")
+
+    def test_repeats_and_stutters(self):
+        self.check("То есть мы мы говорим, или или нет. Вот по функцио функционал.",
+                   "То есть мы говорим, или нет. Вот по функционал.")
+        self.check("И-и-и да, ответ: да.", "И да, ответ: да.")
+        # (meant: a word said several times on purpose, "при приходе", millimetres)
+        for same in ("Нет, нет, нет, так нельзя.", "Да да, очень очень хорошо.", "При приходе: 5 мм.",
+                     "Вот вот.", "А здесь, а там."):
+            self.check(same, same)
+
+    def test_mixed_scripts_and_spacing(self):
+        self.check("Так,oкей, ретеншн и реetention, Viкl LifeTime, одно FД.",
+                   "Так, окей, ретеншн и reetention, Vikl LifeTime, одно FD.")
+        self.check("Подожди,подожди. 5,3 темнее.. Он ушёл....", "Подожди, подожди. 5,3 темнее. Он ушёл...")
+        self.check("—— Да, включил. — Включил?", "— Да, включил. — Включил?")
+
+    def test_verbatim_and_outputs(self):
+        segs = [Seg(0, 1, "Э-э, привет.", speaker="You"), Seg(1, 2, "А-а.", speaker="Person 1"),
+                Seg(2, 3, "Мы мы начали.", speaker="You")]
+        md = nt.meeting_md("T", None, 3, segs, {})
+        self.assertIn("*[00:00]* Привет. Мы начали.", md)
+        self.assertNotIn("Person 1", md)  # only a filler: nothing left of it
+        try:
+            nt.VERBATIM = True
+            self.assertEqual(nt.tidy("Э-э, привет."), "Э-э, привет.")
+        finally:
+            nt.VERBATIM = False
+
+
 class Echo(unittest.TestCase):
     """System audio 0-10 s, leaking into the microphone at -20 dB; you speak 10-12 s."""
 

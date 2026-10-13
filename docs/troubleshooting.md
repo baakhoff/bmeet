@@ -47,6 +47,8 @@ speakers apart…" until it is done.
 | Your words are missing although you were not muted | The transcript's *Microphone off* line says how much was left out. Look at `call-mic.jsonl` while a meeting records (`$(cat $XDG_RUNTIME_DIR/bmeet/recording)/call-mic.jsonl`): `"live": false` while you talk means the extension did not see your sound. Please open an issue with that file's lines. Removing the extension restores the old behaviour. |
 | In person, everyone is *Person 1, 2…* and nobody is *You* | Your voice is learned from online meetings with remembered voices on (`verify.sh` shows how many). Until then, write *You* for yourself in *Name speakers…*: later in-person meetings recognise you. |
 | In person, everything is under *You* | Telling speakers apart is off, or only one voice was found. |
+| The app shows "From voxtype's meeting database (no Markdown copy)" for a finished meeting | Before 0.5.1 the app missed a transcript stamped a minute before voxtype's start time; it is in `~/Documents/Meetings` all the same. Otherwise the speaker pass failed: see its log above. |
+| Fillers or repeated words are missing where you need them verbatim | Transcripts are tidied (docs/npu-transcribe.md, *Tidying the text*). For a file: `npu-transcribe --verbatim FILE`. |
 | *Name speakers…* is greyed out | The meeting is still recording, its speaker pass is running, or the transcript has no speakers (voxtype's *You* / *Remote* version). |
 
 When you open an issue, include the output of `verify.sh` and

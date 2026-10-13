@@ -30,7 +30,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
@@ -108,13 +108,26 @@ def db() -> sqlite3.Connection | None:
     return con
 
 
-def meeting_md(started_at: int) -> str | None:
-    """Markdown copy written by voxtype-meeting-toggle, named YYYY-MM-DD_HHMM-meeting*.md."""
+def meeting_md(started_at: int, title: str = "") -> str | None:
+    """Markdown copy written by voxtype-meeting-toggle, named YYYY-MM-DD_HHMM-meeting*.md
+    after the start minute. voxtype's own start time can be a few seconds off that, so a
+    minute either side counts too when the file's "# Title" is the meeting's (as in the app)."""
     import time
-    stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at))
-    for p in sorted(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")):
-        return str(p)
+    for offset, by_title in ((0, False), (10, False), (-60, True), (60, True)):
+        stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at + offset))
+        for p in sorted(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")):
+            if not by_title or (title and md_title(p) == title):
+                return str(p)
     return None
+
+
+def md_title(path) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            first = f.readline().strip()
+    except OSError:
+        return ""
+    return first[2:].strip() if first.startswith("# ") else ""
 
 
 def speakers_pending() -> list[str]:
@@ -162,7 +175,7 @@ def recent(limit: int) -> list[dict]:
                              "ORDER BY started_at DESC LIMIT ?", (limit,)):
             items.append({"kind": "meeting", "id": r["id"], "title": r["title"] or "Meeting",
                           "time": r["started_at"], "duration": r["duration_secs"],
-                          "status": r["status"], "path": meeting_md(r["started_at"])})
+                          "status": r["status"], "path": meeting_md(r["started_at"], r["title"] or "")})
         con.close()
     try:
         lines = FILE_HISTORY.read_text().splitlines()[-limit * 2:]

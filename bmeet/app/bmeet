@@ -61,7 +61,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -300,12 +300,24 @@ def minute_stamp(epoch: float) -> str:
     return time.strftime("%Y-%m-%d_%H%M", time.localtime(epoch))
 
 
+def md_title(path: str) -> str:
+    """The "# Title" a meeting transcript starts with ("" if none)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            first = f.readline().strip()
+    except OSError:
+        return ""
+    return first[2:].strip() if first.startswith("# ") else ""
+
+
 def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
     """Find the Markdown copy voxtype-meeting-toggle wrote for each meeting:
     MD_DIR/YYYY-MM-DD_HHMM-meeting[-EPOCH].md, named after the start minute. The stamp
-    is taken just after `voxtype meeting start` returns, so a start at hh:mm:59 may
-    be stamped a minute later. Files go out oldest first, so two meetings started
-    in the same minute each get their own."""
+    is taken just after `voxtype meeting start` returns, and voxtype's own start time
+    can fall in the next or the previous minute (a file stamped 1532 for a meeting
+    voxtype started at 15:33:00), so a neighbouring minute counts too when the file's
+    title is the meeting's. Files go out oldest first, so two meetings started in the same minute
+    each get their own."""
     candidates: dict[str, list[tuple[float, str]]] = {}
     try:
         for entry in os.scandir(md_dir):
@@ -317,10 +329,15 @@ def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
     for files in candidates.values():
         files.sort()
     chronological = sorted(meetings, key=lambda m: m.started_at)
-    for offset in (0, 10):  # exact minutes first, then "the start took a moment"
+    # exact minute, "the start took a moment", then a minute either side with the title
+    for offset, by_title in ((0, False), (10, False), (-60, True), (60, True)):
         for m in chronological:
-            if m.md_path is None and (files := candidates.get(minute_stamp(m.started_at + offset))):
-                m.md_path = files.pop(0)[1]
+            if m.md_path is not None or not (files := candidates.get(minute_stamp(m.started_at + offset))):
+                continue
+            pick = next((f for f in files if not by_title or md_title(f[1]) == m.title), None)
+            if pick:
+                files.remove(pick)
+                m.md_path = pick[1]
 
 
 def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> list[Meeting]:

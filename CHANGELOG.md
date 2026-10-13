@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-10-13
+
+Telling the speakers apart with NVIDIA's Nemotron 3 Diarization, on the NPU: far less speech under the wrong person, in Russian first of all.
+
+### Changed
+- **Who speaks when:** NVIDIA's Nemotron 3 Diarization (September 2026, OpenMDW-1.1) replaces pyannote segmentation + clustered TitaNet fingerprints, still on the NPU. Measured on real recordings (`transcribe/tests/speakers_test.py`):
+  - **Russian podcasts** (4.1 h, 2-3 people): speech under the wrong person 8.1 % → 2.1 %.
+  - **AMI meetings** recorded by one microphone in the room (9 h, 3-4 people): 22.8 % → 8.4 %; diarization error rate 42.3 % → 11.0 %; the right number of people in 15 of 16 meetings instead of 4.
+  - **Someone who says little:** a phrase of about 5 s or more usually gets a voice of its own. Before, voices with under 15 s of speech were folded into others.
+  - **Faster:** ~16 s per hour of audio on the NPU instead of ~30 s.
+  - **Remembered voices** still use TitaNet fingerprints, so the voices you named and your own voice carry over.
+  - **Install:** the installer downloads the model (~400 MB) and `transcribe/prepare-diarization` rebuilds it for the NPU without PyTorch (~20 s, once). On the NPU it agrees with NVIDIA's reference code on 99.98 % of the 10 ms frames. `NPU_DIARIZATION=pyannote` uses the way of before.
+  - Up to 8 voices per track.
+- **One person as two voices:** over a long recording Nemotron now and then opens a second voice for someone; voices whose fingerprints are at least 0.75 alike become one. That halved the speech under the wrong person on the Russian podcasts, to 2.1 %.
+
+### Fixed
+- **Their last word under *You*:** a word the other side says just as you start talking, which your microphone picks up from the speakers, was kept in your line: the echo filter compares loudness, and you are loud there already. The same word at the same moment on both tracks is now theirs.
+- **Learning your own voice from long lines:** only the middle 4 s of each of your lines counted, so meetings where Whisper joined your sentences into a few long lines could teach nothing (15 s needed). A long line now gives several 4 s pieces.
+
+### Tests
+- **`transcribe/tests/meeting_test.py` uses real people:** four speakers of Russian podcasts (transcribed by GigaAM, as in a meeting) or four LibriSpeech readers, downloaded into the work folder. Every case comes out with 100 % of the words under the right label, in both languages. Nemotron often hears espeak's synthetic voices as one person, so `--espeak` now checks only your label, the echo and muting.
+- **`transcribe/tests/speakers_test.py`:** who speaks when on the Russian podcasts and (`--ami`) the AMI meetings.
+
 ## [0.5.2] - 2026-10-13
 
 English terms in Russian speech come out right far more often.
@@ -138,6 +161,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.6.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.6.0
 [0.5.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.2
 [0.5.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.1
 [0.5.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.0

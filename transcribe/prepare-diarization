@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Prepare Nemotron 3 Diarization (who speaks when) for the Intel NPU, once, at install time.
+
+NVIDIA's speaker diarization model (Sept 2026, OpenMDW-1.1): up to 8 voices, speaker
+activity every 10 ms. Its Hugging Face weights (model.safetensors, read with numpy: no
+PyTorch) are rebuilt as two OpenVINO models with fixed shapes, as the NPU needs:
+- embedder: 3040 log-mel frames (128 mels, 10 ms) -> 380 encoder frames (80 ms; 8 mel
+  frames stacked and projected);
+- encoder: 684 encoder frames (the speaker cache 264 + FIFO 40 + chunk 340 + look-ahead
+  40 of the model's offline setting, padded and masked when shorter) -> each voice's
+  probability every 10 ms. 31 transformer layers with rotary positions (restarting at 0
+  each chunk, so they are constants here), the sub-pixel upsampling and the classifier,
+  as in transformers' Nemotron3DiarizationForAudioFrameClassification. Padding frames
+  are zeroed before the upsampling convolution, as the end of the original's input.
+The speaker cache between chunks is kept by npu-transcribe (numpy). fp16 weights
+(~200 MB). On the NPU the model agrees with transformers' (fp32, CPU) on 99.98 % of the
+10 ms frames, and on AMI meetings it scores the published 11.1 % DER.
+
+Usage: prepare-diarization MODEL.safetensors OUT_DIR [--compile]
+  MODEL.safetensors  nvidia/Nemotron-3-Diarization's model.safetensors
+  OUT_DIR            receives embedder.xml, encoder.xml (+ .bin) and silence.npy
+  --compile          also compile them for the NPU into ~/.cache/npu-ov-cache (~20 s, once)
+Run with the npu-transcribe venv's Python (openvino, numpy).
+"""
+from __future__ import annotations
+
+import json
+import struct
+import sys
+from pathlib import Path
+
+sys.modules["openvino_telemetry"] = None  # (see npu-transcribe)
+import numpy as np  # noqa: E402
+
+# its sizes (config.json of revision f667ed7) and the offline setting
+NEMOTRON_LAYERS, NEMOTRON_HIDDEN, NEMOTRON_HEADS, NEMOTRON_MELS, NEMOTRON_STACK = 31, 512, 8, 128, 8
+NEMOTRON_STEP = 264 + 40 + 340 + 40   # speaker cache + FIFO + chunk + look-ahead (encoder frames)
+NEMOTRON_EMBED = 340 + 40             # encoder frames per embedder call
+
+
+def read_safetensors(path: Path) -> dict[str, np.ndarray]:
+    """{name: float32 array} of a safetensors file (memory-mapped)"""
+    with open(path, "rb") as f:
+        size = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(size))
+    data = np.memmap(path, np.uint8, "r", offset=8 + size)
+    out = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        if info["dtype"] != "F32":
+            raise SystemExit(f"{name}: {info['dtype']}, expected F32: is this the right model?")
+        a, b = info["data_offsets"]
+        out[name] = np.frombuffer(data[a:b], np.float32).reshape(info["shape"])
+    return out
+
+
+def prepare(weights: Path, out: Path, compile_npu: bool) -> None:
+    import openvino as ov
+    import openvino.opset13 as ops
+    w = read_safetensors(weights)
+    hidden, heads, mels, stack, step = NEMOTRON_HIDDEN, NEMOTRON_HEADS, NEMOTRON_MELS, NEMOTRON_STACK, NEMOTRON_STEP
+    dim = hidden // heads
+    expect = {"model.audio_tower.embedder.projection.weight": (hidden, stack * mels),
+              f"model.audio_tower.layers.{NEMOTRON_LAYERS - 1}.mlp.fc2.weight": (hidden, 4 * hidden),
+              "model.upsampler.conv.weight": (192 * stack, 192, 3), "classifier.out_proj.weight": (8, 192),
+              "silence_embeds": (hidden,)}
+    for name, shape in expect.items():
+        if name not in w or w[name].shape != shape:
+            raise SystemExit(f"{name}: not {shape}: is this the right model?")
+    if f"model.audio_tower.layers.{NEMOTRON_LAYERS}.mlp.fc2.weight" in w:
+        raise SystemExit(f"more than {NEMOTRON_LAYERS} layers: is this the right model?")
+    const = lambda a: ops.constant(np.ascontiguousarray(a, np.float32))
+    shape = lambda *v: ops.constant(np.array(v, np.int64))
+    out.mkdir(parents=True, exist_ok=True)
+
+    feats = ops.parameter([1, NEMOTRON_EMBED * stack, mels], np.float32, name="features")
+    stacked = ops.reshape(feats, shape(1, NEMOTRON_EMBED, stack * mels), False)
+    embeds = ops.matmul(stacked, const(w["model.audio_tower.embedder.projection.weight"]), False, True)
+    embeds.output(0).get_tensor().set_names({"embeds"})
+    ov.save_model(ov.Model([embeds], [feats], "nemotron_embedder"), str(out / "embedder.xml"),
+                  compress_to_fp16=True)
+
+    x = ops.parameter([1, step, hidden], np.float32, name="embeds")
+    mask = ops.parameter([1, step], np.float32, name="mask")
+    additive = ops.reshape(ops.multiply(ops.subtract(const(1.0), mask), const(-30000.0)),
+                           shape(1, 1, 1, step), False)
+    inv_freq = 1.0 / (10000.0 ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
+    angles = np.arange(step)[:, None] * inv_freq[None, :]
+    angles = np.concatenate([angles, angles], -1)[None, None]           # (1, 1, step, dim)
+    cos, sin = const(np.cos(angles)), const(np.sin(angles))
+    half = np.zeros((dim, dim), np.float32)                             # rotate_half(q) == q @ half
+    for j in range(dim // 2):
+        half[j + dim // 2, j], half[j, j + dim // 2] = -1.0, 1.0
+    half = const(half)
+
+    def norm(h, p):
+        n = ops.mvn(h, shape(-1), True, 1e-5, "inside_sqrt")
+        return ops.add(ops.multiply(n, const(w[p + ".weight"])), const(w[p + ".bias"]))
+
+    def linear(h, p, bias=True):
+        y = ops.matmul(h, const(w[p + ".weight"]), False, True)
+        return ops.add(y, const(w[p + ".bias"])) if bias else y
+
+    def heads_of(h):
+        return ops.transpose(ops.reshape(h, shape(1, step, heads, dim), False), shape(0, 2, 1, 3))
+
+    def rotary(h):
+        return ops.add(ops.multiply(h, cos), ops.multiply(ops.matmul(h, half, False, False), sin))
+
+    h = norm(x, "model.audio_tower.input_layer_norm")
+    for i in range(NEMOTRON_LAYERS):
+        p = f"model.audio_tower.layers.{i}"
+        a = norm(h, p + ".layer_norm1")
+        q = rotary(heads_of(linear(a, p + ".self_attn.q_proj", False)))
+        k = rotary(heads_of(linear(a, p + ".self_attn.k_proj", False)))
+        v = heads_of(linear(a, p + ".self_attn.v_proj", False))
+        scores = ops.add(ops.multiply(ops.matmul(q, k, False, True), const(dim ** -0.5)), additive)
+        o = ops.matmul(ops.softmax(scores, -1), v, False, False)
+        o = ops.reshape(ops.transpose(o, shape(0, 2, 1, 3)), shape(1, step, hidden), False)
+        h = ops.add(h, linear(o, p + ".self_attn.o_proj"))
+        m = linear(ops.gelu(linear(norm(h, p + ".layer_norm2"), p + ".mlp.fc1"), "erf"), p + ".mlp.fc2")
+        h = ops.add(h, m)
+    h = linear(norm(h, "model.audio_tower.layer_norm"), "model.proj")
+    h = ops.multiply(h, ops.reshape(mask, shape(1, step, 1), False))
+    h = ops.convolution(ops.transpose(h, shape(0, 2, 1)), const(w["model.upsampler.conv.weight"]),
+                        [1], [1], [1], [1])
+    h = ops.add(h, const(w["model.upsampler.conv.bias"].reshape(1, -1, 1)))
+    h = ops.reshape(ops.transpose(h, shape(0, 2, 1)), shape(1, step * stack, 192), False)
+    h = linear(ops.relu(linear(ops.relu(h), "classifier.dense")), "classifier.out_proj")
+    probs = ops.sigmoid(h)
+    probs.output(0).get_tensor().set_names({"probs"})
+    ov.save_model(ov.Model([probs], [x, mask], "nemotron_encoder"), str(out / "encoder.xml"),
+                  compress_to_fp16=True)
+    np.save(out / "silence.npy", w["silence_embeds"].astype(np.float32))
+    print(f"  {out}/encoder.xml ready")
+    if compile_npu:
+        import time
+        core = ov.Core()
+        if "NPU" not in core.available_devices:
+            print("  no NPU: not compiling")
+            return
+        t0 = time.monotonic()
+        for name in ("embedder.xml", "encoder.xml"):
+            core.compile_model(str(out / name), "NPU", {"CACHE_DIR": str(Path.home() / ".cache/npu-ov-cache")})
+        print(f"  compiled for the NPU in {time.monotonic() - t0:.0f} s (cached)")
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if a != "--compile"]
+    if len(args) != 2:
+        print(__doc__.split("Usage:")[1].split("Run with")[0].strip(), file=sys.stderr)
+        return 2
+    prepare(Path(args[0]), Path(args[1]), "--compile" in sys.argv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

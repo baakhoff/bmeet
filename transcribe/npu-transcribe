@@ -17,9 +17,8 @@ Existing files are never overwritten (your own NAME.md notes, downloaded NAME.sr
 subtitles, an earlier transcript): the outputs then become NAME.2.*, NAME.3.*, ...
 unless --overwrite is given.
 
-With --speakers, the voices are told apart (pyannote segmentation + TitaNet fingerprints,
-also on the NPU) and every line is labelled Speaker 1, Speaker 2, ... in the order they
-first speak.
+With --speakers, the voices are told apart (NVIDIA's Nemotron 3 Diarization, also on the
+NPU) and every line is labelled Speaker 1, Speaker 2, ... in the order they first speak.
 --meeting DIR turns a BMeet meeting recording (DIR/part-N-mic.wav + part-N-remote.wav,
 written by bmeet-meeting-audio) into a Markdown transcript: the microphone is "You",
 the voices in the system audio become Person 1, Person 2, ... Your words from when the
@@ -54,7 +53,8 @@ Notes:
     On the NPU this needs a fresh pipeline per file (~3 s reload, see
     Whisper.ready_for_detection); pass --language to skip that in big batches.
   * Models live in ~/.local/share/npu-models (env NPU_MODELS_DIR); the speaker models in
-    its speaker-diarization/ folder.
+    its speaker-diarization/ folder. Env NPU_DIARIZATION=pyannote tells the voices apart
+    the way of before 0.6.0 (pyannote segmentation + clustered TitaNet fingerprints).
   * --speakers keeps the whole file in memory (~230 MB per hour of audio) and uses
     Whisper's word timestamps, so a sentence that crosses a change of speaker is split.
   * Exit status: 0 all files done, 1 some file failed, 2 usage error, 130 Ctrl+C.
@@ -102,7 +102,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -140,17 +140,33 @@ HALLUCINATIONS = (
 )
 PARAGRAPH_SECONDS = 30       # Markdown/text paragraph length (approximate)
 FORMATS = ("srt", "md", "txt")
-# Speaker diarization on the NPU (SpeakerModels): pyannote segmentation-3.0 finds who speaks
-# when in 10 s windows, TitaNet-small fingerprints each voice, the fingerprints are
-# clustered. The installer downloads both models (sha256-pinned, sherpa-onnx's exports).
+# Speaker diarization on the NPU (SpeakerModels): NVIDIA's Nemotron 3 Diarization (Sept 2026,
+# OpenMDW-1.1; prepare-diarization rebuilds it for the NPU) finds who speaks when, up to 8
+# voices. On 4 h of Russian podcasts it gave 2.1 % of the speech to the wrong person where
+# the pyannote way below gave 8.1 %; on 9 h of AMI meetings (one microphone in the room)
+# 8.4 % where that gave 22.8 % (tests/speakers_test.py, docs/npu-transcribe.md).
+# TitaNet-small fingerprints the voices it found, for remembered voices. Without Nemotron
+# (an install from before 0.6.0, or NPU_DIARIZATION=pyannote) pyannote segmentation-3.0
+# finds who speaks in 10 s windows and the TitaNet fingerprints are clustered. The
+# installer downloads all of them (sha256-pinned).
 SPEAKER_MODELS = MODELS_DIR / "speaker-diarization"
+DIARIZATION_MODEL = SPEAKER_MODELS / "nemotron-3-diarization"   # embedder.xml, encoder.xml, silence.npy
+USE_PYANNOTE = os.environ.get("NPU_DIARIZATION") == "pyannote"  # the old way: to compare, or a way out
 SEGMENTATION_MODEL = SPEAKER_MODELS / "pyannote-segmentation-3-0.onnx"
 EMBEDDING_MODEL = SPEAKER_MODELS / "nemo_en_titanet_small.onnx"  # NVIDIA TitaNet-small, CC-BY-4.0
-# Clustering threshold (cosine distance, average linkage) for "same voice" when the number
-# of speakers is not given: higher merges more. On calls of 2-4 LibriSpeech readers through
-# Opus, 0.3-0.65 found the right number of people every time and 0.4 put the most speech
-# under the right one; 0.7 merged two (docs/npu-transcribe.md). Env NPU_SPEAKER_THRESHOLD
-# overrides it: lower when two people end up as one, higher when one person is split.
+VOICE_ACTIVE = 0.5            # Nemotron: a voice talks where its probability is above this
+# Over a long recording Nemotron's speaker cache now and then opens a second voice for someone
+# (a 99 min podcast: the host as two voices, 0.92 alike; an AMI meeting: 0.89). Voices whose
+# TitaNet fingerprints are at least this alike are one person (other people in those
+# recordings: at most 0.61). On the Russian podcasts this halved the speech under the wrong
+# person (to 2.1 %), on AMI 8.5 -> 8.4 % and the right number of people in 15 of 16.
+SAME_PERSON = 0.75
+# (The pyannote way) Clustering threshold (cosine distance, average linkage) for "same voice"
+# when the number of speakers is not given: higher merges more. On calls of 2-4 LibriSpeech
+# readers through Opus, 0.3-0.65 found the right number of people every time and 0.4 put
+# the most speech under the right one; 0.7 merged two (docs/npu-transcribe.md). Env
+# NPU_SPEAKER_THRESHOLD overrides it: lower when two people end up as one, higher when one
+# person is split.
 SPEAKER_THRESHOLD = float(os.environ.get("NPU_SPEAKER_THRESHOLD") or 0.4)
 WORD_SMOOTH_SECONDS = 0.6     # a speaker change shorter than this inside a sentence is noise
 # Remembered voices (--voices): a voice in a new meeting gets a remembered name when its
@@ -174,6 +190,7 @@ VOICE_MIN_RUN = 1.5           # changes for at least this long (similar voices s
 FINGERPRINT_SECONDS = 60      # a person's fingerprint: their longest turns, up to this much speech
 ECHO_MARGIN = 2.0             # meeting: a mic word at most this much louder than the echo
                               # expected from the system audio at that moment is the echo
+ECHO_SAME_WORD = 0.25         # ... or a mic word said remotely within this of the same moment
 ECHO_WINDOW = 2.0             # without word timestamps: look this far around a mic line ...
 ECHO_SHARE = 0.6              # ... and drop it when this share of its words was said remotely
 # Microphone off in the call: BMeet's Chrome extension logs whether the browser call sent
@@ -908,7 +925,9 @@ class Turn:
 
 
 def speaker_models_missing() -> list[Path]:
-    return [p for p in (SEGMENTATION_MODEL, EMBEDDING_MODEL) if not p.is_file()]
+    who = SEGMENTATION_MODEL if USE_PYANNOTE else DIARIZATION_MODEL / "encoder.xml"
+    return [p for p in (EMBEDDING_MODEL, who) if not p.is_file()
+            and not (p == who and SEGMENTATION_MODEL.is_file())]   # (pyannote: before 0.6.0)
 
 
 def unit(v) -> np.ndarray:
@@ -918,8 +937,10 @@ def unit(v) -> np.ndarray:
 
 class SpeakerModels:
     """Who speaks when, on the NPU (OpenVINO; the CPU only when there is no NPU):
-    pyannote segmentation-3.0 finds up to 3 voices in each 10 s window, TitaNet-small
-    fingerprints them. Two patches make them right on the NPU's fp16 (titanet_npu_safe)."""
+    Nemotron 3 Diarization (self.nemotron), and TitaNet-small to fingerprint voices.
+    Without Nemotron, pyannote segmentation-3.0 finds up to 3 voices in each 10 s window
+    and their TitaNet fingerprints are clustered. A patch makes TitaNet right on the NPU's
+    fp16 (titanet_npu_safe)."""
     SEG_WINDOW = 10 * SAMPLE_RATE           # the segmentation model's input
     SEG_STEP = 5 * SAMPLE_RATE              # windows overlap by half
     FRAME = 270                             # samples per segmentation frame (receptive field shift)
@@ -936,17 +957,21 @@ class SpeakerModels:
             raise RuntimeError(f"speaker model missing: {missing[0]} - run the installer again")
         core = ov.Core()
         self.emb_frames = int(self.EMB_SECONDS * SAMPLE_RATE / self.HOP) + 1
+        self.nemotron: Nemotron | None = None
         while True:
             dev = devices[0]
             try:
-                seg = core.read_model(str(SEGMENTATION_MODEL))
-                seg.reshape({"x": [1, 1, self.SEG_WINDOW]})
+                config = {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
+                if (DIARIZATION_MODEL / "encoder.xml").is_file() and not USE_PYANNOTE:
+                    self.nemotron = Nemotron(core, dev, config)
+                else:
+                    seg = core.read_model(str(SEGMENTATION_MODEL))
+                    seg.reshape({"x": [1, 1, self.SEG_WINDOW]})
+                    self.seg = core.compile_model(seg, dev, config).create_infer_request()
                 emb = core.read_model(str(EMBEDDING_MODEL))
                 emb.reshape({"audio_signal": [self.EMB_BATCH, self.MELS, self.emb_frames],
                              "length": [self.EMB_BATCH]})
                 titanet_npu_safe(emb)
-                config = {"CACHE_DIR": str(CACHE_DIR)} if dev == "NPU" else {}
-                self.seg = core.compile_model(seg, dev, config).create_infer_request()
                 self.emb = core.compile_model(emb, dev, config).create_infer_request()
             except Exception as exc:
                 reason = " ".join(f"speaker models on {dev} failed: {exc}".split())
@@ -958,22 +983,9 @@ class SpeakerModels:
             self.device = dev
             break
         self.emb_out = next(o for o in self.emb.model_outputs if "emb" in o.get_any_name())
-        self.mel = self.slaney_filters()
+        self.mel = slaney_filters(self.MELS, self.N_FFT)
         win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.WIN) / self.WIN)  # periodic Hann
         self.window = np.pad(win, ((self.N_FFT - self.WIN) // 2, (self.N_FFT - self.WIN + 1) // 2))
-
-    @classmethod
-    def slaney_filters(cls) -> np.ndarray:
-        """librosa's mel filters (sr 16000, n_fft 512, 80 mels, slaney scale and norm): (257, 80)"""
-        f_sp, min_log_hz, min_log_mel, logstep = 200.0 / 3, 1000.0, 15.0, np.log(6.4) / 27.0
-        to_mel = lambda f: np.where(f >= min_log_hz, min_log_mel + np.log(np.maximum(f, 1e-10) / min_log_hz)
-                                    / logstep, f / f_sp)
-        to_hz = lambda m: np.where(m >= min_log_mel, min_log_hz * np.exp(logstep * (m - min_log_mel)), f_sp * m)
-        hz = to_hz(np.linspace(to_mel(np.float64(0)), to_mel(np.float64(SAMPLE_RATE / 2)), cls.MELS + 2))
-        freqs = np.linspace(0, SAMPLE_RATE / 2, cls.N_FFT // 2 + 1)
-        ramps = hz[:, None] - freqs[None, :]
-        w = np.maximum(0, np.minimum(-ramps[:-2] / np.diff(hz)[:-1, None], ramps[2:] / np.diff(hz)[1:, None]))
-        return (w * (2.0 / (hz[2:] - hz[:-2]))[:, None]).T.astype(np.float32)
 
     def features(self, x: np.ndarray) -> np.ndarray:
         """NeMo's: preemphasis 0.97, centred STFT, power, log mel, normalised per feature"""
@@ -1011,6 +1023,224 @@ class SpeakerModels:
             v = self.emb.infer({"audio_signal": feats, "length": lengths})[self.emb_out][:len(batch)]
             out[b:b + len(batch)] = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
         return out
+
+
+def slaney_filters(mels: int, n_fft: int) -> np.ndarray:
+    """librosa's mel filters (sr 16000, slaney scale and norm): (n_fft // 2 + 1, mels)"""
+    f_sp, min_log_hz, min_log_mel, logstep = 200.0 / 3, 1000.0, 15.0, np.log(6.4) / 27.0
+    to_mel = lambda f: np.where(f >= min_log_hz, min_log_mel + np.log(np.maximum(f, 1e-10) / min_log_hz)
+                                / logstep, f / f_sp)
+    to_hz = lambda m: np.where(m >= min_log_mel, min_log_hz * np.exp(logstep * (m - min_log_mel)), f_sp * m)
+    hz = to_hz(np.linspace(to_mel(np.float64(0)), to_mel(np.float64(SAMPLE_RATE / 2)), mels + 2))
+    freqs = np.linspace(0, SAMPLE_RATE / 2, n_fft // 2 + 1)
+    ramps = hz[:, None] - freqs[None, :]
+    w = np.maximum(0, np.minimum(-ramps[:-2] / np.diff(hz)[:-1, None], ramps[2:] / np.diff(hz)[1:, None]))
+    return (w * (2.0 / (hz[2:] - hz[:-2]))[:, None]).T.astype(np.float32)
+
+
+class Nemotron:
+    """Who speaks when with Nemotron 3 Diarization, as prepare-diarization built it for the NPU:
+    the probability that each of up to 8 voices talks, every 10 ms, voices numbered in the
+    order they first speak. The recording goes through in chunks of CHUNK encoder frames
+    (80 ms each: 27 s) that also see AHEAD frames on and the speaker cache (SpeakerCache):
+    frames kept from each voice so far, so a voice keeps its number through hours of audio.
+    This is transformers' Nemotron3DiarizationForAudioFrameClassification in its offline
+    setting; on the NPU it agrees with it on 99.98 % of the 10 ms frames."""
+    MELS, N_FFT, WIN, HOP, STACK = 128, 512, 400, 160, 8   # 10 ms log-mel frames, 8 per encoder frame
+    CHUNK, AHEAD = 340, 40
+    HIDDEN, VOICES = 512, 8
+
+    def __init__(self, core, device: str, config: dict) -> None:
+        self.embedder = core.compile_model(str(DIARIZATION_MODEL / "embedder.xml"), device, config) \
+            .create_infer_request()
+        self.encoder = core.compile_model(str(DIARIZATION_MODEL / "encoder.xml"), device, config) \
+            .create_infer_request()
+        self.block = self.embedder.model_inputs[0].get_partial_shape()[1].get_length() // self.STACK
+        self.step = self.encoder.model_inputs[0].get_partial_shape()[1].get_length()
+        if self.block != self.CHUNK + self.AHEAD or \
+                self.step != SpeakerCache.LENGTH + SpeakerCache.FIFO + self.CHUNK + self.AHEAD:
+            raise RuntimeError(f"unexpected Nemotron model in {DIARIZATION_MODEL} - run the installer again")
+        self.silence = np.load(DIARIZATION_MODEL / "silence.npy")
+        self.setup_features()
+
+    def setup_features(self) -> None:
+        self.mel = slaney_filters(self.MELS, self.N_FFT)
+        self.window = np.zeros(self.N_FFT)          # symmetric Hann, centred in the transform
+        offset = (self.N_FFT - self.WIN) // 2
+        self.window[offset:offset + self.WIN] = np.hanning(self.WIN)
+
+    def features(self, samples: np.ndarray, first: int, count: int) -> np.ndarray:
+        """Log-mel frames first..first+count-1 of the whole recording, as transformers'
+        NemotronAsrStreamingFeatureExtractor (pre-emphasis 0.97, centred STFT, Slaney mel,
+        log, no normalisation); frames from the end of the audio on are zeros."""
+        pad, valid = self.N_FFT // 2, samples.size // self.HOP
+        lo = first * self.HOP - pad
+        x = np.zeros((count - 1) * self.HOP + self.N_FFT, np.float32)
+        a, b = max(lo, 0), min(lo + x.size, samples.size)
+        if b > a:
+            before = samples[a - 1] if a > 0 else 0.0
+            x[a - lo:b - lo] = samples[a:b] - 0.97 * np.concatenate([[before], samples[a:b - 1]])
+        idx = np.arange(self.N_FFT)[None, :] + self.HOP * np.arange(count)[:, None]
+        power = np.abs(np.fft.rfft(x[idx] * self.window, n=self.N_FFT)) ** 2
+        feats = np.log(power.astype(np.float32) @ self.mel + 2 ** -24)
+        feats[max(0, valid - first):] = 0.0
+        return feats
+
+    def __call__(self, samples: np.ndarray) -> np.ndarray:
+        """(10 ms frames, VOICES): the probability that each voice talks."""
+        valid = samples.size // self.HOP
+        frames = -(-(valid + 1) // self.STACK)                  # encoder frames
+        embeds = np.zeros((frames, self.HIDDEN), np.float32)
+        for a in range(0, frames, self.block):
+            f = self.features(samples, a * self.STACK, self.block * self.STACK)
+            e = next(iter(self.embedder.infer({"features": f[None]}).values()))[0]
+            embeds[a:a + self.block] = e[:frames - a]
+        real = (np.arange(frames) * self.STACK < valid).astype(np.float32)
+        cache, out = SpeakerCache(), np.zeros((frames * self.STACK, self.VOICES), np.float32)
+        x, mask = np.zeros((1, self.step, self.HIDDEN), np.float32), np.zeros((1, self.step), np.float32)
+        for start in range(0, frames, self.CHUNK):
+            end = min(start + self.CHUNK, frames)
+            kept, chunk = cache.frames(), embeds[start:min(end + self.AHEAD, frames)]
+            n = len(kept) + len(chunk)
+            x[:], mask[:] = 0.0, 0.0
+            x[0, :len(kept)], x[0, len(kept):n] = kept, chunk
+            mask[0, :len(kept)], mask[0, len(kept):n] = 1.0, real[start:start + len(chunk)]
+            p = next(iter(self.encoder.infer({"embeds": x, "mask": mask}).values()))[0][:n * self.STACK]
+            cache.update(x[0, :n], p.reshape(n, self.STACK, self.VOICES).mean(1) * mask[0, :n, None],
+                         self.silence, end - start)
+            out[start * self.STACK:end * self.STACK] = p[len(kept) * self.STACK:(len(kept) + end - start) * self.STACK]
+        return out[:valid]
+
+
+class SpeakerCache:
+    """Nemotron's Arrival-Order Speaker Cache in its offline setting (transformers'
+    Nemotron3DiarizationSpeakerCache, one recording): each chunk joins a FIFO of recent
+    encoder frames; when the FIFO is full, its oldest frames move to the cache, and a cache
+    over LENGTH frames keeps each voice's most telling ones (compress), so that later
+    chunks still hear every voice found so far."""
+    LENGTH, FIFO, UPDATE, SILENCE = 264, 40, 300, 1
+    THRESHOLD, LATEST_BOOST = 0.25, 0.05
+    MIN_POSITIVE, STRONG, WEAK = 0.5, 0.75, 1.5   # shares of each voice's budget of frames
+
+    def __init__(self) -> None:
+        budget = self.LENGTH // Nemotron.VOICES - self.SILENCE
+        self.min_positive = math.floor(budget * self.MIN_POSITIVE)
+        self.strong, self.weak = math.floor(budget * self.STRONG), math.floor(budget * self.WEAK)
+        self.embeds = np.zeros((0, Nemotron.HIDDEN), np.float32)
+        self.probs = np.zeros((0, Nemotron.VOICES), np.float32)
+        self.fifo = np.zeros((0, Nemotron.HIDDEN), np.float32)
+        self.compressed = False
+
+    def frames(self) -> np.ndarray:
+        """What the next chunk attends to besides itself: the cache, then the FIFO."""
+        return np.concatenate([self.embeds, self.fifo])
+
+    def update(self, step: np.ndarray, probs: np.ndarray, silence: np.ndarray, chunk: int) -> None:
+        """step: the encoder input of this chunk (cache, FIFO, chunk, look-ahead), probs:
+        the voices' probabilities per encoder frame; chunk: the number of chunk frames."""
+        cached, start = len(self.embeds), len(self.embeds) + len(self.fifo)
+        fifo = np.concatenate([self.fifo, step[start:start + chunk]])
+        if len(fifo) > self.FIFO:
+            moved = min(max(self.UPDATE, len(fifo) - self.FIFO), len(fifo))
+            old = self.probs if self.compressed else probs[:cached]   # an uncompressed cache is re-estimated
+            embeds = np.concatenate([self.embeds, fifo[:moved]])
+            kept = np.concatenate([old, probs[cached:cached + moved]])
+            fifo = fifo[moved:]
+            if len(embeds) > self.LENGTH:
+                embeds, kept = self.compress(embeds, kept, silence)
+                self.compressed = True
+            self.embeds, self.probs = embeds, kept
+        self.fifo = fifo
+
+    def scores(self, probs: np.ndarray) -> np.ndarray:
+        """How well each frame stands for each voice (-inf: not that voice's)."""
+        log_p = np.log(np.maximum(probs, self.THRESHOLD))
+        log_q = np.log(np.maximum(1.0 - probs, self.THRESHOLD))
+        scores = log_p - log_q + log_q.sum(axis=-1, keepdims=True) - math.log(0.5)
+        speech = probs > 0.5
+        scores = np.where(speech, scores, -np.inf)
+        positive = scores > 0
+        enough = positive.sum(axis=0, keepdims=True) >= self.min_positive
+        return np.where(~positive & speech & enough, -np.inf, scores)
+
+    @staticmethod
+    def boost(scores: np.ndarray, n: int, value: float) -> np.ndarray:
+        """Each voice's n best frames get value more."""
+        top = np.argsort(-scores, axis=0, kind="stable")[:n]
+        out = scores.copy()
+        np.add.at(out, (top, np.broadcast_to(np.arange(scores.shape[1]), top.shape)), value)
+        return out
+
+    def compress(self, embeds: np.ndarray, probs: np.ndarray, silence: np.ndarray
+                 ) -> tuple[np.ndarray, np.ndarray]:
+        """The LENGTH best (frame, voice) pairs, grouped by voice in time order; SILENCE
+        slots per voice hold the learned silence frame."""
+        frames, voices = probs.shape
+        scores = self.scores(probs)
+        scores[self.LENGTH:] += self.LATEST_BOOST          # the frames just moved in
+        scores = self.boost(scores, self.strong, -2.0 * math.log(0.5))
+        scores = self.boost(scores, self.weak, -math.log(0.5))
+        scores = np.concatenate([scores, np.full((self.SILENCE, voices), np.inf)])
+        embeds = np.concatenate([embeds, silence[None, :].astype(np.float32)])
+        probs = np.concatenate([probs, np.zeros((1, voices), np.float32)])
+        scored = frames + self.SILENCE
+        flat = scores.T.reshape(-1)                         # voice by voice
+        best = np.argsort(-flat, kind="stable")[:self.LENGTH]
+        best = np.sort(np.where(flat[best] == -np.inf, scored * voices, best))
+        pick = np.where(best == scored * voices, frames, np.minimum(best % scored, frames))
+        return embeds[pick], probs[pick]
+
+
+def voice_turns(probs: np.ndarray, hop: float = 0.01) -> list[Turn]:
+    """Turns from Nemotron's probabilities (VOICE_ACTIVE), voices numbered 0, 1, ... in
+    the order they first speak. Raw: smoothing them gave more speech to the wrong person."""
+    turns = []
+    for voice in range(probs.shape[1]):
+        edges = np.diff(np.concatenate([[0], (probs[:, voice] > VOICE_ACTIVE).astype(np.int8), [0]]))
+        turns += [Turn(a * hop, b * hop, voice)
+                  for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))]
+    turns.sort(key=lambda t: (t.start, t.speaker))
+    order: dict[int, int] = {}
+    return [Turn(t.start, t.end, order.setdefault(t.speaker, len(order))) for t in turns]
+
+
+def voice_centroids(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]
+                    ) -> tuple[dict[int, float], dict[int, np.ndarray]]:
+    """({voice: seconds of speech}, {voice: its fingerprints' duration-weighted mean, unit length})"""
+    speech: dict[int, float] = {}
+    sums: dict[int, np.ndarray] = {}
+    for i, t in enumerate(turns):
+        speech[t.speaker] = speech.get(t.speaker, 0.0) + t.end - t.start
+        if i in vecs:
+            sums[t.speaker] = sums.get(t.speaker, 0.0) + vecs[i][0] * vecs[i][1]
+    return speech, {v: unit(c) for v, c in sums.items()}
+
+
+def same_people(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]) -> list[Turn]:
+    """Nemotron's voices that sound like one person (SAME_PERSON) become one: the most alike
+    pair first, the voice with less speech joining the other."""
+    while True:
+        speech, centroid = voice_centroids(turns, vecs)
+        pairs = [(float(centroid[u] @ centroid[v]), u, v) for u, v in itertools.combinations(sorted(centroid), 2)]
+        alike = max((p for p in pairs if p[0] >= SAME_PERSON), default=None)
+        if alike is None:
+            return turns
+        small, big = sorted(alike[1:], key=speech.__getitem__)
+        turns = [Turn(t.start, t.end, big) if t.speaker == small else t for t in turns]
+
+
+def fewer_voices(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]], n: int) -> list[Turn]:
+    """Down to n voices (--num-speakers with Nemotron, which finds out how many itself):
+    the voice with the least speech joins the one it sounds most like (else the biggest)."""
+    while len(voices := {t.speaker for t in turns}) > max(1, n):
+        speech, centroid = voice_centroids(turns, vecs)
+        small = min(voices, key=speech.__getitem__)
+        others = [u for u in voices if u != small]
+        alike = [u for u in others if u in centroid] if small in centroid else []
+        into = max(alike, key=lambda u: float(centroid[u] @ centroid[small])) if alike \
+            else max(others, key=speech.__getitem__)
+        turns = [Turn(t.start, t.end, into) if t.speaker == small else t for t in turns]
+    return turns
 
 
 def titanet_npu_safe(model, scale: float = 64.0) -> None:
@@ -1122,8 +1352,62 @@ def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
             ) -> tuple[list[Turn], dict[int, list[float]], dict[int, str]]:
     """Who speaks when. num_speakers=0: find out how many. Returns the turns, each voice's
     fingerprint (voice_prints) and the remembered names found among them (identify)."""
-    log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, on {models.device})")
+    how = "Nemotron" if models.nemotron else "pyannote"
+    log(f"telling voices apart ({hms(samples.size / SAMPLE_RATE)} of audio, {how} on {models.device})")
     t0, c0 = time.monotonic(), cpu_seconds()
+    if models.nemotron:
+        turns = voice_turns(models.nemotron(samples))
+    else:
+        turns = pyannote_turns(models, samples, num_speakers)
+    prints: dict[int, list[float]] = {}
+    names: dict[int, str] = {}
+    if turns:
+        def embed_spans(spans: list[tuple[float, float]]) -> np.ndarray:
+            return models.embed([samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])
+
+        if known and not models.nemotron:  # (Nemotron hears changes between alike voices itself)
+            t1, c1 = time.monotonic(), cpu_seconds()
+            turns = split_by_known_voices(turns, embed_spans, remembered_voices(known))
+            log(f"long turns checked for {len(known)} remembered voice(s) in "
+                f"{time.monotonic() - t1:.1f} s (CPU {cpu_seconds() - c1:.1f} s)")
+        long = [i for i, t in enumerate(turns) if t.end - t.start >= 1.0]
+        if models.nemotron and not known and not num_speakers:  # fingerprints only: the longest turns
+            long = fingerprint_turns(turns, long, models.EMB_SECONDS)
+        spans = []
+        for i in long:   # the middle EMB_SECONDS of each turn
+            mid, half = (turns[i].start + turns[i].end) / 2, models.EMB_SECONDS / 2
+            spans.append((max(turns[i].start, mid - half), min(turns[i].end, mid + half)))
+        vecs = {i: (v, b - a) for i, v, (a, b) in zip(long, embed_spans(spans), spans)}
+        if not models.nemotron:
+            turns, vecs = merge_voices(turns, vecs)
+        else:
+            turns = same_people(turns, vecs)
+            if num_speakers:
+                turns = fewer_voices(turns, vecs, num_speakers)
+        if known:
+            turns, names = identify(turns, vecs, known)
+        prints = voice_prints(turns, vecs)
+    log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s "
+        f"(CPU {cpu_seconds() - c0:.1f} s)"
+        + (f", recognised: {', '.join(sorted(set(names.values())))}" if names else ""))
+    return turns, prints, names
+
+
+def fingerprint_turns(turns: list[Turn], candidates: list[int], seconds: float) -> list[int]:
+    """The turns voice_prints() would use: each voice's longest, until FINGERPRINT_SECONDS
+    of their middle `seconds` are covered (embedding every turn costs more than Nemotron)."""
+    picked, covered = [], {}
+    for i in sorted(candidates, key=lambda i: turns[i].start - turns[i].end):   # longest first
+        voice = turns[i].speaker
+        if covered.get(voice, 0.0) < FINGERPRINT_SECONDS:
+            picked.append(i)
+            covered[voice] = covered.get(voice, 0.0) + min(seconds, turns[i].end - turns[i].start)
+    return sorted(picked)
+
+
+def pyannote_turns(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0) -> list[Turn]:
+    """Who speaks when without Nemotron: pyannote segmentation-3.0's local voices in 10 s
+    windows, clustered by their TitaNet fingerprints, rebuilt into turns (reconstruct)."""
     windows = models.segment(samples)
     keys, pieces = [], []
     for w, (start, act) in enumerate(windows):
@@ -1136,32 +1420,7 @@ def diarize(models: SpeakerModels, samples: np.ndarray, num_speakers: int = 0,
             keys.append((w, local))
             pieces.append(np.concatenate(spans))
     labels = cluster(models.embed(pieces), num_speakers)
-    turns = reconstruct(windows, dict(zip(keys, (int(x) for x in labels))), samples.size)
-    prints: dict[int, list[float]] = {}
-    names: dict[int, str] = {}
-    if turns:
-        def embed_spans(spans: list[tuple[float, float]]) -> np.ndarray:
-            return models.embed([samples[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])
-
-        if known:
-            t1, c1 = time.monotonic(), cpu_seconds()
-            turns = split_by_known_voices(turns, embed_spans, remembered_voices(known))
-            log(f"long turns checked for {len(known)} remembered voice(s) in "
-                f"{time.monotonic() - t1:.1f} s (CPU {cpu_seconds() - c1:.1f} s)")
-        long = [i for i, t in enumerate(turns) if t.end - t.start >= 1.0]
-        spans = []
-        for i in long:   # the middle EMB_SECONDS of each turn
-            mid, half = (turns[i].start + turns[i].end) / 2, models.EMB_SECONDS / 2
-            spans.append((max(turns[i].start, mid - half), min(turns[i].end, mid + half)))
-        vecs = {i: (v, b - a) for i, v, (a, b) in zip(long, embed_spans(spans), spans)}
-        turns, vecs = merge_voices(turns, vecs)
-        if known:
-            turns, names = identify(turns, vecs, known)
-        prints = voice_prints(turns, vecs)
-    log(f"{len({t.speaker for t in turns})} voice(s) in {time.monotonic() - t0:.1f} s "
-        f"(CPU {cpu_seconds() - c0:.1f} s)"
-        + (f", recognised: {', '.join(sorted(set(names.values())))}" if names else ""))
-    return turns, prints, names
+    return reconstruct(windows, dict(zip(keys, (int(x) for x in labels))), samples.size)
 
 
 def merge_voices(turns: list[Turn], vecs: dict[int, tuple[np.ndarray, float]]
@@ -1388,17 +1647,28 @@ def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
     writes their words into your track too, often in the same sentence as your own.
 
     With word timestamps, a word is the echo when the microphone is not clearly louder
-    (ECHO_MARGIN) than the echo the system audio would cause at that moment; those words
-    are cut out. Without them, a whole line goes when ECHO_SHARE of its words were said
-    remotely within ECHO_WINDOW. Returns the kept segments and the number of words cut.
+    (ECHO_MARGIN) than the echo the system audio would cause at that moment, or when the
+    other side said the same word at the same moment (ECHO_SAME_WORD: their last word, heard
+    just as you start talking, is as loud as you); those words are cut out. Without them, a
+    whole line goes when ECHO_SHARE of its words were said remotely within ECHO_WINDOW.
+    Returns the kept segments and the number of words cut.
     gain: echo_gain() measured beforehand (when the microphone has been silenced since)."""
     gain = echo_gain(mic, remote) if gain is None else gain
+    heard = [(w.start, w.end, tok[0]) for r in theirs for w in r.words if (tok := tokens(w.text))]
+
+    def said_by_them(w: Word) -> bool:
+        tok = tokens(w.text)
+        return bool(tok) and any(
+            a - ECHO_SAME_WORD < w.end and w.start < b + ECHO_SAME_WORD
+            and (t == tok[0] or len(t) >= 4 and difflib.SequenceMatcher(None, t, tok[0]).ratio() >= 0.8)
+            for a, b, t in heard)
+
     kept: list[Segment] = []
     cut = 0
     for seg in mine:
         if seg.words:
             echo = [gain > 0 and rms(mic, w.start, w.end) < ECHO_MARGIN * gain * rms(remote, w.start, w.end)
-                    for w in seg.words]
+                    or said_by_them(w) for w in seg.words]
             cut += sum(echo)
             for is_echo, group in itertools.groupby(zip(echo, seg.words), key=lambda x: x[0]):
                 words = [w for _, w in group]
@@ -1454,16 +1724,20 @@ def load_self(folder: Path) -> list[list[float]]:
 
 def self_print(models: SpeakerModels, mic: np.ndarray, mine: list[Segment]) -> list[float] | None:
     """Your fingerprint from an online meeting: what is left of your microphone track after
-    the echo and the muted stretches are taken out is you. The middle EMB_SECONDS of your
-    longest lines, up to FINGERPRINT_SECONDS; None with less than SELF_MIN_SECONDS of them."""
-    spans, total = [], 0.0
+    the echo and the muted stretches are taken out is you. EMB_SECONDS pieces from the middle
+    of your longest lines (a long line gives several), up to FINGERPRINT_SECONDS; None with
+    less than SELF_MIN_SECONDS of them."""
+    spans, total, size = [], 0.0, models.EMB_SECONDS
     for seg in sorted(mine, key=lambda s: s.start - s.end):  # longest first
         if total >= FINGERPRINT_SECONDS or seg.end - seg.start < 1.5:
             break
-        mid, half = (seg.start + seg.end) / 2, models.EMB_SECONDS / 2
-        a, b = max(seg.start, mid - half), min(seg.end, mid + half)
-        spans.append((a, b))
-        total += b - a
+        pieces = max(1, int((seg.end - seg.start - 0.5) // size))
+        mid = (seg.start + seg.end) / 2
+        for k in range(pieces):
+            a = mid - pieces * size / 2 + k * size
+            a, b = max(seg.start, a), min(seg.end, a + size)
+            spans.append((a, b))
+            total += b - a
     if total < SELF_MIN_SECONDS:
         return None
     vecs = models.embed([mic[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)] for a, b in spans])

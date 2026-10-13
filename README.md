@@ -18,7 +18,7 @@ machine, and the CPU and GPU are left alone.
 - **Meeting transcripts, with who said what:**
   - Press **Meta+Alt+M** to record your microphone and the system audio. Each 30 s chunk is transcribed on the NPU while the meeting runs.
   - When you stop, a Markdown transcript is saved to `~/Documents/Meetings` right away.
-  - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 2 minutes on a Core Ultra 7 258V (other languages, with Whisper: ~8 minutes).
+  - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 1 minute on a Core Ultra 7 258V (other languages, with Whisper: ~7 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
   - **Tidy text:** fillers (э-э, а-а, хмм, um), stutters and doubled words are left out (`npu-transcribe --verbatim` keeps them).
   - **Names:** *Name speakers…* in the app turns *Person 1* into *Viktor*. If you let it remember voices, later meetings call Viktor by name on their own.
@@ -52,7 +52,7 @@ BMeet adds:
   - Meteor Lake and Arrow Lake should work, but are untested.
   - Without an NPU, everything still works on the CPU, more slowly.
 - **System:** Ubuntu or Kubuntu **26.04** (x86_64), with **KDE Plasma 6 on Wayland**.
-- **Disk and network:** about 6 GB of free disk space, and internet access for the first install (~1.8 GB of downloads).
+- **Disk and network:** about 7 GB of free disk space, and internet access for the first install (~2.2 GB of downloads).
 
 ## Install
 
@@ -83,7 +83,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 |---|---|
 | `--languages "en de"` | dictation languages for Meta+Shift+H (Whisper codes; default: English + your desktop language) |
 | `--no-turbo` | skip Whisper large-v3-turbo (~1 GB); file transcription then uses small |
-| `--no-speakers` | don't tell meeting speakers apart: transcripts keep the *You* / *Remote* labels, and no meeting audio is held, not even in RAM |
+| `--no-speakers` | don't tell meeting speakers apart (no speaker models, ~0.5 GB): transcripts keep the *You* / *Remote* labels, and no meeting audio is held, not even in RAM |
 | `--no-gigaam` | skip GigaAM v3 (~480 MB): Russian is then transcribed with Whisper |
 | `--no-panel` | don't add the widget to the panel |
 | `--no-npu-driver` | don't install Intel's NPU driver |
@@ -178,7 +178,7 @@ bash ~/.local/share/bmeet/src/uninstall.sh
          │
          └──────────────> npu-transcribe ──> OpenVINO GenAI (Python venv) ──> NPU, CPU fallback
                           (+ Dolphin menu)    GigaAM v3 for Russian ────────────> NPU
-                                              speakers: pyannote + TitaNet ────> NPU
+                                              speakers: Nemotron + TitaNet ────> NPU
 
  meeting: voxtype-meeting-toggle ─> bmeet-meeting-audio (pw-record, RAM) ─> npu-transcribe --meeting
           (live You/Remote transcript from voxtype first, replaced by You/Person 1/... when done)
@@ -201,15 +201,17 @@ bmeet/app/tests/run-tests.sh --quick              # app + bmeet-ctl, offscreen, 
 bmeet/app/tests/run-tests.sh                      # + real Whisper runs on the NPU
 bmeet/plasmoid/tests/check_qml.py --strict bmeet/plasmoid/*/contents/ui/*.qml
 transcribe/tests/run-tests.sh /tmp/npt "NPU CPU"  # npu-transcribe benchmark / regression
-transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass (ru; --language en,
-                                                  #   --remember, --muted, --in-person)
+transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass with real voices (ru; --language en,
+                                                  #   --remember, --muted, --in-person, --espeak)
+transcribe/tests/speakers_test.py /tmp/npt        # who speaks when on real recordings (--ami: meetings)
 transcribe/tests/english_terms_test.py /tmp/npt   # English terms in Russian speech (downloads Podlodka)
 python3 -I bmeet/chrome/tests/test_host.py        # Chrome extension's host (offline)
 bmeet/chrome/tests/test_extension.py              # the extension in a throwaway headless Chrome
 bash voxtype/verify.sh                            # health check of an installed system
 ```
 
-The tests never record audio. They use synthetic speech from espeak-ng and a scratch
+The tests never record audio. They use synthetic speech from espeak-ng, public recordings
+they download into the work folder (LibriSpeech, AMI, podcast clips), and a scratch
 database, and never open your real one.
 
 ## Known limitations
@@ -221,6 +223,7 @@ database, and never open your real one.
   - In an online meeting only the system audio is split by voice, and everyone on your microphone is *You*. For people in the room with you, use an in-person meeting. Hybrid meetings (people in the room and on the call) are not split on both sides yet.
   - In person, everyone shares one microphone: a quick reply between two lines of someone else can end up under them.
   - When two people talk at the same time, the words go to whoever is louder.
+  - Up to 8 voices are told apart per track; with more people, some share a label.
   - People are numbered until you name them in the app; only remembered voices are named automatically.
 - **Muted in the call:** only Google Meet and Slack in Chrome (or another Chromium-based browser), with the extension loaded. Desktop call apps (Zoom, Teams) are not seen. The first second or so after you mute can still be transcribed.
 - **Opening the app from the widget** may only flash it in the task bar (Wayland focus-stealing prevention).
@@ -234,7 +237,8 @@ More in [docs/troubleshooting.md](docs/troubleshooting.md).
 - [OpenVINO](https://github.com/openvinotoolkit/openvino) and the [Intel NPU driver](https://github.com/intel/linux-npu-driver) by Intel.
 - [Whisper](https://github.com/openai/whisper) by OpenAI, in the int8 OpenVINO exports from [huggingface.co/OpenVINO](https://huggingface.co/OpenVINO).
 - [GigaAM v3](https://github.com/salute-developers/GigaAM) by Sber (MIT): Russian speech recognition.
-- [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT) and NVIDIA's [TitaNet-small](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) (CC-BY-4.0): the speaker models.
+- NVIDIA's [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) ([OpenMDW-1.1](https://openmdw.ai/license/1-1/)): who speaks when.
+- NVIDIA's [TitaNet-small](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) (CC-BY-4.0): voice fingerprints, for remembered voices; [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT): the way of telling voices apart before 0.6.0, kept as a fallback.
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0): the ONNX exports of these models, and the GTCRN speech enhancement model.
 
 They're downloaded at install time under their own licenses. This repository is [MIT](LICENSE).

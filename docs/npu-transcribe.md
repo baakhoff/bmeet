@@ -111,19 +111,54 @@ the voices in the system audio become **Person 1**, **Person 2**, … In an in-p
 the microphone is split by voice instead ([In person](#in-person)).
 
 **How it works:**
-1. **Who speaks when**, on the NPU (OpenVINO; until 0.3 this ran on the CPU through sherpa-onnx):
-   - **Speech per window:** pyannote **segmentation-3.0** looks at 10 s windows, every 5 s, and finds up to 3 voices in each (78 ms per window on the NPU).
-   - **Fingerprints:** NVIDIA **TitaNet-small** fingerprints each voice's clean speech in each window, 16 per NPU call (13 ms each).
-   - **Clustering:** the fingerprints are clustered by average-linkage agglomerative clustering, threshold 0.4 on cosine distance (env `NPU_SPEAKER_THRESHOLD`), or into exactly `--num-speakers` clusters.
-   - **Turns:** they are rebuilt pyannote's way. Each voice's activity is added up over the overlapping windows, the number of voices per frame is estimated, and that many of the most active ones are kept. Turns under 0.3 s are dropped, and gaps under 0.5 s are closed.
+1. **Who speaks when**, on the NPU, with NVIDIA's **Nemotron 3 Diarization** (since 0.6.0; [why](#choosing-the-diarization-model)):
+   - **The model** hears the recording in chunks of 27 s, each with 3 s of what comes next and a cache of the moments that best stand for each voice found so far, so a voice keeps its number through hours of audio. It gives each of up to 8 voices a probability every 10 ms, and a voice talks where that is above 0.5. Overlapping speech gives overlapping turns.
+   - **Fingerprints:** NVIDIA **TitaNet-small** fingerprints each voice's longest turns (the middle 4 s of each, up to 60 s), for remembered voices.
+   - **One person as two voices:** over a long recording the cache now and then opens a second voice for someone. Voices whose fingerprints are at least 0.75 alike become one: in the test recordings such duplicates were 0.89 and 0.92 alike, and different people at most 0.61.
+   - **`--num-speakers N`:** Nemotron finds the number itself. If it finds more, the voice with the least speech joins the one it sounds most like, until N are left.
+   - **The way of before 0.6.0** (env `NPU_DIARIZATION=pyannote`, or an install without Nemotron): pyannote **segmentation-3.0** finds up to 3 voices in 10 s windows every 5 s; TitaNet fingerprints each voice's clean speech in each window; the fingerprints are clustered (average linkage, threshold 0.4 on cosine distance, env `NPU_SPEAKER_THRESHOLD`, or exactly `--num-speakers` clusters); and turns are rebuilt pyannote's way (activity added up over the overlapping windows, the most active voices kept per frame, turns under 0.3 s dropped, gaps under 0.5 s closed).
 2. **Words, not sentences:** GigaAM's words come with their times from its output frames. Whisper runs with word timestamps (a separate NPU compile of ~1 min, cached; each block takes ~8 % longer). Every word goes to the voice that speaks during it, so a sentence that crosses a change of speaker is split there. A change shorter than 0.6 s inside a sentence is treated as noise.
 3. **Echo (meetings):** without headphones the microphone also hears the other side, and Whisper writes their words into your track too, often in the same sentence as your own.
    - First, how loud the system audio comes back through the microphone is measured: the median mic/remote ratio while the other side talks.
    - A word on your track is cut when the microphone is less than 2x louder than that predicted echo at that moment.
+   - It is also cut when the other side said the same word at the same moment (within 0.25 s). That is their last word, heard just as you start talking: the volume test misses it, because you are loud there already. Repeating their word yourself comes after it, not at the same moment.
    - With headphones the predicted echo is ~0, so nothing is cut. When you talk over the other side, your voice is far louder than the echo and stays.
 4. **Output:** Speaker labels in `.srt` cues (`Speaker 1: …`), `.md` and `.txt` paragraphs (which never mix two speakers), and a `speakers` count in the history line. Meetings get voxtype's Markdown layout: a `### Person 1` heading per change of speaker and a `*[mm:ss]*` mark per paragraph.
 
-**Cleaning up the clustering on real calls.** Real calls are harder than clean test voices: background noise, the conferencing app's noise suppression, laughter and codec glitches. On one 49-minute Russian 1:1 call, the clustering made 30 "voices": one real person, plus fragments of 1-114 words. Of those fragments, the ones long enough to compare were 0.14-0.87 similar to that person. So after the clustering:
+### Choosing the diarization model
+
+In 0.6.0 telling the voices apart moved from pyannote segmentation + TitaNet clustering (above, "the way of before 0.6.0") to Nemotron 3 Diarization, NVIDIA's model of September 2026 (100M parameters, [OpenMDW-1.1](https://openmdw.ai/license/1-1/): free for commercial use too). Measured with `tests/speakers_test.py` on real recordings, the NPU for both:
+- **Russian:** five podcasts with 2-3 people each (4.1 h; [leshinsky/ru-youtube-diarization](https://huggingface.co/datasets/leshinsky/ru-youtube-diarization), hand-corrected labels; three of them came through YouTube's Opus, like a call).
+- **AMI:** the 16 test meetings of the AMI corpus recorded by one microphone in the room, like an in-person meeting (9 h, 3-4 people; forced-alignment labels of [nttcslab-sp/diar-forced-alignment](https://github.com/nttcslab-sp/diar-forced-alignment)).
+- **Wrong person:** each labelled stretch of speech is given to a voice the way npu-transcribe gives words to speakers; after the best matching of voices to people, the share of speech under someone else. This is what you see in a transcript.
+
+| | Russian podcasts: before | **0.6.0** | AMI meetings: before | **0.6.0** |
+|---|---|---|---|---|
+| Speech under the wrong person | 8.1 % | **2.1 %** | 22.8 % | **8.4 %** |
+| Diarization error rate (DER) | 20.3 % | 21.3 % | 42.3 % | **11.0 %** |
+| ... of which confusion (wrong voice) | 7.8 % | **2.9 %** | 12.2 % | **1.1 %** |
+| Right number of people | 3 of 5 | **4 of 5** | 4 of 16 | **15 of 16** |
+| Time on the NPU | 132 s | **65 s** | 259 s | **146 s** |
+
+- **The Russian DER** barely moves because its labels count the pauses inside a phrase as speech: Nemotron leaves them out (missed speech 3.0 → 8.2 %), which changes nothing in a transcript, while it gives far less speech to the wrong person.
+- **One podcast** (nr3hmL9bcPU) stays at 10 % (27.5 % before, where two of its people became one): its labels put two different people under one name (their phrases fall into two clearly different voices).
+- **AMI:** NVIDIA reports 11.1 % DER for this setup; the NPU build scores 11.0 %. The AMI test meetings are not in Nemotron's training data (its train and dev sets are).
+- **Someone who barely speaks:** a stranger's phrase put into a Russian podcast got a voice of its own in 5 of 8 placements (every phrase of 5 s or more), and never before 0.6.0, which folds voices with under 15 s of speech into others.
+- **Real people in a made-up meeting** (`tests/meeting_test.py`, four people of three Russian podcasts, or four LibriSpeech readers): 100 % of the words under the right label in every case, in both languages, online and in person.
+
+**Other candidates:**
+- **pyannote community-1** (segmentation-3.0 + WeSpeaker ResNet34 + VBx clustering): pyannote reports 19.9 % DER on AMI's room microphone, against 22.7 % for its 3.1, so a small step from where BMeet was.
+- **DiariZen** (WavLM-based, BUT): among the best in published benchmarks, but its weights are CC-BY-NC: not for work meetings.
+- **Streaming Sortformer 4spk v2/v2.1:** Nemotron's predecessor, at most 4 voices, 21.4 % DER on AMI's room microphone by NVIDIA's numbers.
+- **pyannote precision-2:** a cloud service.
+
+**Nemotron on the NPU.** `transcribe/prepare-diarization` rebuilds it at install time from its Hugging Face weights, read with numpy (no PyTorch):
+- **Fixed shapes:** the NPU needs them, so the encoder always takes 684 frames of 80 ms (the cache 264 + recent frames 40 + the chunk 340 + look-ahead 40), padded and masked when shorter; the positions restart at 0 for each chunk, so the rotary tables are constants. The 128-mel features and the speaker cache between chunks are numpy in npu-transcribe.
+- **Accuracy:** in fp16 on the NPU it agrees with transformers' fp32 version on 99.98 % of the 10 ms frames. NVIDIA's own code on the CPU gave 5.5 % wrong person on the Russian podcasts, the NPU build 4.4 % before joining duplicate voices. Over a 99-minute podcast tiny numeric differences change which moments the cache keeps, which once split its host into two voices (5.8-10.6 % on that file depending on the run); joining duplicates (0.75 alike) made it 1.2-1.5 % in both runs.
+- **Speed:** about 16 s per hour of audio on the NPU, ~1 s of CPU of it for the features. Compiling it takes ~20 s, once.
+- **Limit:** 8 voices per track. More people than that end up under those 8.
+
+**Cleaning up the clustering on real calls** (the way of before 0.6.0). Real calls are harder than clean test voices: background noise, the conferencing app's noise suppression, laughter and codec glitches. On one 49-minute Russian 1:1 call, the clustering made 30 "voices": one real person, plus fragments of 1-114 words. Of those fragments, the ones long enough to compare were 0.14-0.87 similar to that person. So after the clustering:
 - **Fragments:** a voice with under 15 s of speech, and under 5 % of the system audio's speech, joins the voice it sounds most like. If it has no turn long enough to compare, it joins the voice nearest in time.
 - **One person split in two:** a voice at least 0.65 similar to a bigger voice joins it. Two different readers were never more than 0.41 similar; the two people on a real call scored 0.41.
 - **Unassigned words:** short replies ("Угу", "Да", "Пока") often get no turn of their own. They go to the nearest speaker within 30 s, not *Remote*.
@@ -163,16 +198,16 @@ This ran at ~110x realtime on the NPU. Under sherpa-onnx's CPU diarization (0.2-
 - 100 % of the text was under the right label.
 - 244 echo words were cut, and none of yours.
 
-`tests/meeting_test.py` builds the same kind of meeting from espeak-ng voices in Russian and English and checks it. It uses `--engine whisper`, because GigaAM, trained on real speech, writes almost nothing for espeak's robotic Russian.
+`tests/meeting_test.py` builds the same kind of meeting from real people's speech in Russian (podcast speakers, transcribed by GigaAM) and English (LibriSpeech readers) and checks it. `--espeak` uses espeak-ng voices instead (no network); it runs `--engine whisper`, because GigaAM, trained on real speech, writes almost nothing for espeak's robotic Russian, and it does not check that the people are told apart (Nemotron often hears espeak's voices as one person).
 
 **Remembered voices** (`--meeting … --voices DIR`; BMeet passes it when *remember voices* is on):
 - **Fingerprints:** each voice's fingerprint is the duration-weighted mean of the TitaNet embeddings of its longest turns, up to 60 s of speech, at unit length. They go to `DIR/meetings/<transcript>.json` (0600, folders 0700). Naming people in the BMeet app copies theirs to `DIR/voices.json`, at most 10 per person.
-- **Recognising, turn by turn:** a turn (or, inside a turn of 4 s or more, a 2 s window every 0.5 s) belongs to a remembered person when its embedding is at least 0.55 similar to their voice and 0.1 more similar than to anyone else remembered.
-  - Long turns are split where the recognised person changes for 1.5 s or more. Two similar voices can share one turn in the segmentation.
+- **Recognising, turn by turn:** a turn belongs to a remembered person when its embedding is at least 0.55 similar to their voice and 0.1 more similar than to anyone else remembered.
+  - The way of before 0.6.0 also checks a 2 s window every 0.5 s inside turns of 4 s or more, and splits them where the recognised person changes for 1.5 s or more, because two similar voices could share one turn in its segmentation. Nemotron hears those changes itself.
   - A voice whose recognised speech is mostly one person's takes their name. Their turns inside another voice (two people the clustering merged) move to them.
   - Everyone else is numbered as before, *Person 1*, *Person 2*, …, skipping the names.
 - **Why 0.55:** fingerprints of the same LibriSpeech reader from different recordings (through Opus) were at least 0.79 similar, and those of different readers at most 0.39. One utterance against a fingerprint scored at least 0.63 for the same reader and at most 0.39 for others.
-- **Test:** in `tests/meeting_test.py --remember`, a second meeting with new sentences, where the people speak in another order, came out as Anna, Boris and Viktor. That was 100 % in English and 90 % in Russian, where espeak's synthetic Russian makes Whisper's word timing blur at one change of speaker. Without the window check, two of espeak's similar voices shared one turn and one name.
+- **Test:** in `tests/meeting_test.py --remember`, a second meeting with new phrases, where the people speak in another order, came out as Anna, Boris and Viktor, with 100 % of the words under the right name in both languages (real voices, 0.6.0).
 - **Language:** a meeting's language is detected on the system audio and used for your microphone too. Detecting it again on a track that may hold little speech of your own went wrong in the tests, and Whisper then translated.
 
 **Robustness on the NPU:**
@@ -183,7 +218,7 @@ This ran at ~110x realtime on the NPU. Under sherpa-onnx's CPU diarization (0.2-
 **Speed and CPU:** a 5-minute Russian meeting (real podcast speech in both tracks, echo included) took 10 s.
 - **CPU time:** 4 s of user and 4 s of system time in total, mostly loading the models.
 - **Why so little:** numpy is kept to one thread. Its BLAS would otherwise start a thread per core for the small matrix products of the features, and they busy-wait: that was 26 s of CPU for the same meeting.
-- **Per hour of a Russian meeting:** about 2 minutes. GigaAM takes ~30 s for both tracks, and the speakers ~1.5 min.
+- **Per hour of a Russian meeting:** about 1 minute (54 s, 14 s of CPU, with remembered voices; 0.6.0). GigaAM takes ~27 s for both tracks, and the speakers ~18 s. Before 0.6.0 the speakers took ~1.3 min.
 - **Other languages:** Whisper turbo is slower, at ~15x realtime per track.
 
 ### Muted in the call
@@ -202,9 +237,9 @@ BMeet's Chrome extension (`bmeet/chrome/extension`) tells the pass when that was
 An in-person meeting (`meeting.json`: `"in_person": true`) has only the microphone, so the
 microphone is diarized like the system audio, and then:
 - **You:** with `--voices`, your own voice (`DIR/you.json`) is one of the remembered voices, under the name *You*. A single voice found is *You* as well.
-- **Learning your voice:** in online meetings, what is left of your microphone after the echo and the muted stretches is you. Its fingerprint is the duration-weighted mean of the middle 4 s of your longest lines, up to 60 s. It needs at least 15 s, and the last 10 meetings are kept. A meeting whose fingerprint is under 0.5 similar to the ones kept (someone else at your microphone) is skipped once there are two to compare with. In the app you can also name yourself (*You*) in an in-person meeting.
+- **Learning your voice:** in online meetings, what is left of your microphone after the echo and the muted stretches is you. Its fingerprint is the duration-weighted mean of 4 s pieces from the middle of your longest lines (a long line gives several), up to 60 s. It needs at least 15 s, and the last 10 meetings are kept. A meeting whose fingerprint is under 0.5 similar to the ones kept (someone else at your microphone) is skipped once there are two to compare with. In the app you can also name yourself (*You*) in an in-person meeting.
 - **Nobody through the speakers:** an online meeting in which the system audio held no speech is split the same way. That covers starting a normal meeting in the room by habit, and a call whose system audio was not captured, where the others leak into your microphone.
-- **Test:** `tests/meeting_test.py --in-person`. espeak's male voices are too alike for one microphone (TitaNet: m1/m3 0.84, as for one person), so it uses four voices at most 0.41 alike, like different people. You are learned in an online meeting, the people are named, and a second meeting in the room comes out as You, Anna, Boris and Viktor. That was 96 % of the words under the right label in English and 87 % in Russian; the misses were quick replies between two lines of someone else.
+- **Test:** `tests/meeting_test.py --in-person`. You are learned in an online meeting, the people are named, and a second meeting in the room comes out as You, Anna, Boris and Viktor: 100 % of the words under the right label in both languages, with real voices (0.6.0). With espeak's voices (`--espeak`; four voices at most 0.41 alike to TitaNet) it was 96 % in English and 87 % in Russian before 0.6.0; Nemotron, trained on real people, often hears espeak's voices as one.
 
 ## Tidying the text
 

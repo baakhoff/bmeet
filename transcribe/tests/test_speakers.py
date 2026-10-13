@@ -234,6 +234,107 @@ class NpuDiarizer(unittest.TestCase):
         self.assertAlmostEqual(turns[0].end - turns[0].start, 400 * 270 / RATE, delta=0.05)
 
 
+class NemotronParts(unittest.TestCase):
+    """Nemotron 3 Diarization's numpy side: features, speaker cache, turns."""
+
+    def test_features_in_blocks_are_those_of_one_pass(self):
+        n = nt.Nemotron.__new__(nt.Nemotron)
+        n.setup_features()
+        x = noise(3.0, 0.1, 1) * np.sin(np.linspace(0, 40, 3 * RATE)).astype(np.float32)
+        y = np.pad(np.concatenate([x[:1], x[1:] - 0.97 * x[:-1]]), 256)    # pre-emphasis, centred
+        valid = x.size // 160
+        idx = np.arange(512)[None, :] + 160 * np.arange(valid + 1)[:, None]
+        whole = np.log((np.abs(np.fft.rfft(y[idx] * n.window)) ** 2) @ n.mel + 2 ** -24)
+        whole[valid:] = 0.0                                                # the last frame is padding
+        for first, count in ((0, 40), (123, 50), (valid - 20, 40)):
+            got = n.features(x, first, count)
+            want = np.zeros((count, 128))
+            have = whole[first:first + count]
+            want[:len(have)] = have
+            np.testing.assert_allclose(got, want, atol=2e-4)
+        self.assertTrue(np.allclose(n.window[56:456], np.hanning(400)) and not n.window[:56].any())
+
+    def test_speaker_cache_fifo_and_compression(self):
+        class Small(nt.SpeakerCache):
+            LENGTH, FIFO, UPDATE = 24, 4, 6   # budget 2 frames a voice, one of them silence
+        cache, rng = Small(), np.random.default_rng(0)
+        silence = np.full(nt.Nemotron.HIDDEN, 7.0, np.float32)
+        voices = [0, 1, 0, 1, 2]
+        for step_no, voice in enumerate(voices):
+            kept = cache.frames()
+            chunk = rng.normal(size=(10, nt.Nemotron.HIDDEN)).astype(np.float32)
+            chunk[:, 0] = step_no * 10 + np.arange(10)          # frame number, to follow them
+            step = np.concatenate([kept, chunk, chunk[:2]])     # + 2 look-ahead frames
+            probs = np.zeros((len(step), nt.Nemotron.VOICES), np.float32)
+            probs[len(kept):, voice] = 0.9
+            if kept.size:
+                probs[:len(kept)] = cache.probs.max() if cache.compressed else 0.0
+            cache.update(step, probs, silence, 10)
+            self.assertLessEqual(len(cache.embeds), Small.LENGTH)
+            self.assertLessEqual(len(cache.fifo), Small.FIFO)
+            np.testing.assert_array_equal(cache.fifo[:, 0], chunk[-len(cache.fifo):, 0])
+        self.assertTrue(cache.compressed)
+        self.assertEqual(len(cache.embeds), Small.LENGTH)
+        # one silence slot per voice, and the best frames of voices 0, 1, 2 grouped by voice
+        self.assertEqual(int((cache.embeds[:, 1] == 7.0).sum()), nt.Nemotron.VOICES)
+        kept = [int(f) for f, s in zip(cache.embeds[:, 0], cache.embeds[:, 1]) if s != 7.0]
+        owner = [voices[f // 10] for f in kept]
+        self.assertEqual(owner, sorted(owner))
+        self.assertEqual(set(owner), {0, 1, 2})
+
+    def test_voice_turns_numbered_by_first_words(self):
+        p = np.zeros((500, 8), np.float32)
+        p[100:200, 3] = 0.9       # voice 3 first: 1.0-2.0 s
+        p[250:300, 3] = 0.6
+        p[150:400, 5] = 0.7       # overlapping speech: voice 5 is the second
+        p[450:460, 5] = 0.4       # under the threshold
+        turns = nt.voice_turns(p)
+        self.assertEqual([(t.speaker, round(t.start, 2), round(t.end, 2)) for t in turns],
+                         [(0, 1.0, 2.0), (1, 1.5, 4.0), (0, 2.5, 3.0)])
+        self.assertEqual(nt.voice_turns(np.zeros((10, 8))), [])
+
+    def test_fewer_voices_and_fingerprint_turns(self):
+        a, b = np.array([1.0, 0, 0]), np.array([0, 1.0, 0])
+        turns = [Turn(0, 10, 0), Turn(10, 20, 1), Turn(20, 22, 2), Turn(22, 30, 0), Turn(30, 31, 3)]
+        vecs = {0: (a, 4.0), 1: (b, 4.0), 2: (nt.unit(a + 0.2 * b), 2.0), 3: (a, 4.0)}
+        two = nt.fewer_voices(turns, vecs, 2)
+        self.assertEqual([t.speaker for t in two], [0, 1, 0, 0, 0])  # 3 (no vector) -> biggest, 2 -> like 0
+        self.assertEqual(nt.fewer_voices(turns, vecs, 9), turns)
+        # one person as two voices (0.98 alike) becomes one; 0.71 alike stay apart
+        same = nt.same_people(turns, {0: (a, 4.0), 1: (b, 4.0), 2: (nt.unit(a + 0.2 * b), 2.0),
+                                      3: (a, 4.0), 4: (nt.unit(a + b), 1.0)})
+        self.assertEqual([t.speaker for t in same], [0, 1, 0, 0, 3])
+        many = [Turn(i * 10, i * 10 + 2 + i % 3, i % 2) for i in range(60)]
+        picked = nt.fingerprint_turns(many, list(range(60)), 4.0)
+        for voice in (0, 1):
+            seconds = [min(4.0, many[i].end - many[i].start) for i in picked if many[i].speaker == voice]
+            self.assertGreaterEqual(sum(seconds), nt.FINGERPRINT_SECONDS)
+            self.assertLess(sum(seconds) - seconds[-1], nt.FINGERPRINT_SECONDS + 4)
+            length = lambda i: many[i].end - many[i].start
+            mine = [i for i in range(60) if many[i].speaker == voice]
+            self.assertGreaterEqual(min(length(i) for i in mine if i in picked),     # the longest ones
+                                    max(length(i) for i in mine if i not in picked))
+
+    def test_models_missing(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
+        saved = nt.DIARIZATION_MODEL, nt.SEGMENTATION_MODEL, nt.EMBEDDING_MODEL
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir()
+            nt.DIARIZATION_MODEL, nt.SEGMENTATION_MODEL = tmp / "nemotron", tmp / "seg.onnx"
+            nt.EMBEDDING_MODEL = tmp / "titanet.onnx"
+            self.assertEqual(nt.speaker_models_missing(), [tmp / "titanet.onnx", tmp / "nemotron/encoder.xml"])
+            nt.EMBEDDING_MODEL.write_bytes(b"x")
+            nt.SEGMENTATION_MODEL.write_bytes(b"x")        # an install from before 0.6.0
+            self.assertEqual(nt.speaker_models_missing(), [])
+            nt.SEGMENTATION_MODEL.unlink()
+            (tmp / "nemotron").mkdir()
+            (tmp / "nemotron/encoder.xml").write_bytes(b"x")
+            self.assertEqual(nt.speaker_models_missing(), [])
+        finally:
+            nt.DIARIZATION_MODEL, nt.SEGMENTATION_MODEL, nt.EMBEDDING_MODEL = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class Sentences(unittest.TestCase):
     def test_sentences_from_ctc_words(self):
         segs = nt.sentences(words("Привет.@0.0-0.4 Как@0.6-0.8 дела?@0.8-1.1 Это@1.3-1.5 я@1.5-1.6 "
@@ -396,6 +497,18 @@ class Echo(unittest.TestCase):
         kept, cut = nt.drop_echo([seg], [], self.mic, self.remote)
         self.assertEqual(cut, 3)
         self.assertEqual([(k.text, k.start) for k in kept], [("yes I agree", 10.1)])
+
+    def test_their_last_word_as_you_start_talking(self):
+        # the volume test misses it (you are already loud there); the same word at the same moment is theirs
+        theirs = [Seg(7, 10, "the budget is fine", words("the@7.0-7.3 budget@7.3-8.0 is@8.0-9.0 fine@9.0-9.95"),
+                      "Person 1")]
+        seg = Seg(9.9, 12, "fine yes I agree fine", words("fine@9.9-10.2 yes@10.3-10.6 I@10.6-10.8 agree@10.8-11.4 "
+                                                         "fine@11.5-11.9"), "You")
+        mic = self.mic.copy()
+        mic[int(9.9 * RATE):10 * RATE] += noise(0.1, 0.1, 7)
+        kept, cut = nt.drop_echo([seg], theirs, mic, self.remote)
+        self.assertEqual(cut, 1)          # your own "fine" later on stays
+        self.assertEqual([k.text for k in kept], ["yes I agree fine"])
 
     def test_headphones_nothing_cut(self):
         mic = noise(12, 0.001, 4)
@@ -569,6 +682,10 @@ class YourVoice(unittest.TestCase):
         self.assertTrue(all(p.size == 4 * RATE for p in models.pieces))  # the middle 4 s
         # too little of your speech: nothing learned
         self.assertIsNone(nt.self_print(models, np.zeros(80 * RATE, np.float32), mine[:2]))
+        # one long line (sentences Whisper joined): several 4 s pieces from its middle
+        models.pieces = []
+        self.assertEqual(nt.self_print(models, np.zeros(80 * RATE, np.float32), [Seg(10.0, 30.0, "long")]), [0.6, 0.8])
+        self.assertEqual([p.size for p in models.pieces], [4 * RATE] * 4)
 
     def test_learn_self_keeps_the_latest_and_skips_strangers(self, tmp=Path(__file__).resolve().parent / ".work-speakers"):
         shutil.rmtree(tmp, ignore_errors=True)

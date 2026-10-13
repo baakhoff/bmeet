@@ -32,7 +32,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.5.2
+    local VERSION=0.6.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -239,8 +239,10 @@ with tarfile.open(sys.argv[1]) as t:
     fi
 
     # --- 4c. speaker models (meetings: Person 1, Person 2, ...; npu-transcribe --speakers) ---
-    # pyannote segmentation-3.0 (MIT) and NVIDIA TitaNet-small (CC-BY-4.0); both run on the
-    # NPU (docs/npu-transcribe.md for the choice and the NPU fixes).
+    # NVIDIA Nemotron 3 Diarization (OpenMDW-1.1) tells who speaks when; NVIDIA TitaNet-small
+    # (CC-BY-4.0) fingerprints voices to recognise remembered people; pyannote segmentation-3.0
+    # (MIT) is the fallback. All run on the NPU (docs/npu-transcribe.md for the choice and the
+    # NPU fixes). transcribe/prepare-diarization rebuilds Nemotron for the NPU (~20 s, once).
     local speakers_file="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
     mkdir -p "$(dirname "$speakers_file")"
     if [ -n "$speakers" ]; then
@@ -268,7 +270,19 @@ with open(sys.argv[2], "wb") as f:
             fetch "$emb" "$rel/speaker-recongition-models/$emb" "$emb_sha"   # (sic: upstream's tag)
             install -m 0644 "$dl/$emb" "$sd/$emb"
         fi
-        echo "  pyannote-segmentation-3-0, ${emb%.onnx}: present"
+        local nem_dir="$sd/nemotron-3-diarization" nem_file=nemotron-3-diarization.safetensors
+        local nem_rev=f667ed73aee57d40cc39428eb768b4fd87a0a29e
+        local nem_sha=c074d86335b3b794f8fa5edc25594558f128bdb3914d27806a3a5a2e44963cb6
+        local nem_stamp   # re-prepared only when the model or the preparation changes
+        nem_stamp="$nem_sha $(sha256sum "$src/transcribe/prepare-diarization" | cut -c1-16)"
+        if [ ! -f "$nem_dir/encoder.xml" ] || [ "$(cat "$nem_dir/.prepared" 2>/dev/null)" != "$nem_stamp" ]; then
+            fetch "$nem_file" "https://huggingface.co/nvidia/Nemotron-3-Diarization/resolve/$nem_rev/model.safetensors" \
+                "$nem_sha"
+            "$venv/bin/python" -I "$src/transcribe/prepare-diarization" "$dl/$nem_file" "$nem_dir" --compile \
+                || die "preparing Nemotron 3 Diarization for the NPU failed (--no-speakers installs without it)"
+            echo "$nem_stamp" > "$nem_dir/.prepared"
+        fi
+        echo "  nemotron-3-diarization, pyannote-segmentation-3-0, ${emb%.onnx}: present"
         [ -s "$speakers_file" ] || echo on > "$speakers_file"   # keeps an "off" you set
     else
         echo off > "$speakers_file"

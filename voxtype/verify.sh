@@ -79,6 +79,9 @@ if [ "$speakers" = on ]; then
     for m in pyannote-segmentation-3-0.onnx nemo_en_titanet_small.onnx; do
         [ -f "$sd/$m" ] && ok "speaker model $m" || bad "speaker model $m missing (run the installer again)"
     done
+    [ -f "$sd/nemotron-3-diarization/encoder.xml" ] \
+        && ok "speaker model Nemotron 3 Diarization (prepared for the NPU)" \
+        || bad "speaker model Nemotron 3 Diarization missing (run the installer again)"
     command -v pw-record >/dev/null && [ -x "$HOME/.local/bin/bmeet-meeting-audio" ] \
         && ok "meeting audio recorder (pw-record, bmeet-meeting-audio)" || bad "pw-record or bmeet-meeting-audio missing"
     if [ "$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices" 2>/dev/null)" = on ]; then

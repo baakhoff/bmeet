@@ -22,7 +22,8 @@ jobs:
             bmeet/plasmoid/*.sh bmeet/chrome/*.sh
       - name: Python syntax
         run: |
-          for f in transcribe/npu-transcribe transcribe/prepare-models bmeet/bmeet-ctl bmeet/app/bmeet \
+          for f in transcribe/npu-transcribe transcribe/prepare-models transcribe/prepare-diarization \
+                   bmeet/bmeet-ctl bmeet/app/bmeet \
                    bmeet/chrome/bmeet-chrome-host \
                    bmeet/app/tests/fake-voxtype bmeet/app/tests/fake-npu-transcribe \
                    $(git ls-files '*.py'); do

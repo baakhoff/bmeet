@@ -12,7 +12,8 @@ panel widget and app. Stdlib only, runs on the system python3.
   bmeet-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
   bmeet-ctl version
 
-Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid},
+Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid,meeting-toggle.started},
+$XDG_RUNTIME_DIR/bmeet/meeting-audio/*/{speaker-pass,live.md},
 ~/.config/voxtype/config.toml, ~/.config/bmeet/languages (the languages
 `lang toggle` cycles through, e.g. "en de"), ~/.local/share/voxtype/meetings/index.db,
 ~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
@@ -30,7 +31,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
@@ -140,6 +141,14 @@ def speakers_pending() -> list[str]:
         return []
 
 
+def live_transcript() -> str | None:
+    """The running meeting's live transcript (npu-transcribe --live; see voxtype-meeting-toggle):
+    live.md in its recording, named after the start stamp the toggle keeps in meeting-toggle.started."""
+    stamp = read_first_line(RUN / "meeting-toggle.started")
+    path = AUDIO_DIR / stamp / "live.md" if re.fullmatch(r"[\w-]+", stamp) else None
+    return str(path) if path and path.is_file() else None
+
+
 def status() -> dict:
     ov = config().get("openvino", {})
     language = str(ov.get("language", "en")).lower()
@@ -158,6 +167,7 @@ def status() -> dict:
         "meeting_id": active["id"] if active else None,
         "meeting_title": active["title"] if active else None,
         "meeting_started": active["started_at"] if active else None,
+        "meeting_live": live_transcript() if meeting in ("recording", "paused") else None,
         "speakers_pending": speakers_pending(),
         "language": language,
         "next_language": next_language(language),

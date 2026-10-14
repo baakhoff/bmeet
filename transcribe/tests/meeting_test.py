@@ -36,7 +36,13 @@ Diarization, which tells the voices apart since 0.6.0, was trained on real conve
 and often hears espeak's voices, all from one synthesizer, as one person; so this only
 checks the rest (your label, the echo, muting), not that the people are told apart.
 
+--live: the live transcript instead (npu-transcribe --live, as the BMeet window shows it while
+the meeting runs): the meeting is recorded again in real time (--speed N: N times faster)
+while it follows; your words must be under You and none of theirs, nothing said while
+muted, and the lines must show up. Reports how soon after its end each line was seen.
+
 Usage: meeting_test.py WORKDIR [--language ru|en] [--headphones] [--remember | --in-person] [--muted] [--espeak]
+                       [--live [--speed N]]
 Env:   NPU_PYTHON  Python with openvino-genai (default: the installer's venv)
 Exit status 0 = passed. Writes only below WORKDIR (plus the OpenVINO compile cache).
 """
@@ -254,11 +260,12 @@ T0 = 1_760_000_000.0  # when the test meeting "started" (part-1.start)
 
 def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: bool,
          in_person: bool = False, muted: tuple[str, str] | None = None, voices: dict | None = None,
-         real: dict | None = None) -> None:
+         real: dict | None = None) -> list[tuple[tuple[str, str], float, float]]:
     """in_person: everyone on the microphone, no system audio. muted: this line goes into
     part 2 (second; after the pause, and out of the first 30 s, where the language is
     detected), and call-mic.jsonl says the call could not hear you meanwhile. real: real
-    people's phrases (real_voices) instead of espeak."""
+    people's phrases (real_voices) instead of espeak. Returns where each line is said (start
+    and end in seconds of the parts joined)."""
     tts = load_tts() if real is None else None
     recorded = {(who, text): x for who, phrases in (real or {}).items() for text, x in phrases}
     rng = np.random.default_rng(7)
@@ -268,7 +275,7 @@ def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: 
     chunks = [lines[:half], lines[half:]]
     if muted:
         chunks[1] = chunks[1][:1] + [muted] + chunks[1][1:]
-    log, wall = [], T0
+    log, wall, timeline, offset = [], T0, [], 0.0
     for part, chunk in enumerate(chunks, 1):
         remote, mic, at = [], [], 0
         (folder / f"part-{part}.start").write_text(f"{wall}\n")
@@ -286,6 +293,7 @@ def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: 
             if line == muted:  # you mute, say it, unmute (the extension logs it within 0.5 s)
                 start = wall + (at + gap.size) / RATE
                 log += [(start - 0.8, False), (start + x.size / RATE + 0.8, True)]
+            timeline.append((line, offset + (at + gap.size) / RATE, offset + (at + gap.size + x.size) / RATE))
             at += gap.size + x.size
         r, m = np.concatenate(remote), np.concatenate(mic)
         if not headphones and not in_person:  # the speakers reach the microphone 30 ms later, -20 dB
@@ -295,6 +303,7 @@ def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: 
             write_wav(folder / f"part-{part}-remote.wav", r)
         write_wav(folder / f"part-{part}-mic.wav", m)
         wall += at / RATE + 10  # a 10 s pause between the parts
+        offset += at / RATE
     info = {"title": f"Test meeting ({language})", "in_person": in_person}
     (folder / "meeting.json").write_text(json.dumps(info))
     if muted:  # as bmeet-chrome-host writes it: live, every 5 s and at each change
@@ -304,6 +313,7 @@ def make(folder: Path, lines: list[tuple[str, str]], language: str, headphones: 
             rows += [(x, live) for x in np.arange(t, nxt[0], 5.0)]
         (folder / "call-mic.jsonl").write_text("".join(
             json.dumps({"t": round(float(t), 3), "call": True, "live": live}) + "\n" for t, live in rows))
+    return timeline
 
 
 def tokens(text: str) -> list[str]:
@@ -380,6 +390,126 @@ def muted_words(md: str, muted: tuple[str, str], lines: list[tuple[str, str]]) -
     return [w for w in tokens(body) if len(w) >= 5 and difflib.get_close_matches(w, said, n=1, cutoff=0.8)]
 
 
+def replay(src: Path, dst: Path, pointer: Path, speed: float, watch) -> None:
+    """Records src's meeting again into dst, as bmeet-meeting-audio does while a meeting runs:
+    each part's start time, then its WAV files growing 0.1 s at a time (`speed` x real time),
+    a 1 s pause between the parts; `pointer` names dst meanwhile, and call-mic.jsonl gets its
+    lines as their time comes. watch(at) runs after each step (at: seconds recorded)."""
+    import time
+    shutil.rmtree(dst, ignore_errors=True)
+    dst.mkdir(parents=True)
+    shutil.copy(src / "meeting.json", dst)
+    calls = (src / "call-mic.jsonl").read_text().splitlines(keepends=True) if (src / "call-mic.jsonl").exists() else []
+    pointer.write_text(f"{dst}\n")
+    header = (b"RIFF\0\0\0\0WAVEfmt " + (16).to_bytes(4, "little") + (1).to_bytes(2, "little")
+              + (1).to_bytes(2, "little") + RATE.to_bytes(4, "little") + (2 * RATE).to_bytes(4, "little")
+              + (2).to_bytes(2, "little") + (16).to_bytes(2, "little") + b"data\0\0\0\0")  # (sizes: not yet)
+    offset, part, step = 0.0, 1, RATE // 10
+    t0 = time.monotonic()
+    while (src / f"part-{part}.start").exists():
+        wall = float((src / f"part-{part}.start").read_text())
+        (dst / f"part-{part}.start").write_text(f"{wall}\n")
+        tracks = {}
+        for kind in ("mic", "remote"):
+            if (src / f"part-{part}-{kind}.wav").exists():
+                with wave.open(str(src / f"part-{part}-{kind}.wav")) as w:
+                    tracks[kind] = w.readframes(w.getnframes())
+                (dst / f"part-{part}-{kind}.wav").write_bytes(header)
+        size = max(len(b) for b in tracks.values()) // 2
+        for i in range(0, size, step):
+            for kind, data in tracks.items():
+                with open(dst / f"part-{part}-{kind}.wav", "ab") as f:
+                    f.write(data[2 * i:2 * (i + step)])
+            now = wall + (i + step) / RATE
+            while calls and json.loads(calls[0])["t"] <= now:
+                with open(dst / "call-mic.jsonl", "a") as f:
+                    f.write(calls.pop(0))
+            at = offset + (i + step) / RATE
+            time.sleep(max(0.0, t0 + at / speed - time.monotonic()))
+            watch(at)
+        offset += size / RATE
+        t0 += 1.0
+        part += 1
+    pointer.unlink()
+
+
+def live_test(python: str, folder: Path, timeline: list, lines: list[tuple[str, str]],
+              muted: tuple[str, str] | None, env: dict, speed: float, real: bool) -> tuple[bool, list[str]]:
+    """--live: `npu-transcribe --live` follows a replay of the meeting in folder; its live.md
+    must have your words under You and none of theirs, nothing said while muted, and most
+    of what was said; reports how soon each line showed up (draft) and was final."""
+    import time
+    dst = folder.with_name(folder.name + "-live")
+    pointer = folder.with_name(folder.name + "-recording")
+    env = dict(env, BMEET_RECORDING_FILE=str(pointer))
+    proc = subprocess.Popen([python, "-I", str(TOOL), "--live", str(dst)]
+                            + ([] if real else ["--engine", "whisper"]), env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    first: dict[int, float] = {}
+    final: dict[int, float] = {}
+    distinct = [[w for w in tokens(text) if len(w) >= 4] for (_, text), _, _ in timeline]
+    wanted = [line for line, _, _ in timeline]
+
+    def found(words: list[str], text: str) -> bool:
+        have = set(tokens(text))
+        hits = sum(1 for w in words if w in have or difflib.get_close_matches(w, list(have), n=1, cutoff=0.8))
+        return bool(words) and hits >= len(words) / 2
+
+    def watch(at: float) -> None:
+        try:
+            md = (dst / "live.md").read_text().split("## Transcript", 1)[-1]
+        except OSError:
+            return
+        settled = re.sub(r"\*[^*\n]+ …\*", "", md)
+        for i, (line, _, _) in enumerate(timeline):
+            if line == muted:
+                continue
+            if i not in first and found(distinct[i], md):
+                first[i] = at
+            if i not in final and found(distinct[i], settled):
+                final[i] = at
+    t0 = time.monotonic()
+    try:
+        replay(folder, dst, pointer, speed, watch)
+    except BaseException:
+        proc.kill()
+        raise
+    ended = time.monotonic()
+    try:
+        _, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+    wall = time.monotonic() - t0
+    for line in err.splitlines():
+        if re.search(r"live:|ERROR|WARNING|language", line):
+            print("  " + line.removeprefix("npu-transcribe: "))
+    report = []
+    if proc.returncode != 0 or not (dst / "live.done").exists():
+        return False, [f"  npu-transcribe --live exited with {proc.returncode}, live.done "
+                       + ("there" if (dst / "live.done").exists() else "missing")]
+    md = (dst / "live.md").read_text()
+    watch(timeline[-1][2] + (time.monotonic() - ended) * speed)  # (what came once the recording ended)
+    shown = len(final)
+    late = [final[i] - end for i, (_, _, end) in enumerate(timeline) if i in final]
+    early = [first[i] - end for i, (_, _, end) in enumerate(timeline) if i in first]
+    if "### Room" in md:  # in person: everyone on the microphone, one label
+        ok, report = "### You" not in md and "### Remote" not in md, ["  everything under Room"]
+    else:
+        ok, report, _ = score(md, [line for line in lines if line != muted], people_apart=False)
+    if muted:
+        heard = muted_words(md, muted, lines)
+        ok &= len(heard) <= 1
+        report.append(f"  {len(heard)} word(s) of the muted sentence in the live transcript (at most 1 expected)")
+    expected = sum(1 for line in wanted if line != muted)
+    ok &= shown >= expected - 1
+    report.append(f"  {shown}/{expected} lines shown live; after the end of a line: first seen "
+                  f"{np.median(early):+.1f} s (median, max {max(early):+.1f} s), final {np.median(late):+.1f} s "
+                  f"(max {max(late):+.1f} s); recording {timeline[-1][2]:.0f} s at {speed:g}x, "
+                  f"{wall:.0f} s wall")
+    return ok, report
+
+
 def name_people(voices: Path, transcript: Path, main: dict) -> None:
     """What the BMeet app does when you name the people of a meeting: their fingerprints
     from voices/meetings/<transcript>.json go into voices/voices.json under the name."""
@@ -399,7 +529,11 @@ def main() -> int:
     p.add_argument("--in-person", action="store_true")
     p.add_argument("--muted", action="store_true")
     p.add_argument("--espeak", action="store_true")
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--speed", type=float, default=1.0)
     args = p.parse_args()
+    if args.live and args.remember:
+        p.error("--live does not go with --remember")
     python = os.environ.get("NPU_PYTHON") or str(Path.home() / ".local/share/bmeet/venv/bin/python")
     name = (f"meeting-{args.language}{'-headphones' if args.headphones else ''}"
             f"{'-in-person' if args.in_person else ''}{'-muted' if args.muted else ''}{'-espeak' if args.espeak else ''}")
@@ -417,7 +551,13 @@ def main() -> int:
         muted = real_lines(real, [muted], used)[0] if muted else None
     voice_set = VOICES_APART if args.in_person else VOICES
     folder, out = args.work / name, args.work / f"{name}.md"
-    make(folder, lines, args.language, args.headphones, muted=muted, voices=voice_set, real=real)
+    timeline = make(folder, lines, args.language, args.headphones, in_person=args.in_person and args.live,
+                    muted=muted, voices=voice_set, real=real)
+    if args.live:
+        ok, report = live_test(python, folder, timeline, lines, muted, env, args.speed, real is not None)
+        print("\n".join(report))
+        print(("PASS" if ok else "FAIL") + f": {folder.name}-live/live.md")
+        return 0 if ok else 1
     if not speaker_pass(python, folder, out, env, voices, real is not None):
         return 1
     ok, report, main_speaker = score(out.read_text(), lines, people_apart=real is not None)

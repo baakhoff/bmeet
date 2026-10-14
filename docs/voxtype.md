@@ -114,7 +114,7 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
 - **What is recorded:** the default microphone (labelled **You**) and system audio (labelled **Remote**).
   - System audio is `@DEFAULT_MONITOR@`, the monitor of the *current* default output. voxtype's `auto` can pick an idle HDMI monitor instead.
   - Switching outputs mid-meeting isn't followed.
-- **Transcription:** every 30 s chunk is transcribed on the NPU (~2.3 s per chunk).
+- **Transcription:** voxtype transcribes every 30 s chunk on the NPU (~2.3 s per chunk) but keeps the text to itself until the meeting stops; what the BMeet window shows meanwhile is BMeet's live transcript (below).
 - **Saving on stop:**
   - The toggle waits until the daemon has processed the last chunk.
   - It then writes `~/Documents/Meetings/YYYY-MM-DD_HHMM-meeting.md` (timestamps, speakers, metadata; it never overwrites) and shows a notification.
@@ -123,6 +123,7 @@ Measured on a Core Ultra 7 258V (voxtype 1.1.0, OpenVINO 2026.4.1, NPU driver 1.
 - **Limits and storage:** maximum 180 min. voxtype keeps no audio (`retain_audio = false`).
 - **Speakers (BMeet):** voxtype labels the live transcript *You* (microphone) and *Remote* (system audio). Its own `ml` backend can't do better with the OpenVINO engine: that engine returns one segment per 30 s chunk, so each chunk would go to one speaker, and *You* would be lost. So BMeet tells the remote voices apart after the meeting:
   - `voxtype-meeting-toggle` starts `bmeet-meeting-audio` (systemd user unit) right after `voxtype meeting start`. It records the default microphone and the default output's monitor (the same sources voxtype uses) with `pw-record` as 16 kHz mono WAV into `$XDG_RUNTIME_DIR/bmeet/meeting-audio/STAMP/` (RAM, mode 0700). It follows voxtype's meeting state: nothing while paused, a new part after each pause, and it stops when the meeting ends.
+  - While it records, `npu-transcribe --live` (unit `bmeet-live`) transcribes it as it grows into `live.md` next to it, which the BMeet app shows under the running meeting (voxtype keeps its own transcript to itself until the meeting stops). After the stop it replaces voxtype's export in the Markdown copy ([npu-transcribe.md](npu-transcribe.md#live-transcript)). `~/.config/bmeet/live-transcript` saying `off` turns it off.
   - After the stop and voxtype's own export, `npu-transcribe --meeting` runs as the unit `bmeet-speakers-STAMP` (see [npu-transcribe.md](npu-transcribe.md#speakers)) and replaces the Markdown copy. The unit's `ExecStopPost` deletes the audio however the pass ends; a meeting start also removes recordings no unit works on any more.
   - `~/.config/bmeet/speakers` (`on`/`off`) switches it; the installer's `--no-speakers` writes `off`.
   - Each part's start time goes to `part-N.start`. While it records, `$XDG_RUNTIME_DIR/bmeet/recording` names the folder, so `bmeet-chrome-host` (the native helper of BMeet's Chrome extension) can write the browser call's microphone state there (`call-mic.jsonl`). The pass leaves out what you said while the call could not hear you ([npu-transcribe.md](npu-transcribe.md#muted-in-the-call)).
@@ -153,3 +154,9 @@ journalctl --user -u voxtype -b | grep "fell back"
 - **voxtype setup commands:**
   - **Don't run:** `voxtype setup npu --enable` (switches to English-only `base.en`), `voxtype setup gpu --enable`, `voxtype setup onnx --enable` or `voxtype setup systemd`. They rewrite the binary, the model or the unit.
   - **Safe:** `voxtype setup npu --status` and `voxtype configure`.
+- **Text while you speak (`[openvino] streaming`): tested, left off** (2026-10-14, voxtype 1.1.0, whisper-small on the NPU; Russian and English clips played into a separate test daemon). It works on the NPU, but:
+  - **CPU:** it re-transcribes the whole utterance every 0.8 s, ~0.08 s of CPU each time: 5-6 s of CPU per minute of speech, against ~0.8 s for normal dictation, and ~45 % of the NPU's time.
+  - **Long dictation:** past ~25 s of continuous speech a pass takes longer than the interval, and audio is dropped (a 59 s clip came out with 59-74 % word errors). `[streaming] interval_secs = 1.5` avoids that, at ~3 s from word to text.
+  - **Repeats:** text is sometimes typed twice, both while you speak and in the end-of-recording pass; `revision_mode` repeats far more.
+  - **With BMeet's paste output:** every piece (7-29 per utterance) is a separate `wl-copy` + Ctrl+V, so the clipboard ends up holding only the last piece and Klipper gets one entry per piece. Words not yet agreed on when you stop are not typed at all (pause ~2 s before stopping).
+  - Text appears ~2 s after a word (Russian; English ~1.6 s), in bursts of a few words.

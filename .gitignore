@@ -6,3 +6,4 @@ bmeet/app/tests/.work/
 /dl/
 .venv/
 transcribe/tests/.work-speakers/
+transcribe/tests/.work-live/

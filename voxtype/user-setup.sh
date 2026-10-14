@@ -72,7 +72,7 @@ uninstall() {
     systemctl --user disable --now voxtype.service 2>/dev/null || true
     systemctl --user stop ydotool.service 2>/dev/null || true
     # speaker passes still running: stop them (their ExecStopPost deletes the audio)
-    systemctl --user stop bmeet-meeting-audio.service 'bmeet-speakers-*.service' 2>/dev/null || true
+    systemctl --user stop bmeet-meeting-audio.service bmeet-live.service 'bmeet-speakers-*.service' 2>/dev/null || true
     rm -rf "$XDG_RUNTIME_DIR/bmeet/meeting-audio" "$XDG_RUNTIME_DIR/bmeet/recording"
     rmdir "$XDG_RUNTIME_DIR/bmeet" 2>/dev/null || true
     rm -f "$BIN_DIR/voxtype-meeting-toggle" "$BIN_DIR/voxtype-lang" "$BIN_DIR/bmeet-meeting-audio"

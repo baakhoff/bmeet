@@ -241,6 +241,43 @@ microphone is diarized like the system audio, and then:
 - **Nobody through the speakers:** an online meeting in which the system audio held no speech is split the same way. That covers starting a normal meeting in the room by habit, and a call whose system audio was not captured, where the others leak into your microphone.
 - **Test:** `tests/meeting_test.py --in-person`. You are learned in an online meeting, the people are named, and a second meeting in the room comes out as You, Anna, Boris and Viktor: 100 % of the words under the right label in both languages, with real voices (0.6.0). With espeak's voices (`--espeak`; four voices at most 0.41 alike to TitaNet) it was 96 % in English and 87 % in Russian before 0.6.0; Nemotron, trained on real people, often hears espeak's voices as one.
 
+## Live transcript
+
+`--live DIR` writes the transcript of a meeting while BMeet records it, to `DIR/live.md`.
+The BMeet app shows it under the running meeting and keeps scrolling with it (unless you
+scrolled up to read). When the meeting stops, it becomes the meeting's Markdown copy until
+the speaker pass replaces it, instead of voxtype's own transcript (whisper-small in 30 s
+chunks, which voxtype keeps to itself until the meeting ends). `voxtype-meeting-toggle`
+starts it as the unit `bmeet-live` next to the recorder. It is off when
+`~/.config/bmeet/live-transcript` says `off`, and without the recording (`--no-speakers`).
+
+**How it works:**
+- **Following the recording:** twice a second it reads what `pw-record` added to the part's WAV files, from behind their header (whose sizes are only written at the end). A new `part-N.start` means the part before it is complete.
+- **Phrases:** each track's loudness per 100 ms, against its own background noise (the quietest tenth of its last 30 s, +12 dB), shows where someone talks. A phrase ends after 0.8 s of quiet, or is cut at its quietest moment after 20 s. Under 0.3 s of sound is a click, not a phrase.
+- **Text:** a phrase is transcribed once, when it has ended, with 0.3 s of audio around it. With GigaAM (Russian) the phrase still being said is also transcribed after every 1.5 s more of it and shown in italics: ~85 ms on the NPU and ~5 ms of CPU each time. (GigaAM's input is fixed at 30 s on the NPU, so a short phrase costs as much NPU time as a long one.) Other languages wait for the end of the phrase, as Whisper costs more.
+- **Language:** `--language`, or detected by Whisper on the first 8 s said on the other side (in person: on the microphone), as the speaker pass does. For Russian, Whisper is let go of then.
+- **Your microphone:** what you said while the call could not hear you is left out ([Muted in the call](#muted-in-the-call)), and the other side's echo is cut as in the speaker pass ([Speakers](#speakers), step 3). Your phrases are only what is clearly louder (2x) than the echo the system audio would cause at that moment, so their reply, heard by your microphone, doesn't keep your phrase open. A phrase of yours becomes final once the other side's text for the same moment is there.
+- **Labels:** You and Remote; in person, Room. Telling the other voices apart (Person 1, …) stays the speaker pass's work after the meeting.
+- **Memory:** only the audio a phrase still needs is kept (in RAM, at most a minute or so), plus the loudness per 100 ms. The process peaks at ~1.6 GB while Whisper is loaded (for the language, or for good with other languages than Russian).
+- **The end:** when the recorder no longer names the folder in `$XDG_RUNTIME_DIR/bmeet/recording` (or at SIGTERM, or when the speaker pass begins), it transcribes the last phrases, writes `live.md` once more without italics, and marks it complete with `live.done`. `voxtype-meeting-toggle` waits for that (at most 60 s) before it starts the speaker pass; a live transcript that did not get to the end leaves voxtype's in place.
+
+**Measured** with `tests/meeting_test.py --live`: the made-up meetings of real voices are recorded again in real time while `--live` follows them.
+
+| meeting (~1 min, 10 lines; real voices) | lines shown live | words first seen | line final | wrong side |
+|---|---|---|---|---|
+| Russian, laptop speakers (echo) | 10/10 | 1.8 s before the line ends | 2.3 s after (max 13.9 s) | none of theirs under You |
+| Russian, headphones | 10/10 | 1.8 s before | 2.0 s after (max 13.8 s) | none |
+| Russian, one sentence said while muted | 10/10, the muted one not | 1.8 s before | 4.1 s after (max 13.9 s) | none |
+| Russian, in person (13 lines) | 13/13, all under Room | 1.9 s before | 4.6 s after (max 13.3 s) | – |
+| English | 10/10 | 1.9 s after | 1.9 s after (max 8.7 s) | none |
+| English, one sentence said while muted | 10/10, the muted one not | 1.7 s after | 1.7 s after (max 8.1 s) | none |
+
+Medians; the longest waits are the first lines, said before the language is known (8 s of
+speech). Lines of different people with under 0.8 s between them become one phrase, so the
+earlier one is final only when the later one ends (the words show in italics meanwhile).
+**CPU:** ~2-2.7 s to start (Whisper and GigaAM loaded, the language detected), then 0.2-0.3 s
+per minute of meeting in Russian (~15 s an hour) and ~1.3 s per minute with Whisper.
+
 ## Tidying the text
 
 The outputs (meetings, `.md`, `.txt`, `.srt`) leave out what the speech models write for hesitations and slips, by fixed rules (`tidy()`; `--verbatim` keeps it all):

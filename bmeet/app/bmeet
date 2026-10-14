@@ -51,7 +51,8 @@ from PyQt6.QtCore import (QDateTime, QFile, QLocale, QMimeDatabase, QObject,  # 
                           QProcess, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFontDatabase,  # noqa: E402
                          QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPen,
-                         QShortcut, QTextCharFormat, QTextCursor)
+                         QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
+                         QTextDocumentFragment)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa: E402
                              QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
@@ -61,7 +62,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -986,18 +987,53 @@ class MarkdownView(QTextBrowser):
         self.anchorClicked.connect(open_url)
         self.document().setDocumentMargin(12)
         self._terms: list[str] = []
+        self._paragraphs: list[str] | None = None  # shown by show_paragraphs(), one block each
 
     def show_markdown(self, text: str) -> None:
+        self._paragraphs = None
         self.setMarkdown(text)
         self._highlight()
 
     def show_plain(self, text: str) -> None:
+        self._paragraphs = None
         self.setPlainText(text)
         self._highlight()
 
     def show_message(self, html_text: str) -> None:
+        self._paragraphs = None
         self.setHtml(html_text)
         self.setExtraSelections([])
+
+    def show_paragraphs(self, paragraphs: list[str]) -> None:
+        """Markdown paragraphs that each make one block (a heading, a line of text). When
+        the ones shown before start the same, only the rest is redone: a live transcript
+        changes at its end, and laying out all of an hour's text took ~40 ms each time."""
+        doc, old = self.document(), self._paragraphs
+        if old is None or self._terms or doc.blockCount() != len(old):
+            self.show_markdown("\n\n".join(paragraphs))
+            self._paragraphs = paragraphs
+            return
+        k = 0
+        while k < min(len(old), len(paragraphs)) and old[k] == paragraphs[k]:
+            k += 1
+        if k == len(old) == len(paragraphs):
+            return
+        if k == len(paragraphs):  # (only some gone at the end: rare)
+            self.show_markdown("\n\n".join(paragraphs))
+            self._paragraphs = paragraphs
+            return
+        cur = QTextCursor(doc.findBlockByNumber(min(k, doc.blockCount() - 1)))
+        if k >= doc.blockCount():  # (only new ones: they start a block of their own)
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            cur.insertBlock()
+        cur.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cur.removeSelectedText()
+        rest = QTextDocument()
+        rest.setMarkdown("\n\n".join(paragraphs[k:]))
+        cur.insertFragment(QTextDocumentFragment(rest))
+        # (the first one took the format of the block it went into)
+        QTextCursor(doc.findBlockByNumber(k)).setBlockFormat(rest.firstBlock().blockFormat())
+        self._paragraphs = paragraphs if doc.blockCount() == len(paragraphs) else None
 
     def set_terms(self, terms: list[str]) -> None:
         if terms != self._terms:
@@ -1355,7 +1391,7 @@ class VoicesDialog(QDialog):
 class MeetingsPage(ListDetailPage):
     COLUMNS = ("Title", "Date", "Duration", "Status")
     EMPTY = ("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
-             "microphone and the system audio. The transcript shows up here when you stop.")
+             "microphone and the system audio. The transcript shows up here as people talk.")
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__(main)
@@ -1366,6 +1402,10 @@ class MeetingsPage(ListDetailPage):
         self.live_id: str | None = None
         self.live_state = "idle"
         self.live_elapsed: float | None = None
+        self.live_md: str | None = None           # the running meeting's live transcript
+        self.live_sig: tuple | None = None        # ... as last shown
+        self.follow: str | None = None            # a meeting that just started: select it once listed
+        self.polled = False
         self.speakers_pending: set[str] = set()   # start stamps of running speaker passes
         self.error: str | None = None
         self._req = 0
@@ -1412,6 +1452,8 @@ class MeetingsPage(ListDetailPage):
                          [m.title.casefold(), m.started_at, self.duration_value(m), None],
                          tilde(m.md_path) if m.md_path else ""))
         self.repopulate(rows, old_key)
+        if self.follow and self.select_key(self.follow):
+            self.follow = None
         new_key = self.current_key()
         new_sig = self.meetings[new_key].signature() if new_key in self.meetings else None
         if new_key != old_key or new_sig != old_sig:
@@ -1431,11 +1473,18 @@ class MeetingsPage(ListDetailPage):
             return "Recording" if self.live_state == "recording" else "Paused"
         return m.status.replace("_", " ").capitalize() or "–"
 
-    def set_live(self, meeting_id: str | None, state: str, elapsed: float | None) -> None:
-        """Called every second by the window: update the running meeting's row."""
+    def set_live(self, meeting_id: str | None, state: str, elapsed: float | None,
+                 live_md: str | None = None) -> None:
+        """Called every second by the window: update the running meeting's row, and its
+        transcript so far when it is shown and live_md (from bmeet-ctl) changed."""
         old_id = self.live_id
         changed = (meeting_id, state) != (self.live_id, self.live_state)
-        self.live_id, self.live_state, self.live_elapsed = meeting_id, state, elapsed
+        if meeting_id and old_id is None and self.polled:  # (started now, not before the window opened)
+            self.follow = meeting_id
+        self.polled = True
+        self.live_id, self.live_state, self.live_elapsed, self.live_md = meeting_id, state, elapsed, live_md
+        if self.follow and self.select_key(self.follow):
+            self.follow = None
         for mid in {meeting_id, old_id} - {None}:
             item, m = self.item_for(mid), self.meetings.get(mid)
             if item is not None and m is not None:
@@ -1443,8 +1492,10 @@ class MeetingsPage(ListDetailPage):
                 item.setText(3, self.status_text(m))
         if changed and self.current_key():
             self.show_current()
-        elif meeting_id and self.current_key() == meeting_id:
+        elif meeting_id and self.current_key() == meeting_id and meeting_id in self.meetings:
             self.meta.setText(self.meta_text(self.meetings[meeting_id]))
+            if self.is_live(self.meetings[meeting_id]) and stat_sig(live_md or "") != self.live_sig:
+                self.show_live()
 
     def meta_text(self, m: Meeting) -> str:
         parts = [fmt_date(m.started_at, long=True), self.duration_text(m), self.status_text(m)]
@@ -1457,6 +1508,8 @@ class MeetingsPage(ListDetailPage):
                         else "From voxtype's meeting database (no Markdown copy)")
         if m.stamps() & self.speakers_pending:
             text += "\nTelling the speakers apart… the transcript is replaced when that is done."
+        if self.is_live(m) and self.live_md:
+            text += "\nLive: transcribed as people talk; in italics, what is still being said"
         return text
 
     def set_speakers_pending(self, pending: set[str]) -> None:
@@ -1537,12 +1590,15 @@ class MeetingsPage(ListDetailPage):
     def load_body(self, m: Meeting, live: bool) -> None:
         self._req += 1
         req = self._req
-        if m.md_path and not live:
+        if live:  # (voxtype keeps a meeting's text to itself until it stops)
+            self.show_live(first=True)
+            return
+        if m.md_path:
             text = self.texts.get(m.md_path)
             if text is not None:
                 self._show_text(text)
                 return
-        if not live and m.id in self.export_cache:
+        if m.id in self.export_cache:
             self._show_text(self.export_cache[m.id])
             return
         self.current_text = ""
@@ -1550,21 +1606,49 @@ class MeetingsPage(ListDetailPage):
         self.view.show_message(message_html("Loading the transcript…", "voxtype meeting export", "busy"))
 
         def done(code: int, out: str, err: str) -> None:
-            if code == 0 and not live:
+            if code == 0:
                 self.export_cache[m.id] = out
                 self.export_failed.discard(m.id)
             if req != self._req:
                 return  # the selection moved on
             if code == 0:
                 self._show_text(out)
-                if live and not self.terms:  # follow the growing transcript
-                    self.view.moveCursor(QTextCursor.MoveOperation.End)
             else:
                 self.view.show_message(message_html(
                     "Could not load the transcript",
                     (err.strip() or f"voxtype exited with status {code}")
                     + ("\n\nIs the voxtype daemon running?" if code == -1 else ""), "error"))
         run_command(self, export_cmd(m.id), done, timeout_ms=60_000)
+
+    def show_live(self, first: bool = False) -> None:
+        """The running meeting's transcript so far (npu-transcribe --live), following its end
+        unless you scrolled up (or search in it)."""
+        self.live_sig = stat_sig(self.live_md or "")
+        text = read_text(self.live_md) if self.live_md else None
+        if text is None:
+            self.current_text = ""
+            self.act_copy.setEnabled(False)
+            self.view.show_message(message_html(
+                "The transcript shows up here as people talk",
+                "If it does not, the live transcript is off, and the transcript shows up here when the "
+                "meeting stops. It needs telling speakers apart (on unless installed with "
+                "--no-speakers), and ~/.config/bmeet/live-transcript must not say “off”.", "busy"))
+            return
+        bar = self.view.verticalScrollBar()
+        follow, pos = not self.terms and (first or bar.value() >= bar.maximum() - 4), bar.value()
+        self.current_text = text
+        self.act_copy.setEnabled(bool(text.strip()))
+        # The transcript only: the info above it changes with every line (word count, ...).
+        body = text.split("\n## Transcript\n", 1)[-1]
+        self.view.show_paragraphs([p.strip() for p in body.split("\n\n") if p.strip()]
+                                  or ["*(nothing said yet)*"])
+        if self.terms and first:
+            return  # (at the first search hit)
+
+        def scroll() -> None:
+            bar.setValue(bar.maximum() if follow else pos)
+        scroll()
+        QTimer.singleShot(0, scroll)  # (once the text is laid out)
 
     def _show_text(self, text: str) -> None:
         self.current_text = text
@@ -2502,8 +2586,8 @@ class MainWindow(QMainWindow):
         self.meet_label.setMinimumWidth(self.meet_label.fontMetrics().horizontalAdvance("Saving transcript…  "))
         tb.addWidget(w)
         self.act_meet_start = QAction(icon("media-record"), "Start meeting", self)
-        self.act_meet_start.setToolTip("Record the microphone + system audio and transcribe it in "
-                                       "30-second chunks (also Meta+Alt+M)")
+        self.act_meet_start.setToolTip("Record the microphone + system audio and transcribe it as people "
+                                       "talk; select the meeting to follow along (also Meta+Alt+M)")
         self.act_meet_start.triggered.connect(lambda: self.start_meeting())
         self.act_meet_room = QAction(icon("group"), "In person", self)
         self.act_meet_room.setToolTip("Start an in-person meeting: record only the microphone and tell "
@@ -2628,7 +2712,7 @@ class MainWindow(QMainWindow):
         self.act_meet_pause.setToolTip("Continue recording" if meeting == "paused"
                                        else "Pause recording (nothing is recorded until you resume)")
         self.act_meet_stop.setEnabled(daemon_on and meeting != "idle" and not busy)
-        self.meetings_page.set_live(st.get("meeting_id"), meeting, elapsed)
+        self.meetings_page.set_live(st.get("meeting_id"), meeting, elapsed, st.get("meeting_live"))
         pending = set(st.get("speakers_pending") or [])
         if pending != self.meetings_page.speakers_pending:
             finished = self.meetings_page.speakers_pending - pending

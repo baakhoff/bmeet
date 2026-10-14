@@ -84,6 +84,11 @@ if [ "$speakers" = on ]; then
         || bad "speaker model Nemotron 3 Diarization missing (run the installer again)"
     command -v pw-record >/dev/null && [ -x "$HOME/.local/bin/bmeet-meeting-audio" ] \
         && ok "meeting audio recorder (pw-record, bmeet-meeting-audio)" || bad "pw-record or bmeet-meeting-audio missing"
+    if [ "$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/live-transcript" 2>/dev/null)" = off ]; then
+        info "live transcript while the meeting runs: off (~/.config/bmeet/live-transcript)"
+    else
+        info "live transcript while the meeting runs: on (the BMeet window shows it)"
+    fi
     if [ "$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices" 2>/dev/null)" = on ]; then
         n=$(python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["voices"]))' \
             "${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices/voices.json" 2>/dev/null || echo 0)

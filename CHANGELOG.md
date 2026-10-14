@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-10-14
+
+See what has been said while the meeting is still on.
+
+### Added
+- **Live meeting transcript:** the BMeet window shows the running meeting's transcript as people talk, **You** and **Remote** (in person: **Room**), and keeps scrolling with it unless you scroll up to read. A meeting that starts while the window is open is selected. Until now nothing showed before the stop: voxtype keeps its own transcript to itself until the meeting ends.
+  - `npu-transcribe --live DIR` follows BMeet's meeting recording as it grows (unit `bmeet-live`, started by `voxtype-meeting-toggle` next to the recorder). Each track is cut into phrases where its sound stops, and a phrase is transcribed once it has ended, on the NPU.
+  - **Russian (GigaAM):** the sentence still being said shows in italics, redone every 1.5 s of it. In the tests the words showed up about 2 s *before* the end of a line, and the line was final 2-5 s after it. That costs ~15 s of CPU per hour of meeting (plus ~2 s to load the models).
+  - **Other languages (Whisper turbo):** a phrase at a time, ~2 s after it ends. Whisper takes more CPU: ~1.3 s per minute of meeting.
+  - **Your microphone:** what you said while muted in the call is left out, and so is the other side's echo, as in the speaker pass. The echo doesn't keep your phrase open either: only what is clearly louder than it counts as you.
+  - **When you stop:** the live transcript, finished, becomes the meeting's Markdown copy instead of voxtype's (whisper-small, without the echo and muting filters), until the speaker pass replaces it with Person 1, Person 2, …
+  - Off with `off` in `~/.config/bmeet/live-transcript`. It needs the meeting audio, so not with `--no-speakers`.
+
+### Not changed
+- **Dictation still types the text when you stop.** voxtype's own way of typing while you speak (`[openvino] streaming`) was tested on the NPU and left off. It took 5-6x the CPU of normal dictation, dropped audio past ~25 s of speech, sometimes typed text twice, and with BMeet's paste output it would fill the clipboard history with fragments and lose the last words (details in `docs/voxtype.md`).
+
+### Tests
+- **`transcribe/tests/meeting_test.py --live`:** records the made-up meeting of real voices again in real time while `--live` follows it, and reports how soon each line showed up. All lines showed in Russian and English, with echo, with headphones, muted and in person; none of the other side's words were under *You*, and nothing said while muted.
+
 ## [0.6.0] - 2026-10-13
 
 Telling the speakers apart with NVIDIA's Nemotron 3 Diarization, on the NPU: far less speech under the wrong person, in Russian first of all.
@@ -161,6 +180,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.7.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.0
 [0.6.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.6.0
 [0.5.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.2
 [0.5.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.1

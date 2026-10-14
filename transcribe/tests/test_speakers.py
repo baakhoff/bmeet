@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of npu-transcribe's speaker helpers: labelling and splitting by speaker,
-echo removal and the meeting Markdown. No models, no NPU: only numpy is needed.
+echo removal, the meeting Markdown and the live transcript. No models, no NPU: only numpy
+is needed.
 
 Run: python3 -I transcribe/tests/test_speakers.py -v
 """
@@ -702,6 +703,228 @@ class YourVoice(unittest.TestCase):
             self.assertEqual(len(nt.load_self(tmp)), nt.MAX_SELF_PRINTS)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class FakeEngine:
+    """Stands in for the speech models in the live tests: each phrase it is given is the
+    scripted text whose level (RMS of the phrase's loud part) is nearest, its words spread
+    over the loud part. Like Whisper with word timestamps (generate), or GigaAM (words)."""
+
+    def __init__(self, script: list[tuple[float, str]]) -> None:
+        self.script, self.device, self.model_dir, self.calls = script, "NPU", Path("fake-whisper"), 0
+
+    def heard(self, block: np.ndarray) -> list:
+        self.calls += 1
+        loud = nt.frame_rms(block, RATE // 20)
+        level = float(np.percentile(loud, 90)) if loud.size else 0.0
+        on = np.flatnonzero(loud >= level / 2)
+        if level == 0 or not on.size:
+            return []
+        text = min(self.script, key=lambda s: abs(np.log(s[0] / level)))[1].split()
+        a, b = on[0] * 0.05, (on[-1] + 1) * 0.05
+        step = (b - a) / len(text)
+        return [Word(a + i * step, a + (i + 0.9) * step, " " + w) for i, w in enumerate(text)]
+
+    def generate(self, block, **kwargs):  # Whisper
+        from types import SimpleNamespace as NS
+        ws = self.heard(block)
+        chunks = [NS(text=" ".join(w.text.strip() for w in ws), start_ts=ws[0].start, end_ts=ws[-1].end)] if ws else []
+        return NS(chunks=chunks, language="<|en|>",
+                  words=[NS(word=w.text, start_ts=w.start, end_ts=w.end) for w in ws])
+
+
+class FakeGigaAM(nt.GigaAM):
+    def __init__(self, script: list[tuple[float, str]]) -> None:  # (no model)
+        self.fake, self.device = FakeEngine(script), "NPU"
+
+    def words(self, block):
+        return self.fake.heard(block)
+
+
+class FakeEngines:
+    def __init__(self, engine) -> None:
+        self.engine, self._whisper = engine, None
+
+    def for_language(self, language, words=False):
+        return self.engine, language
+
+
+class Live(unittest.TestCase):
+    """--live: the transcript while a meeting is recorded (LiveMeeting, LiveTrack)."""
+    T0 = 1_760_000_000.0
+    SCRIPT = [(0.05, "Alpha bravo charlie delta."), (0.005, "Alpha bravo charlie delta."),  # (its echo)
+              (0.03, "Echo foxtrot golf."), (0.02, "Hotel india juliet."), (0.08, "Kilo lima mike november.")]
+
+    @staticmethod
+    def header() -> bytes:  # as pw-record writes it while recording: sizes 0
+        return (b"RIFF\0\0\0\0WAVEfmt " + (16).to_bytes(4, "little") + (1).to_bytes(2, "little")
+                + (1).to_bytes(2, "little") + RATE.to_bytes(4, "little") + (2 * RATE).to_bytes(4, "little")
+                + (2).to_bytes(2, "little") + (16).to_bytes(2, "little") + b"data\0\0\0\0")
+
+    @staticmethod
+    def pcm(x: np.ndarray) -> bytes:
+        return (np.clip(x, -1, 1) * 32767).astype("<i2").tobytes()
+
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / ".work-live"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.tmp.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def burst(self, x: np.ndarray, start: float, end: float, level: float, seed: int) -> None:
+        a, b = int(start * RATE), int(end * RATE)
+        x[a:b] += np.random.default_rng(seed).normal(0, level, b - a).astype(np.float32)
+
+    def test_wav_data_while_it_is_written(self):
+        f = self.tmp / "part-1-mic.wav"
+        self.assertIsNone(nt.wav_data(f))
+        f.write_bytes(self.header()[:20])
+        self.assertIsNone(nt.wav_data(f))
+        f.write_bytes(self.header() + self.pcm(np.zeros(160)))
+        self.assertEqual(nt.wav_data(f), 44)
+        f.write_bytes(self.header().replace(RATE.to_bytes(4, "little"), (48000).to_bytes(4, "little"), 1))
+        with self.assertRaises(RuntimeError):
+            nt.wav_data(f)
+
+    def test_phrases_end_at_pauses_and_long_ones_are_cut(self):
+        x = noise(60, 0.001, 1)
+        self.burst(x, 1.0, 3.0, 0.05, 2)
+        self.burst(x, 3.5, 4.5, 0.05, 3)    # a short pause: the same phrase
+        self.burst(x, 7.0, 7.1, 0.05, 4)    # a click
+        self.burst(x, 10.0, 35.0, 0.05, 5)  # 25 s without a pause: cut at 20 s
+        t = nt.LiveTrack("mic", "You")
+        for i in range(0, x.size, RATE // 2):  # as it is recorded, 0.5 s at a time
+            t.append(x[i:i + RATE // 2], 0)
+            t.listen(0)
+        got = [(a / RATE, b / RATE) for a, b in t.ended]
+        self.assertEqual(len(got), 3, got)
+        self.assertAlmostEqual(got[0][0], 0.7, delta=0.11)
+        self.assertAlmostEqual(got[0][1], 4.8, delta=0.11)
+        self.assertAlmostEqual(got[1][0], 9.7, delta=0.11)
+        self.assertTrue(25.0 <= got[1][1] <= 29.8, got)  # (its quietest moment in the last 5 s)
+        self.assertEqual(got[2], (got[1][1], got[2][1]))
+        self.assertAlmostEqual(got[2][1], 35.3, delta=0.11)
+        self.assertIsNone(t.start)
+
+    def record(self, parts: list[dict[str, np.ndarray]], engine, in_person=False, calls=(), ticks=None) -> nt.LiveMeeting:
+        """Writes the parts as bmeet-meeting-audio would, 0.5 s at a time, and has a
+        LiveMeeting follow them; returns it once the recording ended."""
+        from types import SimpleNamespace as NS
+        (self.tmp / "call-mic.jsonl").write_text("".join(
+            '{"t": %.1f, "call": true, "live": %s}\n' % (t, "true" if live else "false") for t, live in calls))
+        m = nt.LiveMeeting(self.tmp, in_person)
+        args, engines, wall = NS(engine="auto", language="en"), FakeEngines(engine), self.T0
+        for n, tracks in enumerate(parts, 1):
+            (self.tmp / f"part-{n}.start").write_text(f"{wall}\n")
+            files = {k: self.tmp / f"part-{n}-{k}.wav" for k in tracks}
+            for f in files.values():
+                f.write_bytes(self.header())
+            size = max(x.size for x in tracks.values())
+            for i in range(0, size, RATE // 2):
+                for k, x in tracks.items():
+                    with open(files[k], "ab") as f:
+                        f.write(self.pcm(x[i:i + RATE // 2]))
+                m.take_in()
+                m.step(engines, args, over=False)
+                if ticks:
+                    ticks(m, (i + RATE // 2) / RATE)
+            wall += size / RATE + 10
+        m.take_in()
+        m.end_part()
+        m.step(engines, args, over=True)
+        return m
+
+    def meeting(self) -> tuple[dict, list]:
+        """Remote says two things; your microphone hears the first as echo (-20 dB), you say
+        one thing, and another while the call cannot hear you (muted 10.5-13.5 s)."""
+        remote, mic = np.zeros(20 * RATE, np.float32), noise(20, 0.001, 9)
+        self.burst(remote, 1.0, 4.0, 0.05, 10)
+        mic[480:] += 0.1 * remote[:-480]
+        self.burst(mic, 6.0, 8.0, 0.03, 11)
+        self.burst(mic, 11.0, 13.0, 0.02, 12)
+        self.burst(remote, 15.0, 18.0, 0.08, 13)
+        calls = [(self.T0 + t, True) for t in np.arange(0, 10.5, 5)] + [(self.T0 + 10.5, False)] \
+            + [(self.T0 + 13.5, True), (self.T0 + 18.5, True)]
+        return {"remote": remote, "mic": mic}, calls
+
+    def check(self, m: nt.LiveMeeting) -> None:
+        said = {t.label: " ".join(s.text for s in t.final) for t in m.tracks}
+        self.assertEqual(said, {"Remote": "Alpha bravo charlie delta. Kilo lima mike november.",
+                                "You": "Echo foxtrot golf."})
+        self.assertGreaterEqual(m.echoes, 4)
+        self.assertEqual(m.muted, 3)
+        md = m.markdown("Test", self.T0, done=True)
+        self.assertIn("### Remote\n\n*[00:01]* Alpha bravo charlie delta.", md)
+        self.assertIn("### You\n\n*[00:06]* Echo foxtrot golf.", md)
+        self.assertIn("- **Transcribed:** as people talked (live)", md)
+        self.assertNotIn("*Kilo", md)
+
+    def test_whisper_phrases_without_echo_or_muted_words(self):
+        tracks, calls = self.meeting()
+        engine = FakeEngine(self.SCRIPT)
+        m = self.record([tracks], engine, calls=calls)
+        self.check(m)
+        self.assertLessEqual(engine.calls, 6)  # each phrase once (Whisper: no drafts)
+
+    def test_gigaam_drafts_while_people_talk(self):
+        tracks, calls = self.meeting()
+        seen = []
+
+        def tick(m, at):
+            md = m.markdown("Test", self.T0, done=False)
+            if at == 17.5:
+                seen.append(md)
+            if at == 0.5:
+                self.assertIn("*(nothing said yet)*", md)
+                self.assertIn("- **Live:** transcribed as people talk", md)
+        m = self.record([tracks], FakeGigaAM(self.SCRIPT), calls=calls, ticks=tick)
+        self.check(m)
+        self.assertIn("*Kilo lima mike november. …*", seen[0])  # (still being said)
+
+    def test_yours_is_final_before_their_quick_answer_ends(self):
+        remote, mic = np.zeros(16 * RATE, np.float32), noise(16, 0.001, 40)
+        self.burst(remote, 0.5, 3.5, 0.05, 43)
+        self.burst(mic, 5.0, 7.0, 0.03, 41)
+        self.burst(remote, 7.4, 14.0, 0.05, 42)   # they answer 0.4 s after you stop
+        mic[480:] += 0.1 * remote[:-480]          # (and your microphone hears it)
+        when = []
+        m = self.record([{"remote": remote, "mic": mic}], FakeEngine(self.SCRIPT[:3]),
+                        ticks=lambda m, at: when.append(at) if m.mic.final and not when else None)
+        self.assertLessEqual(when[0], 9.0)
+        self.assertEqual([s.text for s in m.mic.final], ["Echo foxtrot golf."])
+
+    def test_parts_and_in_person(self):
+        a, b = noise(4, 0.001, 20), noise(3, 0.001, 21)
+        self.burst(a, 1.0, 3.5, 0.03, 22)  # still talking when the meeting is paused
+        self.burst(b, 0.5, 2.0, 0.08, 23)
+        m = self.record([{"mic": a}, {"mic": b}], FakeEngine(self.SCRIPT), in_person=True)
+        self.assertEqual([(s.speaker, s.text, round(s.start)) for s in m.mic.final],
+                         [("Room", "Echo foxtrot golf.", 1), ("Room", "Kilo lima mike november.", 4)])
+        self.assertEqual([(p.offset, p.wall) for p in m.parts], [(0.0, self.T0), (4.0, self.T0 + 14)])
+
+    def test_a_pause_ends_the_phrase(self):
+        from types import SimpleNamespace as NS
+        x = noise(4, 0.001, 50)
+        self.burst(x, 1.0, 4.0, 0.03, 51)   # paused while talking: the recording just stops
+        (self.tmp / "part-1.start").write_text(f"{self.T0}\n")
+        (self.tmp / "part-1-mic.wav").write_bytes(self.header() + self.pcm(x))
+        m, args = nt.LiveMeeting(self.tmp, True), NS(engine="auto", language="en")
+        engines = FakeEngines(FakeEngine(self.SCRIPT))
+        m.take_in()
+        m.step(engines, args, over=False)
+        self.assertEqual(m.mic.final, [])
+        m.step(engines, args, over=False, still=True)
+        self.assertEqual([s.text for s in m.mic.final], ["Echo foxtrot golf."])
+
+    def test_old_audio_is_let_go(self):
+        x = noise(100, 0.001, 30)
+        self.burst(x, 80.0, 82.0, 0.03, 31)
+        m = self.record([{"mic": x}], FakeEngine(self.SCRIPT), in_person=True,
+                        ticks=lambda m, at: self.assertLessEqual(m.mic.length - m.base, (nt.LIVE_KEEP + 2) * RATE))
+        self.assertGreater(m.base, 60 * RATE)
+        self.assertEqual([s.text for s in m.mic.final], ["Echo foxtrot golf."])
 
 
 if __name__ == "__main__":

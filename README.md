@@ -16,8 +16,9 @@ machine, and the CPU and GPU are left alone.
   - Press **Meta+H**, speak, and press it again. The text is typed at the cursor in any app.
   - Speed: about 0.5 s for a 5 s sentence on the NPU.
 - **Meeting transcripts, with who said what:**
-  - Press **Meta+Alt+M** to record your microphone and the system audio. Each 30 s chunk is transcribed on the NPU while the meeting runs.
-  - When you stop, a Markdown transcript is saved to `~/Documents/Meetings` right away.
+  - Press **Meta+Alt+M** to record your microphone and the system audio.
+  - **Live:** while the meeting runs, the BMeet window shows what has been said so far, **You** and **Remote**, and keeps up as people talk. In Russian you see the sentence still being said, in italics; other languages appear a phrase at a time. Your words from while you were muted and the echo from your speakers are left out here too.
+  - When you stop, that transcript is saved to `~/Documents/Meetings` right away.
   - A few minutes later it is replaced by one where the other side is split by voice: **You**, **Person 1**, **Person 2**, … Each line sits under whoever said it, in the order it was said, and the speech your microphone picked up from your speakers is left out. A 1-hour Russian meeting takes about 1 minute on a Core Ultra 7 258V (other languages, with Whisper: ~7 minutes).
   - The audio is held in RAM only until that is done, then deleted. It never reaches the disk.
   - **Tidy text:** fillers (э-э, а-а, хмм, um), stutters and doubled words are left out (`npu-transcribe --verbatim` keeps them).
@@ -181,7 +182,8 @@ bash ~/.local/share/bmeet/src/uninstall.sh
                                               speakers: Nemotron + TitaNet ────> NPU
 
  meeting: voxtype-meeting-toggle ─> bmeet-meeting-audio (pw-record, RAM) ─> npu-transcribe --meeting
-          (live You/Remote transcript from voxtype first, replaced by You/Person 1/... when done)
+          npu-transcribe --live follows the recording: live.md, shown in the app (You/Remote)
+          (it is the Markdown copy until the speaker pass replaces it with You/Person 1/...)
           Chrome extension ─> bmeet-chrome-host ─> call-mic.jsonl (muted stretches left out)
 ```
 
@@ -202,7 +204,8 @@ bmeet/app/tests/run-tests.sh                      # + real Whisper runs on the N
 bmeet/plasmoid/tests/check_qml.py --strict bmeet/plasmoid/*/contents/ui/*.qml
 transcribe/tests/run-tests.sh /tmp/npt "NPU CPU"  # npu-transcribe benchmark / regression
 transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass with real voices (ru; --language en,
-                                                  #   --remember, --muted, --in-person, --espeak)
+                                                  #   --remember, --muted, --in-person, --espeak;
+                                                  #   --live: the live transcript, in real time)
 transcribe/tests/speakers_test.py /tmp/npt        # who speaks when on real recordings (--ami: meetings)
 transcribe/tests/english_terms_test.py /tmp/npt   # English terms in Russian speech (downloads Podlodka)
 python3 -I bmeet/chrome/tests/test_host.py        # Chrome extension's host (offline)

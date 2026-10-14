@@ -24,6 +24,8 @@ written by bmeet-meeting-audio) into a Markdown transcript: the microphone is "Y
 the voices in the system audio become Person 1, Person 2, ... Your words from when the
 browser call could not hear you (muted in Meet or Slack; BMeet's Chrome extension logs
 it) are left out. An in-person meeting (microphone only) is split by voice: You, Person 1, ...
+--live DIR writes the transcript of such a recording while it is still being made, to
+DIR/live.md, for the BMeet window: You and Remote (Room in person), updated as people talk.
 
 Examples:
   npu-transcribe meeting.m4a
@@ -33,6 +35,7 @@ Examples:
   npu-transcribe --num-speakers 3 panel.mp4                  # exactly three voices
   npu-transcribe --engine whisper russian-talk.ogg           # Whisper even for Russian
   npu-transcribe --meeting DIR --output 2026-10-12_1041-meeting.md
+  npu-transcribe --live DIR                                  # while DIR is being recorded
 
 Notes:
   * Russian (given with --language ru, or detected) goes to GigaAM v3 when it is installed:
@@ -74,6 +77,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -102,7 +106,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -699,39 +703,17 @@ def transcribe(whisper: Whisper | GigaAM, name: str,
     t0 = time.monotonic()
     try:
         for start, block in blocks:
-            length = block.size / SAMPLE_RATE
             # Whisper invents text ("Thank you.") for pure silence: skip silent
             # blocks and drop segments whose audio is (digitally) silent.
             if peak_dbfs(block) >= SILENCE_DBFS:
                 kwargs = dict(gen_kwargs, language=f"<|{language}|>") if language else gen_kwargs
-                result = whisper.generate(block, **kwargs)
-                if result is None:
-                    dropped += 1
-                    done = start + length
-                    progress.update(done)
-                    continue
-                if not language and result.language:
-                    language = result.language.strip("<|>")
+                found, lost, heard = whisper_block(whisper, start, block, kwargs)
+                segments += found
+                dropped += lost
+                if not language and heard:
+                    language = heard
                     log(f"language: {language} (auto-detected from the first block)")
-                words = [Word(float(w.start_ts), float(w.end_ts), w.word)
-                         for w in (getattr(result, "words", None) or [])]
-                chunks = [c for c in result.chunks or [] if c.text.strip()]
-                for i, chunk in enumerate(chunks):
-                    text = " ".join(chunk.text.split())  # one line: a blank line would end the SRT cue
-                    s = min(max(float(chunk.start_ts), 0.0), length)
-                    e = min(max(float(chunk.end_ts), s + 0.5), length)  # end may be missing
-                    # this segment's words: those centred before its end (the last one takes the rest)
-                    n = len(words) if i == len(chunks) - 1 else \
-                        sum(1 for _ in itertools.takewhile(lambda w: (w.start + w.end) / 2 <= e, words))
-                    mine, words = words[:n], words[n:]
-                    span = audible_span(block, s, e)
-                    if span is None or hallucination(text) or not re.search(r"\w", text):
-                        dropped += 1
-                        continue
-                    segments.append(collapse_repeats(Segment(
-                        start + span[0], start + span[1], text,
-                        [Word(start + w.start, start + w.end, w.text) for w in mine])))
-            done = start + length
+            done = start + block.size / SAMPLE_RATE
             progress.update(done)
     finally:
         blocks.close()  # stops ffmpeg right away if we bail out early
@@ -739,6 +721,37 @@ def transcribe(whisper: Whisper | GigaAM, name: str,
     if (looped := len(segments) - len(segments := drop_repeated_segments(segments))) > 0:
         log(f"{looped} repeated segment(s) left out (Whisper looping)")
     return Transcript(segments, done, time.monotonic() - t0, language or "?", dropped)
+
+
+def whisper_block(whisper: Whisper, start: float, block: np.ndarray,
+                  kwargs: dict) -> tuple[list[Segment], int, str]:
+    """One block (<= 30 s, starting `start` seconds in) through Whisper: (its segments, how
+    many were dropped as silence hallucinations or a failed block, the language it heard)."""
+    length = block.size / SAMPLE_RATE
+    result = whisper.generate(block, **kwargs)
+    if result is None:
+        return [], 1, ""
+    words = [Word(float(w.start_ts), float(w.end_ts), w.word)
+             for w in (getattr(result, "words", None) or [])]
+    chunks = [c for c in result.chunks or [] if c.text.strip()]
+    segments: list[Segment] = []
+    dropped = 0
+    for i, chunk in enumerate(chunks):
+        text = " ".join(chunk.text.split())  # one line: a blank line would end the SRT cue
+        s = min(max(float(chunk.start_ts), 0.0), length)
+        e = min(max(float(chunk.end_ts), s + 0.5), length)  # end may be missing
+        # this segment's words: those centred before its end (the last one takes the rest)
+        n = len(words) if i == len(chunks) - 1 else \
+            sum(1 for _ in itertools.takewhile(lambda w: (w.start + w.end) / 2 <= e, words))
+        mine, words = words[:n], words[n:]
+        span = audible_span(block, s, e)
+        if span is None or hallucination(text) or not re.search(r"\w", text):
+            dropped += 1
+            continue
+        segments.append(collapse_repeats(Segment(
+            start + span[0], start + span[1], text,
+            [Word(start + w.start, start + w.end, w.text) for w in mine])))
+    return segments, dropped, (result.language or "").strip("<|>")
 
 
 def transcribe_ctc(model: GigaAM, name: str, blocks: Generator[tuple[float, np.ndarray], None, None],
@@ -750,16 +763,20 @@ def transcribe_ctc(model: GigaAM, name: str, blocks: Generator[tuple[float, np.n
     t0 = time.monotonic()
     try:
         for start, block in blocks:
-            if peak_dbfs(block) >= SILENCE_DBFS:  # (a lone "." or "—" is no sentence)
-                segments += [seg for seg in sentences([Word(start + w.start, start + w.end, w.text)
-                                                       for w in model.words(block)])
-                             if re.search(r"\w", seg.text)]
+            if peak_dbfs(block) >= SILENCE_DBFS:
+                segments += ctc_block(model, start, block)
             done = start + block.size / SAMPLE_RATE
             progress.update(done)
     finally:
         blocks.close()
         progress.close()
     return Transcript(segments, done, time.monotonic() - t0, model.language, 0)
+
+
+def ctc_block(model: GigaAM, start: float, block: np.ndarray) -> list[Segment]:
+    """One block (<= 30 s, starting `start` seconds in) through GigaAM, as sentences."""
+    return [seg for seg in sentences([Word(start + w.start, start + w.end, w.text) for w in model.words(block)])
+            if re.search(r"\w", seg.text)]  # (a lone "." or "—" is no sentence)
 
 
 # English terms in Russian speech. GigaAM writes them garbled or in Cyrillic ("Data Dog",
@@ -1627,16 +1644,25 @@ def rms(samples: np.ndarray, start: float, end: float) -> float:
     return float(np.sqrt(np.square(part, dtype=np.float64).mean())) if part.size else 0.0
 
 
+def frame_rms(samples: np.ndarray, frame: int = SAMPLE_RATE // 10) -> np.ndarray:
+    """Loudness (RMS) of each whole `frame` of samples."""
+    n = samples.size // frame
+    return np.sqrt(np.square(samples[:n * frame].reshape(n, frame), dtype=np.float64).mean(axis=1))
+
+
 def echo_gain(mic: np.ndarray, remote: np.ndarray) -> float:
     """How loud the system audio comes back through the microphone: the median mic/remote
     loudness ratio over the 100 ms frames where the remote side is loudest (you are
     silent in most of them). ~0 with headphones."""
-    frame = SAMPLE_RATE // 10
-    n = min(mic.size, remote.size) // frame
+    return echo_gain_of(frame_rms(mic), frame_rms(remote))
+
+
+def echo_gain_of(loud_m: np.ndarray, loud_r: np.ndarray) -> float:
+    """echo_gain() from the two tracks' frame_rms()."""
+    n = min(loud_m.size, loud_r.size)
     if n == 0:
         return 0.0
-    loud_r = np.sqrt(np.square(remote[:n * frame].reshape(n, frame), dtype=np.float64).mean(axis=1))
-    loud_m = np.sqrt(np.square(mic[:n * frame].reshape(n, frame), dtype=np.float64).mean(axis=1))
+    loud_m, loud_r = loud_m[:n], loud_r[:n]
     loud = loud_r >= max(SILENCE_AMPLITUDE, float(np.percentile(loud_r, 70)))
     return float(np.median(loud_m[loud] / loud_r[loud])) if loud.sum() >= 20 else 0.0
 
@@ -1670,14 +1696,7 @@ def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
             echo = [gain > 0 and rms(mic, w.start, w.end) < ECHO_MARGIN * gain * rms(remote, w.start, w.end)
                     or said_by_them(w) for w in seg.words]
             cut += sum(echo)
-            for is_echo, group in itertools.groupby(zip(echo, seg.words), key=lambda x: x[0]):
-                words = [w for _, w in group]
-                text = " ".join("".join(w.text for w in words).split())
-                if not is_echo and tokens(text):
-                    if len(words) == len(seg.words):
-                        kept.append(seg)
-                    else:
-                        kept.append(Segment(words[0].start, words[-1].end, text, words, seg.speaker))
+            kept += without_words(seg, echo)
             continue
         said = tokens(seg.text)
         pool: dict[str, int] = {}
@@ -1695,6 +1714,19 @@ def drop_echo(mine: list[Segment], theirs: list[Segment], mic: np.ndarray,
         else:
             kept.append(seg)
     return kept, cut
+
+
+def without_words(seg: Segment, cut: list[bool]) -> list[Segment]:
+    """seg without the words flagged in `cut` (one flag per word): its runs of kept words."""
+    if not any(cut):
+        return [seg]
+    out = []
+    for is_cut, group in itertools.groupby(zip(cut, seg.words), key=lambda x: x[0]):
+        words = [w for _, w in group]
+        text = " ".join("".join(w.text for w in words).split())
+        if not is_cut and tokens(text):
+            out.append(Segment(words[0].start, words[-1].end, text, words, seg.speaker))
+    return out
 
 
 def load_voices(folder: Path) -> dict[str, list[list[float]]]:
@@ -2034,10 +2066,11 @@ def meeting_time(seconds: float) -> str:
 
 
 def meeting_md(title: str, started: float | None, duration: float, segments: list[Segment],
-               meta: dict[str, str]) -> str:
+               meta: dict[str, str], tidied: bool = False, empty: str = "*(no speech detected)*") -> str:
     """The meeting transcript, laid out like `voxtype meeting export --format markdown`
-    (which it replaces): a heading per change of speaker, a [mm:ss] mark per paragraph."""
-    segments = tidy_segments(segments)
+    (which it replaces): a heading per change of speaker, a [mm:ss] mark per paragraph.
+    tidied: the segments went through tidy_segments() already. empty: the text without any."""
+    segments = segments if tidied else tidy_segments(segments)
     speakers = sorted({s.speaker for s in segments},
                       key=lambda n: (n != "You", int(n.split()[-1]) if n[-1:].isdigit() else 0, n))
     info = ([f"- **Date:** {datetime.fromtimestamp(started):%Y-%m-%d %H:%M}"] if started else []) + [
@@ -2050,7 +2083,7 @@ def meeting_md(title: str, started: float | None, duration: float, segments: lis
         body += [f"### {spk}", ""]
         body += [f"*[{meeting_time(start)}]* {text}\n" for start, text in paragraphs(group)]
     return "\n".join([f"# {title}", "", "## Meeting Info", "", *info, "", "## Transcript", "",
-                      *(body or ["*(no speech detected)*", ""])])
+                      *(body or [empty, ""])])
 
 
 def write_atomic(path: Path, text: str, private: bool = False) -> None:
@@ -2201,7 +2234,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--meeting", type=Path, metavar="DIR",
                    help="transcribe a BMeet meeting recording (see above) instead of files")
     p.add_argument("--output", type=Path, metavar="FILE.md", help="--meeting: the Markdown transcript")
-    p.add_argument("--title", help="--meeting: its title (default: from DIR/meeting.json)")
+    p.add_argument("--live", type=Path, metavar="DIR",
+                   help="the transcript of a BMeet meeting while it is recorded into DIR, in DIR/live.md "
+                        "(You / Remote; until the recording ends)")
+    p.add_argument("--title", help="--meeting, --live: its title (default: from DIR/meeting.json)")
     p.add_argument("--no-english-terms", action="store_true",
                    help="Russian (GigaAM): do not let Whisper redo the English terms in sentences where "
                         "GigaAM heard some (by default it does, on the NPU, for those sentences only)")
@@ -2217,8 +2253,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         p.error("--num-speakers: expected a positive number")
     args.speakers = args.speakers or args.num_speakers > 0 or args.meeting is not None
     if args.meeting is not None:
-        if args.files or not args.output:
+        if args.files or not args.output or args.live is not None:
             p.error("--meeting DIR takes no FILE and needs --output FILE.md")
+    elif args.live is not None:
+        if args.files or args.voices is not None or args.speakers:
+            p.error("--live DIR takes no FILE, --voices or --speakers")
     elif args.voices is not None:
         p.error("--voices only works with --meeting")
     elif not args.files:
@@ -2251,8 +2290,9 @@ class Engines:
         self._speakers: SpeakerModels | None = None
 
     def whisper(self, words: bool = False) -> Whisper:
-        """words: with word timestamps (a separately compiled pipeline; reloaded if needed)."""
-        words = words or self.args.speakers
+        """words: with word timestamps (a separately compiled pipeline; reloaded if needed).
+        Always for --meeting and --live, which need them for the speakers and the echo."""
+        words = words or self.args.speakers or self.args.live is not None
         if self._whisper is not None and words and not self._whisper.word_timestamps:
             self._whisper = None  # (frees the pipeline without them)
         if self._whisper is None:
@@ -2323,10 +2363,14 @@ class Engines:
             language = self.detect(blocks)
         else:
             blocks.close()
-        if (self.args.engine == "auto" and language == "ru" and not self.args.translate
-                and gigaam_ready()):
+        return self.for_language(language)
+
+    def for_language(self, language: str, words: bool = False) -> tuple[Whisper | GigaAM, str]:
+        """choose() once the language is known. words: Whisper with word timestamps."""
+        if self.args.engine == "gigaam" or (self.args.engine == "auto" and language == "ru"
+                                            and not self.args.translate and gigaam_ready()):
             return self.gigaam(), "ru"
-        return self.whisper(), language
+        return self.whisper(words), language
 
 
 def user_languages() -> set[str]:
@@ -2486,6 +2530,484 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
     return 0
 
 
+# --------------------------------------------------------------------------- live
+
+# --live DIR: the transcript while the meeting is still on, for the BMeet window (DIR/live.md,
+# rewritten whenever the text changes). It follows bmeet-meeting-audio's recording as the
+# files grow, cuts each track into phrases where its sound stops, and transcribes a phrase
+# once it has ended. With GigaAM (Russian) the phrase still being said is shown as well,
+# redone after every LIVE_PARTIAL more seconds of it: ~85 ms on the NPU and ~5 ms of CPU
+# each time. Other languages wait for the end of the phrase (Whisper). Your microphone is
+# "You" (left out while the call cannot hear you, the other side's echo cut out as in the
+# speaker pass), the system audio "Remote"; who is who among them is the speaker pass's job
+# after the meeting. In person, the microphone is "Room".
+LIVE_TICK = 0.5           # seconds between looks at the recording
+LIVE_FRAME = SAMPLE_RATE // 10  # sound is measured per 100 ms (as in echo_gain)
+LIVE_NOISE = 300          # a track's background noise: the quietest tenth of its last 300 frames
+LIVE_SNR = 12.0           # sound: this many dB above that noise (and above SILENCE_DBFS)
+LIVE_PAUSE = 0.8          # a phrase ends after this much quiet ...
+LIVE_LONGEST = 20.0       # ... or is cut at its quietest moment when it gets this long
+LIVE_PAD = 0.3            # audio kept on both sides of a phrase
+LIVE_MIN_SOUND = 0.3      # a phrase with less sound than this is a click or a cough
+LIVE_PARTIAL = 1.5        # GigaAM: the phrase being said is redone after this much more of it
+LIVE_DETECT = 8.0         # the language is detected (by Whisper) once this much was said
+LIVE_START = 30.0         # give up when no recording shows up in this long
+LIVE_STILL = 3.0          # nothing recorded for this long (paused): the phrases being said end
+LIVE_KEEP = 30.0          # audio no phrase needs any more is let go of in steps this long
+
+
+def wav_data(path: Path) -> int | None:
+    """Where the samples start in a WAV that pw-record may still be writing (its sizes are not
+    final then); None while the header is not there yet. Only 16 kHz mono 16-bit, as
+    bmeet-meeting-audio records it."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos = 12
+    while pos + 8 <= len(head):
+        chunk, size = head[pos:pos + 4], int.from_bytes(head[pos + 4:pos + 8], "little")
+        if chunk == b"fmt " and pos + 24 <= len(head):
+            fmt, channels, rate = (int.from_bytes(head[pos + 8:pos + 10], "little"),
+                                   int.from_bytes(head[pos + 10:pos + 12], "little"),
+                                   int.from_bytes(head[pos + 12:pos + 16], "little"))
+            bits = int.from_bytes(head[pos + 22:pos + 24], "little")
+            if (fmt, channels, rate, bits) != (1, 1, SAMPLE_RATE, 16):
+                raise RuntimeError(f"{path.name}: not 16 kHz mono 16-bit PCM")
+        if chunk == b"data":
+            return pos + 8
+        pos += 8 + size + (size & 1)
+    return None
+
+
+def shifted(segments: list[Segment], seconds: float) -> list[Segment]:
+    return [Segment(s.start + seconds, s.end + seconds, s.text,
+                    [Word(w.start + seconds, w.end + seconds, w.text) for w in s.words], s.speaker)
+            for s in segments]
+
+
+class LiveTrack:
+    """One track of a meeting while it is being recorded: its audio, phrases and text.
+    Sample positions count from the start of the meeting (its parts joined, as in
+    read_meeting()); the audio itself is kept from LiveMeeting.base on."""
+
+    def __init__(self, kind: str, label: str) -> None:
+        self.kind, self.label = kind, label            # "mic"/"remote", the speaker label
+        self.buf = np.zeros(60 * SAMPLE_RATE, np.float32)
+        self.length = 0                                # samples recorded
+        self.rms = np.zeros(0)                         # loudness per LIVE_FRAME from the start
+        self.file: Path | None = None                  # the part being read, ...
+        self.data = 0                                  # ... where its samples start, ...
+        self.read = 0                                  # ... and the bytes of them read
+        self.start: int | None = None                  # the phrase being said: first sample,
+        self.began = 0                                 # ... its first sound,
+        self.last = 0                                  # ... end of its last sound,
+        self.sound = 0                                 # ... its frames with sound,
+        self.partial_at = 0                            # ... and how far its draft goes
+        self.closed = 0                                # where the last phrase ended
+        self.heard = 0                                 # samples with sound in ended phrases
+        self.ended: list[tuple[int, int]] = []         # phrases said, not transcribed yet
+        self.final: list[Segment] = []                 # transcribed (tidied)
+        self.drafts: dict[int, list[Segment]] = {}     # phrase start -> its text so far
+
+    def audio(self, base: int, a: int, b: int) -> np.ndarray:
+        return self.buf[max(a, base) - base:max(min(b, self.length), base) - base]
+
+    def append(self, x: np.ndarray, base: int) -> None:
+        used = self.length - base
+        if used + x.size > self.buf.size:
+            grown = np.zeros(max(2 * self.buf.size, used + x.size), np.float32)
+            grown[:used] = self.buf[:used]
+            self.buf = grown
+        self.buf[used:used + x.size] = x
+        self.length += x.size
+
+    def forget(self, base: int, new_base: int) -> None:
+        """Let go of the audio before new_base."""
+        used = self.length - base
+        self.buf[:used - (new_base - base)] = self.buf[new_base - base:used]
+
+    def take_in(self, base: int) -> bool:
+        """Read what the recorder added to the current part's file; True if anything."""
+        if self.file is None:
+            return False
+        if not self.data:
+            self.data = wav_data(self.file) or 0
+            if not self.data:
+                return False
+        try:
+            with open(self.file, "rb") as f:
+                f.seek(self.data + self.read)
+                raw = f.read()
+        except OSError:
+            return False
+        raw = raw[:len(raw) // 2 * 2]
+        if not raw:
+            return False
+        self.read += len(raw)
+        self.append(np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0, base)
+        return True
+
+    def listen(self, base: int, upto: int | None = None, echo: np.ndarray | None = None) -> None:
+        """Measure the new audio (up to frame `upto`), frame by frame: phrases begin, end, and
+        get cut when long. echo: per frame, how loud the other side's echo would be here
+        (your microphone without headphones); sound that is not louder is no phrase of yours."""
+        first, n = self.rms.size, self.length // LIVE_FRAME
+        if upto is not None:
+            n = min(n, upto)
+        if n <= first:
+            return
+        self.rms = np.concatenate([self.rms, frame_rms(self.audio(base, first * LIVE_FRAME, n * LIVE_FRAME),
+                                                       LIVE_FRAME)])
+        level = 20 * np.log10(np.maximum(self.rms[max(0, n - LIVE_NOISE):], 1e-10))
+        threshold = max(SILENCE_DBFS, float(np.percentile(level, 10)) + LIVE_SNR)
+        pad, pause = int(LIVE_PAD * SAMPLE_RATE), int(LIVE_PAUSE * SAMPLE_RATE)
+        loud = lambda i: (20 * math.log10(max(self.rms[i], 1e-10)) >= threshold
+                          and (echo is None or i >= echo.size or self.rms[i] >= echo[i]))
+        for i in range(first, n):
+            s, e = i * LIVE_FRAME, (i + 1) * LIVE_FRAME
+            if loud(i):
+                if self.start is None:
+                    self.start = self.partial_at = max(s - pad, self.closed)
+                    self.began, self.sound = s, 0
+                self.last, self.sound = e, self.sound + 1
+            elif self.start is not None and e - self.last >= pause:
+                self.close(self.last + pad)
+            if self.start is not None and e - self.start >= LIVE_LONGEST * SAMPLE_RATE:
+                # (between two words: the quietest 100 ms of its last 5 s)
+                tail = self.audio(base, e - 5 * SAMPLE_RATE, e)
+                cut = e - tail.size + quietest_cut(tail, tail.size)
+                self.close(cut, go_on=sum(loud(j) for j in range(cut // LIVE_FRAME, i + 1)))
+
+    def close(self, end: int, go_on: int | None = None) -> None:
+        """The phrase being said ends at `end`. go_on: the next one starts there, with this
+        many frames of sound already."""
+        start, end = self.start, min(end, self.length)
+        assert start is not None
+        if end - start >= LIVE_FRAME and self.sound * LIVE_FRAME >= LIVE_MIN_SOUND * SAMPLE_RATE:
+            self.ended.append((start, end))
+            self.heard += self.sound * LIVE_FRAME
+            if start in self.drafts:  # (its draft stays until it is transcribed)
+                self.drafts[start] = [d for d in self.drafts[start] if d.end <= end / SAMPLE_RATE]
+        else:
+            self.drafts.pop(start, None)
+        self.closed = self.partial_at = end
+        if go_on is None:
+            self.start, self.sound = None, 0
+        else:
+            self.start = self.began = end
+            self.sound, self.last = go_on, max(self.last, end)
+
+    def end_phrase(self) -> None:
+        """The recording paused or ended: so did the phrase being said."""
+        if self.start is not None:
+            self.close(self.last + int(LIVE_PAD * SAMPLE_RATE))
+
+    def settled(self) -> int:
+        """Samples up to which everything said was transcribed (the other side's text, which
+        your microphone's echo is told apart by, must be there first)."""
+        if self.ended:
+            return self.ended[0][0]
+        return self.began if self.start is not None else self.rms.size * LIVE_FRAME
+
+    def speech(self) -> float:
+        """Seconds of sound in the phrases so far."""
+        return (self.heard + self.sound * LIVE_FRAME) / SAMPLE_RATE
+
+
+class LiveMeeting:
+    """--live: a meeting's transcript while bmeet-meeting-audio records it (see LIVE_TICK)."""
+
+    def __init__(self, folder: Path, in_person: bool) -> None:
+        self.folder = folder
+        self.mic = LiveTrack("mic", "Room" if in_person else "You")
+        self.remote = None if in_person else LiveTrack("remote", "Remote")
+        self.tracks = [t for t in (self.remote, self.mic) if t is not None]
+        self.part = 0
+        self.parts: list[Part] = []
+        self.base = 0                     # the first sample kept in memory (all tracks)
+        self.calls: list[tuple[float, bool, bool]] = []
+        self.calls_read = 0               # bytes of call-mic.jsonl read
+        self.engine: Whisper | GigaAM | None = None
+        self.kwargs: dict = {}
+        self.gain, self.gain_at = 0.0, 0  # echo_gain() so far, and at how many frames
+        self.echoes = self.muted = 0      # your words left out, as echo / while muted
+
+    # -- the recording
+    def take_in(self) -> bool:
+        """Read what was recorded since the last look; True if there was something."""
+        got = False
+        while True:
+            if self.part == 0:
+                if not (self.folder / "part-1.start").exists():
+                    return False
+                self.next_part()
+            # A newer part means this one is complete: the recorder stopped it (a pause) first.
+            newer = (self.folder / f"part-{self.part + 1}.start").exists()
+            got = any([t.take_in(self.base) for t in self.tracks]) or got
+            if not newer:
+                break
+            self.end_part()
+            self.next_part()
+        self.parts[-1].length = max(t.length for t in self.tracks) / SAMPLE_RATE - self.parts[-1].offset
+        return got
+
+    def next_part(self) -> None:
+        self.part += 1
+        try:
+            wall: float | None = float((self.folder / f"part-{self.part}.start").read_text().strip())
+        except (OSError, ValueError):
+            wall = None
+        self.parts.append(Part(max(t.length for t in self.tracks) / SAMPLE_RATE, 0.0, wall))
+        for t in self.tracks:
+            t.file, t.data, t.read = self.folder / f"part-{self.part}-{t.kind}.wav", 0, 0
+
+    def end_part(self) -> None:
+        """Both tracks of a part are made as long (as read_meeting() does), its phrases end."""
+        n = max(t.length for t in self.tracks)
+        self.listen(end=True)
+        for t in self.tracks:
+            t.end_phrase()
+            t.append(np.zeros(n - t.length, np.float32), self.base)
+
+    def listen(self, end: bool = False) -> None:
+        """LiveTrack.listen() for both tracks: the other side first, as your microphone's
+        phrases are only what is louder than its echo (ECHO_MARGIN, as in drop_echo())."""
+        if self.remote is None:
+            self.mic.listen(self.base)
+            return
+        self.remote.listen(self.base)
+        if not self.gain or self.remote.rms.size - self.gain_at >= 100:  # (once known: every 10 s)
+            self.gain, self.gain_at = echo_gain_of(self.mic.rms, self.remote.rms), self.remote.rms.size
+        # (your track waits for theirs, unless theirs stopped growing: then without the echo)
+        behind = not end and self.remote.length + 2 * SAMPLE_RATE >= self.mic.length
+        self.mic.listen(self.base, self.remote.rms.size if behind else None,
+                        ECHO_MARGIN * self.gain * self.remote.rms if self.gain > 0 else None)
+
+    def muted_spans(self) -> list[tuple[float, float]]:
+        """muted_spans() of the call log so far (bmeet-chrome-host appends to it)."""
+        try:
+            with open(self.folder / "call-mic.jsonl", "rb") as f:
+                f.seek(self.calls_read)
+                text = f.read()
+        except OSError:
+            text = b""
+        text = text[:text.rfind(b"\n") + 1]  # (whole lines only)
+        if text:
+            self.calls_read += len(text)
+            for line in text.decode(errors="replace").splitlines():
+                try:
+                    d = json.loads(line)
+                    self.calls.append((float(d["t"]), bool(d["call"]), bool(d["live"])))
+                except (ValueError, KeyError, TypeError):
+                    continue
+            self.calls.sort()
+        return muted_spans(self.calls, self.parts) if self.calls else []
+
+    # -- the text
+    def step(self, engines: Engines, args: argparse.Namespace, over: bool, still: bool = False) -> bool:
+        """Transcribe what can be (over: the recording ended, so everything; still: nothing
+        was recorded for a while, so the phrases being said are over); True if the text changed."""
+        self.listen(end=over)
+        if over or still:
+            for t in self.tracks:
+                t.end_phrase()
+        if self.engine is None and not self.choose(engines, args, over):
+            return False
+        changed = False
+        if self.remote:
+            changed |= self.finish(self.remote, list(self.remote.ended))
+        # Yours waits while the other side says something at the same time (your phrase's
+        # padding may reach into theirs: only its sound counts).
+        settled = self.remote.settled() + int(LIVE_PAD * SAMPLE_RATE) if self.remote and not over else math.inf
+        changed |= self.finish(self.mic, [p for p in self.mic.ended if p[1] <= settled])
+        if isinstance(self.engine, GigaAM) and not over:
+            for t in self.tracks:
+                changed |= self.draft(t)
+        self.let_go()
+        return changed
+
+    def choose(self, engines: Engines, args: argparse.Namespace, over: bool) -> bool:
+        """The model, once the language is known: given, or detected by Whisper on the first
+        LIVE_DETECT s said on the other side (like the speaker pass: your microphone may hold
+        little of your own; in person, on the microphone). False while it is not known yet."""
+        if args.engine == "gigaam":
+            language = "ru"
+        elif args.language != "auto":
+            language = args.language
+        else:
+            t = next((t for t in self.tracks if t.speech() >= LIVE_DETECT), None)
+            if t is self.mic and self.remote and self.mic.speech() < 3 * LIVE_DETECT and not over:
+                t = None  # (you have spoken for a while, the others hardly: then yours)
+            if t is None and over:
+                t = max(self.tracks, key=lambda x: x.speech())
+            if t is None or t.speech() == 0:
+                return False
+            spans = t.ended + ([(t.start, t.length)] if t.start is not None else [])
+            sound = np.concatenate([t.audio(self.base, a, b) for a, b in spans])
+            language = engines.detect(array_blocks(sound[:BLOCK_SECONDS * SAMPLE_RATE]))
+        self.engine, language = engines.for_language(language, words=True)
+        if isinstance(self.engine, GigaAM):
+            engines._whisper = None  # (only needed for detecting the language: frees ~2 GB)
+        else:
+            self.kwargs = {"return_timestamps": True, "task": "transcribe", "word_timestamps": True}
+            if language not in ("auto", "?"):
+                self.kwargs["language"] = f"<|{language}|>"
+        log(f"live: {language}, {engine_label(self.engine)} on {self.engine.device} "
+            f"(CPU so far {cpu_seconds():.1f} s)")
+        return True
+
+    def hear(self, t: LiveTrack, a: int, b: int) -> list[Segment]:
+        """Phrase [a, b) of track t, transcribed; your words the call did not get, or that are
+        the other side's echo, left out."""
+        block = t.audio(self.base, a, b)
+        if block.size == 0 or peak_dbfs(block) < SILENCE_DBFS:
+            return []
+        if isinstance(self.engine, GigaAM):
+            segments = ctc_block(self.engine, a / SAMPLE_RATE, block)
+        else:
+            segments = whisper_block(self.engine, a / SAMPLE_RATE, block, self.kwargs)[0]
+        for seg in segments:
+            seg.speaker = t.label
+        if t is not self.mic or not self.remote or not segments:
+            return segments
+        return self.not_echo(self.not_muted(segments))
+
+    def not_muted(self, segments: list[Segment]) -> list[Segment]:
+        if not (spans := self.muted_spans()):
+            return segments
+        out = []
+        for seg in segments:
+            cut = [any(x <= (w.start + w.end) / 2 < y for x, y in spans) for w in seg.words]
+            self.muted += sum(cut)
+            out += without_words(seg, cut)
+        return out
+
+    def not_echo(self, segments: list[Segment]) -> list[Segment]:
+        assert self.remote is not None
+        if not segments:
+            return []
+        a, b = segments[0].start - ECHO_WINDOW, segments[-1].end + ECHO_WINDOW
+        theirs = [s for s in self.remote.final + [d for ds in self.remote.drafts.values() for d in ds]
+                  if s.end >= a and s.start <= b]
+        n = min(self.mic.length, self.remote.length)
+        off = self.base / SAMPLE_RATE
+        kept, cut = drop_echo(shifted(segments, -off), shifted(theirs, -off),
+                              self.mic.audio(self.base, self.base, n), self.remote.audio(self.base, self.base, n),
+                              echo_gain_of(self.mic.rms, self.remote.rms))
+        self.echoes += cut
+        return shifted(kept, off)
+
+    def finish(self, t: LiveTrack, phrases: list[tuple[int, int]]) -> bool:
+        for a, b in phrases:
+            t.final += tidy_segments(self.hear(t, a, b))
+            t.drafts.pop(a, None)
+            t.ended.remove((a, b))
+        return bool(phrases)
+
+    def draft(self, t: LiveTrack) -> bool:
+        """The phrase being said, as far as it goes (every LIVE_PARTIAL s of it)."""
+        if t.start is None or t.last - t.partial_at < LIVE_PARTIAL * SAMPLE_RATE:
+            return False
+        echoes, muted = self.echoes, self.muted
+        t.drafts[t.start] = tidy_segments(self.hear(t, t.start, t.last))
+        self.echoes, self.muted = echoes, muted  # (counted when it is final)
+        t.partial_at = t.last
+        return True
+
+    def let_go(self) -> None:
+        """Forget the audio that no phrase needs any more."""
+        need = min(min([a for a, _ in t.ended] + [t.start if t.start is not None else t.length])
+                   for t in self.tracks)
+        need = min([need] + [t.rms.size * LIVE_FRAME for t in self.tracks]) - SAMPLE_RATE
+        if need - self.base >= LIVE_KEEP * SAMPLE_RATE:
+            for t in self.tracks:
+                t.forget(self.base, need)
+            self.base = need
+
+    def markdown(self, title: str, started: float | None, done: bool) -> str:
+        segments = [s for t in self.tracks for s in t.final]
+        if not done:  # what is still being said, in italics
+            segments += [Segment(d.start, d.end, f"*{d.text} …*", d.words, d.speaker)
+                         for t in self.tracks for ds in t.drafts.values() for d in ds]
+        segments.sort(key=lambda s: s.start)
+        how = f"{engine_label(self.engine)} on {self.engine.device}" if self.engine else "…"
+        meta = {"Transcribed": f"as people talked (live), {how}"} if done else \
+            {"Live": f"transcribed as people talk, {how}; in italics: still being said"}
+        if self.muted:
+            meta["Microphone off"] = f"{self.muted} word(s) the call could not hear (muted) were left out"
+        if self.echoes:
+            meta["Echo"] = f"{self.echoes} word(s) your microphone picked up from the speakers were left out"
+        duration = max(t.length for t in self.tracks) / SAMPLE_RATE
+        return meeting_md(title, started, duration, segments, meta, tidied=True,
+                          empty="*(nothing said yet)*" if not done else "*(no speech detected)*")
+
+
+def live_meeting(args: argparse.Namespace, engines: Engines) -> int:
+    """--live DIR: DIR/live.md while bmeet-meeting-audio records DIR (see LiveMeeting). Ends
+    with the recording (it no longer names DIR in $XDG_RUNTIME_DIR/bmeet/recording, or env
+    BMEET_RECORDING_FILE), at SIGTERM/SIGINT, or when the speaker pass starts; then the last
+    phrases are transcribed, live.md is written once more and DIR/live.done marks it whole."""
+    folder = args.live.expanduser()
+    pointer = Path(os.environ.get("BMEET_RECORDING_FILE")
+                   or Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "bmeet/recording")
+    try:
+        info = json.loads((folder / "meeting.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        info = {}
+    title, started = args.title or info.get("title") or "Meeting", info.get("started")
+    meeting = LiveMeeting(folder, bool(info.get("in_person")))
+    out = folder / "live.md"
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    log(f"live: following {folder}")
+    t0, c0, seen, written = time.monotonic(), cpu_seconds(), False, ""
+    heard = t0
+    try:
+        while True:
+            try:
+                ours = Path(pointer.read_text().strip()).resolve() == folder.resolve()
+            except OSError:
+                ours = False
+            seen |= ours
+            over = (stop.is_set() or (seen and not ours) or (folder / "speaker-pass").exists()
+                    or (not seen and time.monotonic() - t0 > LIVE_START))
+            if not folder.is_dir():
+                log("live: the recording is gone")
+                return 1
+            if meeting.take_in():
+                heard = time.monotonic()
+            if over:
+                meeting.end_part()
+            changed = meeting.step(engines, args, over, still=time.monotonic() - heard > LIVE_STILL)
+            if changed or over or not written:
+                text = meeting.markdown(title, started, done=over)
+                if text != written:
+                    write_atomic(out, text)
+                    written = text
+            if over:
+                break
+            stop.wait(max(0.0, LIVE_TICK - (time.monotonic() - t0) % LIVE_TICK))
+    except Exception as exc:
+        log(f"ERROR: live: {exc}")
+        return 1
+    if meeting.part == 0:
+        log("live: nothing was recorded")
+        return 1
+    try:
+        (folder / "live.done").touch()
+    except OSError:  # (the recording is gone already)
+        return 1
+    said = sum(len(t.final) for t in meeting.tracks)
+    log(f"live: done, {hms(max(t.length for t in meeting.tracks) / SAMPLE_RATE)} of audio, {said} sentence(s)"
+        f" (CPU {cpu_seconds() - c0:.1f} s)")
+    return 0
+
+
 def history_model(engine: Whisper | GigaAM | None, args: argparse.Namespace, model_dir: Path) -> str:
     """The "model" of a history line: gigaam, or --model as given (turbo, small, a path)."""
     if isinstance(engine, GigaAM):
@@ -2519,6 +3041,8 @@ def main(argv: list[str]) -> int:
     engines = Engines(args, model_dir, pick_devices(args.device))
     if args.meeting:
         return transcribe_meeting(args, engines, gen_kwargs)
+    if args.live:
+        return live_meeting(args, engines)
 
     report: list[str] = []
     failed = 0

@@ -12,9 +12,15 @@
 # people the BMeet app was told about, and keeps this meeting's voice fingerprints in
 # ~/.local/share/bmeet/voices so you can name its people afterwards.
 #
+# Live transcript: while the meeting runs, `npu-transcribe --live` (unit bmeet-live) follows
+# that recording and writes what is said, You / Remote, to its live.md, which the BMeet window
+# shows. When the meeting stops, it replaces voxtype's transcript in the Markdown copy until the
+# speaker pass is done (GigaAM for Russian, without the echo or what you said while muted).
+# Off when ~/.config/bmeet/live-transcript says "off".
+#
 # In person (--in-person): a meeting in the room, not on a call. Only the microphone is
 # recorded for the speaker pass, which splits it by voice: You, Person 1, Person 2, ...
-# (voxtype's own live transcript still has its You/Remote tracks until the pass replaces it.)
+# (Until the pass replaces it, the transcript has everyone under Room: the live one.)
 #
 # Bound to Meta+Alt+M (voxtype-meeting.desktop) and Meta+Alt+Shift+M (in person,
 # voxtype-meeting-in-person.desktop); see docs/voxtype.md.
@@ -31,9 +37,11 @@ LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype-meeting-toggle.lock"
 BIN_DIR="$HOME/.local/bin"
 SPEAKERS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
 REMEMBER_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices"
+LIVE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/live-transcript"
 VOICES_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices"
 AUDIO_ROOT="${XDG_RUNTIME_DIR:-/tmp}/bmeet/meeting-audio"
 REC_UNIT=bmeet-meeting-audio
+LIVE_UNIT=bmeet-live
 
 notify() {  # best effort; never fail the toggle because of a notification
     notify-send -a "Voxtype" -i "${3:-audio-input-microphone}" "$1" "${2:-}" 2>/dev/null || true
@@ -73,6 +81,28 @@ start_audio() {  # $1 stamp, $2 title, $3 in_person (1 or empty); best effort: t
             ${3:+--mic-only} "$dir"; then
         rm -rf "$dir"
         notify "Speakers will not be told apart" "The meeting audio recorder did not start" dialog-warning
+        return 0
+    fi
+    [ "$(head -n1 "$LIVE_FILE" 2>/dev/null)" != off ] || return 0
+    systemctl --user stop "$LIVE_UNIT.service" 2>/dev/null || true
+    systemctl --user reset-failed "$LIVE_UNIT.service" 2>/dev/null || true
+    systemd-run --user --quiet --collect --unit="$LIVE_UNIT" -p Nice=5 \
+        "$BIN_DIR/npu-transcribe" --live "$dir" \
+        || notify "No live transcript" "Could not start npu-transcribe --live" dialog-warning
+}
+
+live_copy() {  # $1 stamp, $2 the Markdown copy: the live transcript instead of voxtype's
+    local dir="$AUDIO_ROOT/$1"
+    systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true
+    # It ends with the recording, once it has transcribed the last phrases (a second or two).
+    for _ in $(seq 1 120); do
+        systemctl --user is-active --quiet "$LIVE_UNIT.service" || break
+        sleep 0.5
+    done
+    systemctl --user stop "$LIVE_UNIT.service" 2>/dev/null || true
+    # (live.done: it got to the end; a crashed one leaves voxtype's transcript alone)
+    if [ -e "$dir/live.done" ] && [ -s "$dir/live.md" ]; then
+        cp "$dir/live.md" "$2.live.$$" && mv -f "$2.live.$$" "$2"
     fi
 }
 
@@ -142,14 +172,17 @@ stop_meeting() {
     # (when voxtype's own transcript cannot be saved, the speaker pass still writes one)
     if [ "$(meeting_state)" != "idle" ]; then
         notify "Meeting export not done" "Daemon still busy. Later run: voxtype meeting export latest -o FILE.md" dialog-warning
+        live_copy "$stamp" "$file"
         speaker_pass "$stamp" "$file"
         exit 1
     fi
     if ! voxtype meeting export latest --format markdown --timestamps --speakers --metadata --output "$file"; then
         notify "Meeting export failed" "Saved in voxtype's database; try: voxtype meeting export latest -o FILE.md" dialog-warning
+        live_copy "$stamp" "$file"
         speaker_pass "$stamp" "$file"
         exit 1
     fi
+    live_copy "$stamp" "$file"
     rm -f "$STAMP_FILE"
     if [ -d "$AUDIO_ROOT/$stamp" ]; then
         notify "Meeting transcript saved" "$file

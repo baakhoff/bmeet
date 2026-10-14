@@ -496,6 +496,28 @@ class A_DataTests(unittest.TestCase):
         self.assertIn("--timestamps", cmd)
 
 
+    def test_paragraphs_redo_only_the_end(self):
+        """MarkdownView.show_paragraphs: the same page as a full render, without one."""
+        para = lambda i: f"*[00:{i:02d}]* Line {i} of the meeting."
+        start = ["### You"] + [para(i) for i in range(5)] + ["### Remote", para(5), "*still talking …*"]
+        cases = [start[:-1] + [para(6), "*more …*"],                         # a line final, a new draft
+                 start[:-1] + [para(6), "### You", para(7)],                 # a new heading at the end
+                 start[:3] + ["*[00:02]* Line 2 changed."] + start[4:],      # one in the middle
+                 start[:-2],                                                 # some gone at the end
+                 ["*(nothing said yet)*"]]
+        for case in cases:
+            view, full = vn.MarkdownView(), vn.MarkdownView()
+            view.show_paragraphs(start)
+            full_renders = []
+            view.show_markdown = lambda text, f=view.show_markdown: (full_renders.append(1), f(text))
+            view.show_paragraphs(case)
+            full.setMarkdown("\n\n".join(case))
+            self.assertEqual(view.toHtml(), full.toHtml(), case)
+            self.assertEqual(view.document().blockCount(), len(case))
+            if case is cases[0] or case is cases[1]:
+                self.assertEqual(full_renders, [])   # only the end was redone
+
+
 # ============================================================================ window
 
 class B_WindowTests(unittest.TestCase):
@@ -856,9 +878,41 @@ class B_WindowTests(unittest.TestCase):
         self.select(p, did)
         self.assertFalse(p.act_delete.isEnabled())
         self.assertTrue(p.act_refresh.isVisible())
-        self.assertTrue(wait_until(lambda: "zeppelin" in p.view.toPlainText()))
+        self.assertIn("shows up here as people talk", p.view.toPlainText())  # (no live transcript)
         self.state("idle", "idle")
         self.assertTrue(p.act_delete.isEnabled())
+
+    def test_15b_live_transcript_follows_the_meeting(self):
+        p, did = self.win.meetings_page, FIX["ids"]["D"]
+        live = WORK / "meeting-audio" / "2026-10-12_1041" / "live.md"
+        live.parent.mkdir(parents=True)
+        (WORK / "run" / "meeting-toggle.started").write_text("2026-10-12_1041\n")
+        lines = "".join(f"*[00:{i:02d}]* Line number {i} of the meeting.\n\n" for i in range(60))
+        try:
+            live.write_text("# Meeting\n\n## Transcript\n\n### You\n\n" + lines + "*Still talking …*\n")
+            self.state("idle", "idle")
+            self.select(p, FIX["ids"]["B"])
+            self.state("idle", "recording")    # it starts: the window shows it
+            self.assertEqual(p.current_key(), did)
+            self.assertIn("Line number 59", p.view.toPlainText())
+            self.assertIn("Still talking", p.view.toPlainText())
+            bar = p.view.verticalScrollBar()
+            self.assertTrue(wait_until(lambda: bar.maximum() > 0 and bar.value() == bar.maximum()))
+            live.write_text(live.read_text() + "\n### Remote\n\n*[01:00]* A new zeppelin line.\n")
+            self.state("idle", "recording")   # (the window polls every second)
+            self.assertIn("zeppelin", p.view.toPlainText())
+            self.assertTrue(wait_until(lambda: bar.value() == bar.maximum()))   # still at the end
+            bar.setValue(0)                    # you scrolled up to read: it stays there
+            live.write_text(live.read_text() + "\n*[01:05]* Another one.\n")
+            self.state("idle", "recording")
+            self.assertIn("Another one", p.view.toPlainText())
+            wait_until(lambda: False, 0.2)
+            self.assertEqual(bar.value(), 0)
+            self.assertTrue(p.act_copy.isEnabled())
+        finally:
+            shutil.rmtree(live.parent.parent)
+            (WORK / "run" / "meeting-toggle.started").unlink()
+            self.state("idle", "idle")
 
     def test_16_db_change_reloads_list(self):
         p = self.win.meetings_page

@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-10-14
+
+### Fixed
+- **Export gave the transcript from before the speaker pass:** *Export…* in the app asked voxtype for its copy of the meeting, which is the one from during the meeting: You / Remote only (in person, everything under You), without the people told apart, their names, the tidying, or the echo and muted words left out. It now exports the meeting's Markdown copy, which has all of that: as it is, or as plain text or JSON in voxtype's layouts. A running meeting exports its live transcript; voxtype's copy is used only for a meeting without a Markdown copy.
+
 ## [0.7.0] - 2026-10-14
 
 See what has been said while the meeting is still on.
@@ -180,6 +185,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.7.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.1
 [0.7.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.0
 [0.6.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.6.0
 [0.5.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.5.2

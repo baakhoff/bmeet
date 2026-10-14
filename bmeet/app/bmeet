@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -368,6 +368,79 @@ def export_cmd(meeting_id: str, fmt: str = "markdown", output: str | None = None
     if output:
         cmd += ["--output", output]
     return cmd + ["--", meeting_id]
+
+
+# Exports come from the Markdown copy when there is one: voxtype's own transcript (what
+# `voxtype meeting export` gives) is the one from during the meeting, without the speaker
+# pass (You / Remote, everyone under You in person), the names or the tidying.
+MD_INFO = re.compile(r"^- \*\*(.+?):\*\* (.*)$")
+MD_STAMPED = re.compile(r"^\*\[(\d+(?::\d\d){1,2})\]\*\s*(.*)$")                 # *[mm:ss]* text
+MD_OLD_LINE = re.compile(r"^\*\*\[(\d+(?::\d\d){1,2})\] (.+?):\*\*\s*(.*)$")  # **[h:mm:ss] Who:** text
+
+
+def md_meeting(text: str) -> tuple[str, dict[str, str], list[tuple[str, str, str]]]:
+    """A meeting transcript in voxtype's Markdown layout (the speaker pass and the live
+    transcript write it the same way), read back: (title, its "- **Key:** value" info,
+    its paragraphs as (time stamp or "", speaker, text))."""
+    title, info, paragraphs, section, speaker = "", {}, [], "", ""
+    for line in (raw.strip() for raw in text.splitlines()):
+        if line.startswith("# ") and not title:
+            title = line[2:].strip()
+        elif line.startswith("## "):
+            section = line[3:].strip()
+        elif section == "Meeting Info" and (m := MD_INFO.match(line)):
+            info[m[1]] = m[2]
+        elif m := MD_OLD_LINE.match(line):
+            paragraphs.append((m[1], m[2], m[3]))
+        elif section == "Transcript" and line.startswith("### "):
+            speaker = line[4:].strip()
+        elif section == "Transcript" and line and not line.startswith("*("):
+            m = MD_STAMPED.match(line)
+            paragraphs.append((m[1], speaker, m[2]) if m else ("", speaker, line))
+    return title, info, paragraphs
+
+
+def stamp_seconds(stamp: str) -> int | None:
+    if not stamp:
+        return None
+    seconds = 0
+    for part in stamp.split(":"):
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def meeting_export(m: Meeting, text: str, fmt: str) -> str:
+    """The Markdown copy `text` of meeting m as an export: itself, or in voxtype's plain text
+    or JSON layout."""
+    if fmt == "markdown":
+        return text
+    title, info, paragraphs = md_meeting(text)
+    title = title or m.title
+    words = sum(len(t.split()) for _, _, t in paragraphs)
+    speakers = list(dict.fromkeys(s for _, s, _ in paragraphs if s))
+    if fmt == "json":
+        return json.dumps({
+            "metadata": {"id": m.id, "title": title,
+                         "startedAt": QDateTime.fromSecsSinceEpoch(int(m.started_at)).toString(Qt.DateFormat.ISODate)
+                         if m.started_at else None,
+                         "durationSecs": m.duration(), "status": m.status, "info": info},
+            "transcript": {"segments": [{"id": i, "startMs": None if (sec := stamp_seconds(st)) is None else sec * 1000,
+                                         "text": t, "speaker": s or None}
+                                        for i, (st, s, t) in enumerate(paragraphs)],
+                           "wordCount": words, "speakers": speakers},
+        }, ensure_ascii=False, indent=2) + "\n"
+    out = [title] + [f"{key}: {info[key]}" for key in ("Date", "Duration", "Speakers") if key in info]
+    out += [f"Words: {words}", "", "=" * 60, ""]
+    last = ""
+    for stamp, speaker, t in paragraphs:  # (voxtype's layout: the name on its own line at each change)
+        line = f"[{stamp}] " if stamp else ""
+        if speaker and speaker != last:
+            if last:
+                out.append("")
+            line += f"{speaker}:\n"
+            last = speaker
+        out.append(line + t)
+    return "\n".join(out) + "\n"
 
 
 # ============================================================================ data: speaker names
@@ -1713,13 +1786,26 @@ class MeetingsPage(ListDetailPage):
             self.export_to(m.id, path, flt)
 
     def export_to(self, meeting_id: str, path: str, name_filter: str = "") -> str:
-        """Format from the file extension, else from the chosen filter (extension added)."""
+        """Format from the file extension, else from the chosen filter (extension added).
+        From the Markdown copy (the running meeting: its live transcript) when there is one,
+        else voxtype's own transcript (meeting_export())."""
         ext = Path(path).suffix.lower()
         fmt = next((f[1] for f in EXPORT_FORMATS if f[2] == ext), None)
         if fmt is None:
             fmt, ext = next(((f[1], f[2]) for f in EXPORT_FORMATS if f[0] == name_filter),
                             ("markdown", ".md"))
             path += ext
+        m = self.meetings.get(meeting_id)
+        source = m and (m.md_path or (self.live_md if self.is_live(m) else None))
+        text = read_text(source) if source else None
+        if m is not None and text is not None:
+            try:
+                Path(path).write_text(meeting_export(m, text, fmt), encoding="utf-8")
+            except OSError as exc:
+                self.main.error_box("Export failed", str(exc))
+                return path
+            self.main.message(f"Exported to {tilde(path)}")
+            return path
 
         def done(code: int, _out: str, err: str) -> None:
             if code == 0:

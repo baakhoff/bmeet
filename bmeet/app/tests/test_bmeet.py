@@ -488,6 +488,29 @@ class A_DataTests(unittest.TestCase):
         finally:
             shutil.rmtree(audio)
 
+    def test_export_from_the_markdown_copy(self):
+        md = ("# In-person meeting 2026-10-14 13:29\n\n## Meeting Info\n\n- **Date:** 2026-10-14 13:29\n"
+              "- **Duration:** 32m 1s\n- **Speakers:** Денис, You, Person 2\n- **Microphone:** split by voice\n\n"
+              "## Transcript\n\n### Денис\n\n*[00:00]* — Вот это метан, типа?\n\n*[00:31]* Да.\n\n"
+              "### You\n\n*[01:02]* Нет, это пропан.\n\n### Person 2\n\n*[1:00:05]* Всё, спасибо.\n")
+        m = vn.Meeting(id="ID", title="voxtype's title", started_at=1791977340, ended_at=None,
+                       duration_secs=1921, status="completed", chunk_count=60, storage_path=None, model=None)
+        title, info, paragraphs = vn.md_meeting(md)
+        self.assertEqual(title, "In-person meeting 2026-10-14 13:29")
+        self.assertEqual(info["Speakers"], "Денис, You, Person 2")
+        self.assertEqual(paragraphs, [("00:00", "Денис", "— Вот это метан, типа?"), ("00:31", "Денис", "Да."),
+                                      ("01:02", "You", "Нет, это пропан."), ("1:00:05", "Person 2", "Всё, спасибо.")])
+        self.assertEqual(vn.meeting_export(m, md, "markdown"), md)
+        txt = vn.meeting_export(m, md, "text")
+        self.assertTrue(txt.startswith("In-person meeting 2026-10-14 13:29\nDate: 2026-10-14 13:29\n"), txt)
+        self.assertIn("[00:00] Денис:\n— Вот это метан, типа?\n[00:31] Да.\n\n[01:02] You:\nНет, это пропан.", txt)
+        js = json.loads(vn.meeting_export(m, md, "json"))
+        self.assertEqual(js["metadata"]["title"], "In-person meeting 2026-10-14 13:29")
+        self.assertEqual(js["transcript"]["speakers"], ["Денис", "You", "Person 2"])
+        self.assertEqual([(x["startMs"], x["speaker"]) for x in js["transcript"]["segments"]],
+                         [(0, "Денис"), (31000, "Денис"), (62000, "You"), (3605000, "Person 2")])
+        self.assertEqual(js["transcript"]["wordCount"], 11)
+
     def test_export_cmd(self):
         self.assertEqual(vn.export_cmd("ID", "json", "/o.json")[-5:], ["--metadata", "--output", "/o.json", "--", "ID"])
         cmd = vn.export_cmd("ID")
@@ -827,6 +850,18 @@ class B_WindowTests(unittest.TestCase):
         p.export_to("00000000-0000-0000-0000-000000000000", str(out / "missing.md"))
         self.assertTrue(wait_until(lambda: self.errors))
         self.assertEqual(self.errors[0][0], "Export failed")
+
+    def test_12b_export_uses_the_markdown_copy(self):
+        """Not voxtype's own transcript, which is the one from before the speaker pass."""
+        p, bid, out = self.win.meetings_page, FIX["ids"]["B"], WORK / "out"
+        before = len(voxtype_calls())
+        md, txt = p.export_to(bid, str(out / "b.md")), p.export_to(bid, str(out / "b.txt"))
+        self.assertEqual(Path(md).read_text(), Path(p.meetings[bid].md_path).read_text())
+        self.assertIn("[00:00:01] Remote:\nThe roadmap is fine.", Path(txt).read_text())
+        self.assertEqual(json.loads(Path(p.export_to(bid, str(out / "b.json"))).read_text())
+                         ["transcript"]["segments"][0]["text"], "The roadmap is fine.")
+        self.assertEqual(voxtype_calls()[before:], [])
+        self.assertIn("Exported to", self.win.statusBar().currentMessage())
 
     def test_13_search(self):
         w, mp, fp = self.win, self.win.meetings_page, self.win.files_page

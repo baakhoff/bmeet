@@ -2,13 +2,15 @@
 Type=Application
 Name=Voxtype: Dictate
 GenericName=Voice typing (toggle)
-Comment=Start/stop dictation; the text is pasted at the cursor (Whisper on the Intel NPU)
-Exec=/usr/bin/voxtype record toggle
+Comment=Start/stop dictation; the text is pasted at the cursor (on the Intel NPU)
+Exec=@HOME@/.local/bin/bmeet-ctl dictate
 Icon=audio-input-microphone
 Terminal=false
 StartupNotify=false
 Categories=Utility;Accessibility;
 Keywords=voice;speech;dictation;whisper;
+# bmeet-ctl runs voxtype's dictation, or BMeet's own with the text while you speak when
+# ~/.config/bmeet/live-dictation says on (docs/live-dictation.md).
 # KDE global shortcut (registered by kglobalaccel from this file; change it in
 # System Settings > Keyboard > Shortcuts). Meta+V is Klipper, Meta+Space is layout.
 X-KDE-Shortcuts=Meta+H
@@ -16,5 +18,5 @@ Actions=ClipboardOnly;
 
 [Desktop Action ClipboardOnly]
 Name=Dictate to clipboard only (for terminals: then Ctrl+Shift+V)
-Exec=/usr/bin/voxtype record toggle --clipboard
+Exec=@HOME@/.local/bin/bmeet-ctl dictate --clipboard
 X-KDE-Shortcuts=Meta+Alt+H

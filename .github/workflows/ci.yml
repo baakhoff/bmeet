@@ -19,13 +19,14 @@ jobs:
           shellcheck --version
           shellcheck -S warning install.sh uninstall.sh system/*.sh voxtype/*.sh voxtype/bin/* \
             transcribe/*.sh transcribe/tests/*.sh bmeet/app/*.sh bmeet/app/tests/*.sh \
-            bmeet/plasmoid/*.sh bmeet/chrome/*.sh
+            bmeet/plasmoid/*.sh bmeet/chrome/*.sh bmeet/dictate/tests/*.sh
       - name: Python syntax
         run: |
           for f in transcribe/npu-transcribe transcribe/prepare-models transcribe/prepare-diarization \
                    bmeet/bmeet-ctl bmeet/app/bmeet \
                    bmeet/chrome/bmeet-chrome-host \
                    bmeet/app/tests/fake-voxtype bmeet/app/tests/fake-npu-transcribe \
+                   bmeet/dictate/bmeet-dictate bmeet/dictate/bmeet-im bmeet/dictate/tests/fake-engine \
                    $(git ls-files '*.py'); do
             python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
           done
@@ -49,6 +50,7 @@ jobs:
           grep -q "__version__ = \"$v\"" transcribe/npu-transcribe
           grep -q "__version__ = \"$v\"" bmeet/bmeet-ctl
           grep -q "__version__ = \"$v\"" bmeet/app/bmeet
+          grep -q "__version__ = \"$v\"" bmeet/dictate/bmeet-dictate
           grep -q "\"Version\": \"$v\"" bmeet/plasmoid/io.github.baakhoff.bmeet/metadata.json
           grep -q "\"version\": \"$v\"" bmeet/chrome/extension/manifest.json
           grep -q "^## \[$v\]" CHANGELOG.md
@@ -74,11 +76,16 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -I bmeet/app/tests/test_bmeet.py -v
-      - name: npu-transcribe speaker helpers (offline, no models)
+      - name: npu-transcribe speaker helpers and dictation (offline, no models)
         run: |
           sudo apt-get install -y -qq ffmpeg >/dev/null   # (reading meeting recordings)
           python -m pip install --quiet "numpy>=2.0"
           python -I transcribe/tests/test_speakers.py -v
+          python -I transcribe/tests/test_dictation.py -v
+      - name: bmeet-dictate + bmeet-im (offscreen, fake engine; the private-KWin tests skip without KWin)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -I bmeet/dictate/tests/test_dictate.py -v
       - name: npu-transcribe output checker
         run: |
           printf '1\n00:00:00,000 --> 00:00:01,500\nHello world.\n' > /tmp/t.srt

@@ -118,6 +118,12 @@ voxtype meeting list                            # all meetings
 
 **Shortcuts after a fresh install:** they're registered automatically, but KDE may only pick them up after you log out and in once.
 
+### Text while you speak (prototype, off by default)
+
+`echo on > ~/.config/bmeet/live-dictation` makes Meta+H use BMeet's own dictation instead of voxtype's. The words appear in the text field you are in while you speak, underlined until they are final, and each sentence goes in for good when you pause after it. Russian uses GigaAM v3 and has half the word errors of today's dictation; other languages use Whisper turbo. Both run on the NPU.
+
+To do this, BMeet becomes KWin's input method for the length of each dictation (the slot of System Settings → *Virtual Keyboard*) and puts yours back afterwards. In X11 programs a panel at the bottom shows the text, and it is pasted when you stop. `panel` instead of `on` always uses the panel and leaves KWin alone. Details and measurements: [docs/live-dictation.md](docs/live-dictation.md).
+
 ### Chrome extension
 
 BMeet records your microphone straight from the system, so it hears you even while the call
@@ -139,6 +145,7 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 ## Configure
 
 - **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
+- **Text while you speak:** `~/.config/bmeet/live-dictation` says `on`, `panel` or `off` (the default; see above).
 - **Meeting speakers:** `~/.config/bmeet/speakers` says `on` or `off`. When two people end up as one, or one person is split in two, see [docs/troubleshooting.md](docs/troubleshooting.md#meeting-speakers).
 - **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
@@ -185,6 +192,10 @@ bash ~/.local/share/bmeet/src/uninstall.sh
           npu-transcribe --live follows the recording: live.md, shown in the app (You/Remote)
           (it is the Markdown copy until the speaker pass replaces it with You/Person 1/...)
           Chrome extension ─> bmeet-chrome-host ─> call-mic.jsonl (muted stretches left out)
+
+ dictation, with live-dictation on: bmeet-ctl ─> bmeet-dictate (user unit) ─> npu-transcribe --dictate ─> NPU
+          the text into the field through bmeet-im (KWin's input method while you dictate),
+          or a panel at the bottom + a paste at the end (X11 programs)
 ```
 
 | Path | |
@@ -208,6 +219,9 @@ transcribe/tests/meeting_test.py /tmp/npt         # meeting speaker pass with re
                                                   #   --live: the live transcript, in real time)
 transcribe/tests/speakers_test.py /tmp/npt        # who speaks when on real recordings (--ami: meetings)
 transcribe/tests/english_terms_test.py /tmp/npt   # English terms in Russian speech (downloads Podlodka)
+python3 -I transcribe/tests/test_dictation.py     # live dictation engine (offline, fake model)
+python3 -I bmeet/dictate/tests/test_dictate.py    # bmeet-dictate + bmeet-im (offscreen and in a private KWin)
+transcribe/tests/dictate_test.py /tmp/npt         # live dictation on real speech (--language en; NPU)
 python3 -I bmeet/chrome/tests/test_host.py        # Chrome extension's host (offline)
 bmeet/chrome/tests/test_extension.py              # the extension in a throwaway headless Chrome
 bash voxtype/verify.sh                            # health check of an installed system

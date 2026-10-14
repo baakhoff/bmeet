@@ -154,7 +154,7 @@ journalctl --user -u voxtype -b | grep "fell back"
 - **voxtype setup commands:**
   - **Don't run:** `voxtype setup npu --enable` (switches to English-only `base.en`), `voxtype setup gpu --enable`, `voxtype setup onnx --enable` or `voxtype setup systemd`. They rewrite the binary, the model or the unit.
   - **Safe:** `voxtype setup npu --status` and `voxtype configure`.
-- **Text while you speak (`[openvino] streaming`): tested, left off** (2026-10-14, voxtype 1.1.0, whisper-small on the NPU; Russian and English clips played into a separate test daemon). It works on the NPU, but:
+- **Text while you speak (`[openvino] streaming`): tested, left off** (2026-10-14, voxtype 1.1.0, whisper-small on the NPU; Russian and English clips played into a separate test daemon). BMeet has its own way instead, off by default: [live-dictation.md](live-dictation.md). voxtype's works on the NPU, but:
   - **CPU:** it re-transcribes the whole utterance every 0.8 s, ~0.08 s of CPU each time: 5-6 s of CPU per minute of speech, against ~0.8 s for normal dictation, and ~45 % of the NPU's time.
   - **Long dictation:** past ~25 s of continuous speech a pass takes longer than the interval, and audio is dropped (a 59 s clip came out with 59-74 % word errors). `[streaming] interval_secs = 1.5` avoids that, at ~3 s from word to text.
   - **Repeats:** text is sometimes typed twice, both while you speak and in the end-of-recording pass; `revision_mode` repeats far more.

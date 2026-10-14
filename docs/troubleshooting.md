@@ -25,6 +25,17 @@ bash ~/.local/share/bmeet/src/voxtype/verify.sh
 | BMeet window only flashes in the task bar | Wayland focus-stealing prevention when it's opened from another program. Click the task bar entry. |
 | npu-transcribe: "model not found … turbo" | It was installed with `--no-turbo`. Re-run the installer without it, or use `--model small`. |
 
+## Text while you speak
+
+BMeet's own dictation (`~/.config/bmeet/live-dictation` says `on` or `panel`; [live-dictation.md](live-dictation.md)) runs as the user unit `bmeet-dictate`: `journalctl --user -u bmeet-dictate -b` shows each dictation (its language, where the text went, the engine's CPU), and `~/.local/bin/bmeet-ctl status` its state.
+
+| Symptom | What to check |
+|---|---|
+| Meta+H still uses voxtype | The file must say `on` or `panel`. The shortcut runs `bmeet-ctl dictate`: re-run the installer if System Settings → Shortcuts → *Voxtype: Dictate* still runs `voxtype record toggle`. |
+| No text in the field, the panel shows it | The window is an X11 program, or no text field has the focus; the text is pasted when you stop. `qdbus6 org.kde.KWin /VirtualKeyboard org.kde.kwin.VirtualKeyboard.activeClientSupportsTextInput` says whether KWin sees a field. |
+| The virtual keyboard setting is BMeet's after a crash | The next start puts yours back. Now: `python3 -I ~/.local/share/bmeet/src/bmeet/dictate/bmeet-dictate give-back` (it reads `~/.local/state/bmeet/input-method.json`). |
+| The first dictation starts late | The first Meta+H starts the service and loads the model (GigaAM < 1 s, Whisper turbo ~2 s). What you say meanwhile is kept. |
+
 ## Meeting speakers
 
 The speaker pass (You / Person 1 / Person 2 …) runs as the systemd user unit

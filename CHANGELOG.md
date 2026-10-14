@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-10-14
+
+See the text while you dictate: a prototype, off by default.
+
+### Added
+- **Text while you speak** (`echo on > ~/.config/bmeet/live-dictation`): Meta+H uses BMeet's own dictation instead of voxtype's, and the words appear in the text field you are in as you speak. They are underlined until they are final, and each sentence goes in for good when you pause after it. Details and measurements in `docs/live-dictation.md`.
+  - **Into the field without the clipboard:** for the length of each dictation BMeet becomes KWin's input method (the slot of System Settings → *Virtual Keyboard*), and afterwards puts back what was there, switched on or off as it was. What was there is noted in `~/.local/state/bmeet/input-method.json` first, so a crash can't lose it. Tested with Qt, GTK 3, Chrome 155 and Konsole; X11 programs get a panel at the bottom and a paste at the end. `panel` instead of `on` always does that and leaves KWin alone.
+  - **Russian (GigaAM v3):** half the word errors of today's dictation on Podlodka clips (7.3 % against 16.2 %), as good as GigaAM on the whole recording, also past 30 s. The text is ~0.5 s behind your words, and ~0.2 s after the stop it is complete. CPU about as today's: ~0.4 s per minute of speech.
+  - **English (Whisper turbo):** 1.1 % word errors on LibriSpeech (today 2.7 %), ~1.2 s behind your words. It costs more CPU than Russian: ~2.3 s per minute of speech, against ~0.4 s for today's dictation. Whisper computes its audio features on the CPU for every pass.
+  - `npu-transcribe --dictate` is the engine (commands on stdin, the text as it changes on stdout), `bmeet-dictate` the service that `bmeet-ctl dictate` starts, and `bmeet-im` the input method. `npu-transcribe --dictate-file FILE` dictates a file, for tests.
+
+### Changed
+- The Meta+H and Meta+Alt+H launchers run `bmeet-ctl dictate`, which goes to voxtype as before unless live dictation is on.
+
+### Tests
+- `transcribe/tests/test_dictation.py` (offline) and `bmeet/dictate/tests/test_dictate.py` (offscreen, and in a private headless KWin with its own D-Bus and kwinrc: text into a Wayland field, X11 fallback, cancel, the slot always given back) run in CI; the KWin part skips there. `transcribe/tests/dictate_test.py` measures the engine on real Russian and English speech on the NPU.
+
 ## [0.7.1] - 2026-10-14
 
 ### Fixed

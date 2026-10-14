@@ -17,7 +17,7 @@ state_file = "auto"
 
 [hotkey]
 # KWin cannot deliver key-release events to custom shortcuts, so push-to-talk is not
-# possible on Plasma; a KDE global shortcut runs `voxtype record toggle` instead
+# possible on Plasma; a KDE global shortcut runs `bmeet-ctl dictate` (= `voxtype record toggle`) instead
 # (see docs/voxtype.md). The built-in evdev hotkey stays OFF, so the user does NOT have to be
 # in the `input` group (which would let any user process read every keystroke).
 enabled = false

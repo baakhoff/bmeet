@@ -4,7 +4,9 @@ panel widget and app. Stdlib only, runs on the system python3.
 
   bmeet-ctl status                     JSON: dictation/meeting state, language, ...
   bmeet-ctl recent [--limit N]         JSON list: meetings + transcribed files, newest first
-  bmeet-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only)
+  bmeet-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only); with
+                                       ~/.config/bmeet/live-dictation "on" or "panel": BMeet's own,
+                                       the text while you speak (bmeet-dictate), else voxtype's
   bmeet-ctl cancel                     cancel the current dictation
   bmeet-ctl lang [toggle|en|de|...]    switch dictation language (restarts the daemon)
   bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]
@@ -20,7 +22,8 @@ $XDG_RUNTIME_DIR/bmeet/meeting-audio/*/{speaker-pass,live.md},
 Actions that can take long (meeting stop waits for the last chunk) run detached.
 
 Path overrides for testing (env): BMEET_RUN_DIR, BMEET_AUDIO_DIR, BMEET_MEETING_DB,
-VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP.
+VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP, BMEET_RUNTIME_DIR (bmeet-dictate's),
+BMEET_DICTATE_START (how to start bmeet-dictate when it is not running).
 """
 import json
 import os
@@ -31,7 +34,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
@@ -51,6 +54,11 @@ FILE_HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
 BIN = HOME / ".local/bin"
 APP = Path(os.environ.get("BMEET_APP")
            or Path(__file__).resolve().parent / "app" / "bmeet")
+# BMeet's own dictation (docs/live-dictation.md): "on" (into the text field), "panel", or off.
+LIVE_DICTATION = XDG_CONFIG / "bmeet/live-dictation"
+DICTATE = Path(__file__).resolve().parent / "dictate" / "bmeet-dictate"
+DICTATE_SOCKET = Path(os.environ.get("BMEET_RUNTIME_DIR")
+                      or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bmeet") / "dictate.sock"
 
 
 def read_first_line(path: Path, default: str = "") -> str:
@@ -58,6 +66,51 @@ def read_first_line(path: Path, default: str = "") -> str:
         return path.read_text().splitlines()[0].strip() or default
     except (OSError, IndexError):
         return default
+
+
+def live_dictation() -> str:
+    word = read_first_line(LIVE_DICTATION, "off").lower()
+    return word if word in ("on", "panel") else "off"
+
+
+def to_dictate(command: str, start: bool = True) -> dict | None:
+    """One command to bmeet-dictate (its JSON answer; None if it is not running). start: run it
+    first if it is not (the user unit bmeet-dictate; it keeps the speech model loaded)."""
+    import socket
+    import time
+
+    def send() -> dict:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(str(DICTATE_SOCKET))
+            s.sendall(command.encode() + b"\n")
+            return json.loads(s.makefile().readline() or "{}")
+    try:
+        return send()
+    except OSError:
+        if not start:
+            return None
+    cmd = os.environ.get("BMEET_DICTATE_START")
+    subprocess.run(cmd if cmd else
+                   ["systemd-run", "--user", "--quiet", "--collect", "--unit=bmeet-dictate",
+                    "-p", "Wants=ydotool.service", "-p", "After=ydotool.service",
+                    "/usr/bin/python3", "-I", str(DICTATE), "serve"], shell=bool(cmd), check=False)
+    for _ in range(100):
+        time.sleep(0.05)
+        try:
+            return send()
+        except OSError:
+            continue
+    print("bmeet-ctl: bmeet-dictate did not start (journalctl --user -u bmeet-dictate)", file=sys.stderr)
+    return None
+
+
+def dictation_state() -> str:
+    """idle / recording / transcribing: voxtype's, or bmeet-dictate's when BMeet dictates."""
+    if live_dictation() != "off":
+        state = read_first_line(DICTATE_SOCKET.parent / "dictation", "idle")
+        return "transcribing" if state == "committing" else state
+    return read_first_line(RUN / "state", "idle") if daemon_running() else "off"
 
 
 def daemon_running() -> bool:
@@ -162,7 +215,8 @@ def status() -> dict:
             con.close()
     return {
         "daemon": "active" if daemon_running() else "inactive",
-        "dictation": read_first_line(RUN / "state", "idle") if daemon_running() else "off",
+        "dictation": dictation_state(),
+        "live_dictation": live_dictation(),
         "meeting": meeting,
         "meeting_id": active["id"] if active else None,
         "meeting_title": active["title"] if active else None,
@@ -219,9 +273,14 @@ def main(argv: list[str]) -> int:
         limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 10
         print(json.dumps(recent(limit)))
     elif cmd == "dictate":
+        if live_dictation() != "off":
+            return 0 if to_dictate("toggle" + (" --clipboard" if "--clipboard" in args else "")) else 1
         return subprocess.call(["voxtype", "record", "toggle"]
                                + (["--clipboard"] if "--clipboard" in args else []))
     elif cmd == "cancel":
+        if live_dictation() != "off":
+            to_dictate("cancel", start=False)
+            return 0
         return subprocess.call(["voxtype", "record", "cancel"])
     elif cmd == "lang":
         target = (args[:1] or ["toggle"])[0].lower()

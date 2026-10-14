@@ -1,0 +1,66 @@
+#!/usr/bin/python3 -I
+"""Stands in for `npu-transcribe --dictate` in the bmeet-dictate tests: the same commands (stdin)
+and events (stdout), with a scripted dictation instead of a microphone and a model. After a start
+it sends the text events of $FAKE_ENGINE_SCRIPT (JSON lines with "at" seconds; default SCRIPT)
+as their time comes; a stop sends "done" with the last event's final + draft. Every command is
+appended to $FAKE_ENGINE_LOG."""
+import json
+import os
+import select
+import sys
+import time
+
+SCRIPT = [
+    {"at": 0.4, "final": "", "draft": "Второй челлендж"},
+    {"at": 0.8, "final": "", "draft": "Второй челлендж, он чисто поисковый."},
+    {"at": 1.2, "final": "Второй челлендж, он чисто поисковый.", "draft": "Это, собственно"},
+    {"at": 1.6, "final": "Второй челлендж, он чисто поисковый.", "draft": "Это, собственно, как делать поиск быстро."},
+]
+
+
+def emit(ev):
+    print(json.dumps(ev, ensure_ascii=False), flush=True)
+
+
+def main():
+    script = SCRIPT
+    if os.environ.get("FAKE_ENGINE_SCRIPT"):
+        with open(os.environ["FAKE_ENGINE_SCRIPT"], encoding="utf-8") as f:
+            script = [json.loads(line) for line in f if line.strip()]
+    log = open(os.environ["FAKE_ENGINE_LOG"], "a", buffering=1) if os.environ.get("FAKE_ENGINE_LOG") else None
+    language = sys.argv[sys.argv.index("--language") + 1] if "--language" in sys.argv else "en"
+    emit({"ready": True, "language": language, "model": "fake", "device": "NPU"})
+    started, i, pending, last = None, 0, b"", {"final": "", "draft": ""}
+    while True:
+        wait = None
+        if started is not None and i < len(script):
+            wait = max(0.0, started + script[i]["at"] - time.monotonic())
+        if not select.select([0], [], [], wait)[0]:
+            last = script[i]
+            emit(dict(last, at=round(time.monotonic() - started, 3)))
+            i += 1
+            continue
+        data = os.read(0, 65536)
+        if not data:
+            return 0
+        pending += data
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            cmd = json.loads(line)
+            if log:
+                log.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+            if "start" in cmd and started is None:
+                started, i, last = time.monotonic(), 0, {"final": "", "draft": ""}
+                emit({"started": True, "language": cmd["start"].get("language"), "model": "fake", "device": "NPU"})
+            elif "stop" in cmd and started is not None:
+                text = f"{last['final']} {last['draft']}".strip()
+                emit({"done": True, "text": text, "audio": time.monotonic() - started, "cpu": 0.01, "passes": i,
+                      "at": time.monotonic() - started})
+                started = None
+            elif "cancel" in cmd and started is not None:
+                emit({"cancelled": True})
+                started = None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

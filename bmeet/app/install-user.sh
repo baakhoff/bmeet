@@ -28,6 +28,9 @@ unlink_ours() {  # remove a symlink only if it points at a bmeet file
 
 case ${1:-} in
     --uninstall)
+        # BMeet's own dictation: stopping it gives KWin's input method back if it holds it
+        systemctl --user stop bmeet-dictate.service 2>/dev/null || true
+        /usr/bin/python3 -I "$(dirname "$here")/dictate/bmeet-dictate" give-back 2>/dev/null || true
         rm -fv "$desktop"
         unlink_ours "$bin_dir/bmeet"
         unlink_ours "$bin_dir/bmeet-ctl"
@@ -41,9 +44,14 @@ esac
 /usr/bin/python3 -I -c 'import PyQt6.QtWidgets, PyQt6.QtNetwork' \
     || { echo "error: the system PyQt6 (python3-pyqt6) is missing" >&2; exit 1; }
 case $app in *[[:space:]]*) echo "error: paths with spaces are not supported in Exec=" >&2; exit 1;; esac
-chmod 755 "$app" "$ctl"
+dictate="$(dirname "$here")/dictate"
+chmod 755 "$app" "$ctl" "$dictate/bmeet-dictate" "$dictate/bmeet-im"
 "$app" --help >/dev/null   # parses and imports PyQt6: fails early if something is broken
 "$ctl" status >/dev/null
+"$dictate/bmeet-dictate" --version >/dev/null
+# A running bmeet-dictate (BMeet's own dictation, when ~/.config/bmeet/live-dictation is on) still
+# has the old files: stop it, the next Meta+H starts the new one.
+systemctl --user stop bmeet-dictate.service 2>/dev/null || true
 
 # --- the same app before 0.2.0 (BMeet was npu-voicenotes, the app "Voice Notes") -----
 for name in voicenotes voicenotes-ctl; do

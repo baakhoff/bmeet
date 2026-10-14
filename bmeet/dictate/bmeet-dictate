@@ -1,0 +1,673 @@
+#!/usr/bin/python3 -I
+"""bmeet-dictate - BMeet's own dictation, with the text in front of you while you speak.
+
+When ~/.config/bmeet/live-dictation says "on" (or "panel"), `bmeet-ctl dictate` (Meta+H,
+Meta+Alt+H) and `bmeet-ctl cancel` come here instead of going to voxtype (docs/live-dictation.md).
+The first one starts this as the user unit bmeet-dictate, which keeps `npu-transcribe --dictate`
+(the speech model on the NPU: GigaAM for Russian, Whisper for the other languages) loaded.
+
+"on": the text goes into the text field you are in while you speak. KWin runs one input method
+at a time (System Settings > Keyboard > Virtual Keyboard); for the length of a dictation this
+makes BMeet's (bmeet-im) that one, and afterwards puts back what was there, switched on or off as
+it was. What was there is kept in ~/.local/state/bmeet/input-method.json until then, so a crash
+or a reboot in between can't lose it: the next start puts it back. Words still being redone are
+underlined in the field (preedit text), final ones are committed as they become final.
+Where no text field takes them (X11 programs), a panel at the bottom of the screen shows the
+text instead, and at the end it is pasted at the cursor as voxtype does it (wl-copy, then Ctrl+V
+through ydotool).
+"panel": always the panel and the paste at the end; KWin's settings are not touched.
+--clipboard (Meta+Alt+H): the panel, and at the end the text only goes to the clipboard.
+
+  bmeet-dictate serve                              the service (bmeet-ctl starts it)
+  bmeet-dictate toggle|start [--clipboard]         tell the running service
+  bmeet-dictate stop|cancel|status|quit
+  bmeet-dictate give-back                          put KWin's input method back if a note says it was
+                                                   taken (the service does it itself; for the uninstaller)
+
+The language is voxtype's dictation language (openvino.language in ~/.config/voxtype/config.toml,
+switched with Meta+Shift+H). A dictation stops by itself after MAX_SECONDS, as voxtype's does.
+The state, for the widget and the app, is in $XDG_RUNTIME_DIR/bmeet/dictation (idle, recording,
+transcribing).
+
+Env (tests): BMEET_DICTATE_ENGINE (the engine command, default: npu-transcribe), BMEET_DICTATE_OUTPUT
+=file:PATH (append what would be pasted or copied to PATH instead: nothing is typed or copied),
+BMEET_DICTATE_SOURCE=FILE (that audio instead of the microphone), BMEET_RUNTIME_DIR, BMEET_STATE_DIR,
+VOXTYPE_CONFIG.
+"""
+from __future__ import annotations
+
+import ctypes
+import html
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+__version__ = "0.8.0"
+PROG = "bmeet-dictate"
+HERE = Path(__file__).resolve().parent
+HOME = Path.home()
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+RUNTIME = Path(os.environ.get("BMEET_RUNTIME_DIR")
+               or Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "bmeet")
+STATE_DIR = Path(os.environ.get("BMEET_STATE_DIR")
+                 or Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "bmeet")
+SOCKET = RUNTIME / "dictate.sock"
+STATE = RUNTIME / "dictation"
+MODE_FILE = CONFIG / "bmeet/live-dictation"
+SLOT_FILE = STATE_DIR / "input-method.json"   # what KWin's input-method slot held before a dictation
+IM_DESKTOP = RUNTIME / "bmeet-im.desktop"      # how KWin starts bmeet-im (written at start-up)
+VOXTYPE_CONFIG = Path(os.environ.get("VOXTYPE_CONFIG") or CONFIG / "voxtype/config.toml")
+MAX_SECONDS = 120             # voxtype's [audio] max_duration_secs
+SHOWN_CHARS = 400             # the panel shows the end of the text (about three lines)
+PANEL_GRACE_MS = 600          # no text field took the input method this long after the start: the panel
+COMMIT_WAIT_MS = 1500         # the input method's answer to the end of a dictation, at most
+PASTE_KEYS = ["29:1", "47:1", "47:0", "29:0"]   # Ctrl+V for ydotool (voxtype's paste_keys)
+
+
+def log(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
+
+
+def mode() -> str:
+    """~/.config/bmeet/live-dictation: "on" (the text in the field), "panel", or "off" (voxtype)."""
+    try:
+        word = MODE_FILE.read_text().split()[0].lower()
+    except (OSError, IndexError):
+        return "off"
+    return word if word in ("on", "panel") else "off"
+
+
+def dictation_language() -> str:
+    """voxtype's dictation language (switched with Meta+Shift+H / voxtype-lang)."""
+    try:
+        with VOXTYPE_CONFIG.open("rb") as f:
+            cfg = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return "en"
+    section = cfg.get("openvino" if cfg.get("engine") == "openvino" else "whisper", {})
+    language = str(section.get("language") or "en").lower()
+    return language if language.isalpha() and 2 <= len(language) <= 3 else "en"
+
+
+def engine_command() -> list[str]:
+    if os.environ.get("BMEET_DICTATE_ENGINE"):
+        return shlex.split(os.environ["BMEET_DICTATE_ENGINE"])
+    return [shutil.which("npu-transcribe") or str(HOME / ".local/bin/npu-transcribe")]
+
+
+def shown_text(final: str, draft: str, chars: int = SHOWN_CHARS) -> str:
+    """The panel's rich text: the end of final + draft, the draft in grey."""
+    text = f"{final} {draft}".strip()
+    if len(text) > chars:
+        text = "…" + text[-chars:].split(" ", 1)[-1]
+    cut = max(0, len(text) - len(draft))
+    return html.escape(text[:cut]) + (f"<span style='color:#9aa4b1'>{html.escape(text[cut:])}</span>" if draft else "")
+
+
+def rest_of(text: str, committed: str) -> str:
+    """What of the dictation's text the input method did not get into a field."""
+    if not committed:
+        return text
+    return text[len(committed):].strip() if text.startswith(committed) else ""
+
+
+def deliver(text: str, clipboard: bool) -> str:
+    """Put the text where it goes: pasted at the cursor (wl-copy + Ctrl+V through ydotool, as
+    voxtype's paste mode), the clipboard only, or (tests) a file. Returns what was done."""
+    if not text:
+        return "nothing"
+    out = os.environ.get("BMEET_DICTATE_OUTPUT", "")
+    if out.startswith("file:"):
+        with open(out[5:], "a", encoding="utf-8") as f:
+            f.write(json.dumps({"text": text, "clipboard": clipboard}, ensure_ascii=False) + "\n")
+        return "file"
+    # wl-copy forks a process that serves the clipboard; it returns once the text is offered.
+    subprocess.run(["wl-copy"], input=text.encode(), check=True, timeout=5)
+    if clipboard:
+        return "clipboard"
+    subprocess.run(["ydotool", "key", *PASTE_KEYS], check=True, timeout=5,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "pasted"
+
+
+# --------------------------------------------------------------------------- KWin's input-method slot
+
+def kwinrc(value: str | None) -> None:
+    """[Wayland] InputMethod in kwinrc (None: no entry), with the change notification KWin follows."""
+    cmd = ["kwriteconfig6", "--file", "kwinrc", "--group", "Wayland", "--key", "InputMethod", "--notify"]
+    subprocess.run(cmd + (["--delete"] if value is None else [value]), check=True, timeout=5)
+
+
+def kwinrc_input_method() -> str | None:
+    out = subprocess.run(["kreadconfig6", "--file", "kwinrc", "--group", "Wayland", "--key", "InputMethod"],
+                         capture_output=True, text=True, timeout=5).stdout.strip()
+    return out or None
+
+
+class Slot:
+    """KWin's one input method (org.kde.KWin /VirtualKeyboard), taken for a dictation and given back."""
+
+    IFACE = "org.kde.kwin.VirtualKeyboard"
+
+    def __init__(self) -> None:
+        from PyQt6.QtDBus import QDBusConnection, QDBusInterface
+        self.bus = QDBusConnection.sessionBus()
+        self.props = QDBusInterface("org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties", self.bus)
+        self.kwin = QDBusInterface("org.kde.KWin", "/VirtualKeyboard", self.IFACE, self.bus)
+
+    def get(self, name: str):
+        reply = self.props.call("Get", self.IFACE, name)
+        args = reply.arguments()
+        if reply.errorMessage() or not args:
+            raise RuntimeError(f"KWin's {name}: {reply.errorMessage() or 'no answer'}")
+        value = args[0]
+        return value.variant() if hasattr(value, "variant") else value
+
+    def set(self, name: str, value: bool) -> None:
+        from PyQt6.QtDBus import QDBusVariant
+        reply = self.props.call("Set", self.IFACE, name, QDBusVariant(value))
+        if reply.errorMessage():
+            raise RuntimeError(f"KWin's {name}: {reply.errorMessage()}")
+
+    def usable(self) -> bool:
+        try:
+            return bool(self.get("available") is not None)
+        except RuntimeError:
+            return False
+
+    def take(self) -> None:
+        """Make bmeet-im KWin's input method. What was there is written down first (unless an
+        earlier dictation's note is still there: that one holds your setting)."""
+        if not SLOT_FILE.exists():
+            saved = {"input_method": kwinrc_input_method(), "enabled": bool(self.get("enabled"))}
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = SLOT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(saved) + "\n")
+            tmp.replace(SLOT_FILE)
+        kwinrc(str(IM_DESKTOP))
+        self.set("enabled", True)
+
+    def activate(self) -> bool:
+        """The text field that has the focus already takes the input method that just started.
+        Only a Wayland window's field: forced on an X11 window (Xwayland), KWin types the text as
+        key presses of the current layout, and the letters it lacks (Cyrillic on a US layout) are
+        lost. Returns whether the focused window has a field."""
+        if not self.get("activeClientSupportsTextInput"):
+            return False
+        self.kwin.call("forceActivate")
+        return True
+
+    def give_back(self) -> bool:
+        """Put back what the slot held before (kept in SLOT_FILE). True if there was something."""
+        try:
+            saved = json.loads(SLOT_FILE.read_text())
+        except (OSError, ValueError):
+            return False
+        try:
+            self.set("active", False)
+        except RuntimeError:
+            pass
+        kwinrc(saved.get("input_method"))
+        self.set("enabled", bool(saved.get("enabled")))
+        SLOT_FILE.unlink()
+        return True
+
+
+def write_im_desktop() -> None:
+    """The desktop file KWin starts bmeet-im from while it holds the slot."""
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    exe = HERE / "bmeet-im"
+    env = [f"BMEET_RUNTIME_DIR={RUNTIME}"]
+    if os.environ.get("BMEET_IM_LOG"):   # (tests)
+        env.append(f"BMEET_IM_LOG={os.environ['BMEET_IM_LOG']}")
+    IM_DESKTOP.write_text(
+        "[Desktop Entry]\nType=Application\nName=BMeet dictation\n"
+        "Comment=BMeet's input method, only while you dictate (bmeet-dictate puts your own back)\n"
+        f"Exec=env {shlex.join(env)} {shlex.quote(str(exe))}\nNoDisplay=true\n")
+
+
+# --------------------------------------------------------------------------- client
+
+def send(command: str, timeout: float = 5.0) -> dict:
+    """One command to the running service; its JSON answer."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(SOCKET))
+        s.sendall(command.encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data or b"{}")
+
+
+# --------------------------------------------------------------------------- service
+
+def serve() -> int:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        # The panel is a layer-shell surface (LayerShellQt): above the windows, never focused.
+        os.environ.setdefault("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell")
+        # ... drawn in software: without this Qt sets up EGL (the GPU) at the start, which the
+        # panel never uses (as voxtype's overlay, which BMeet makes draw with cairo).
+        os.environ.setdefault("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "none")
+    from PyQt6.QtCore import QObject, QProcess, Qt, QTimer
+    from PyQt6.QtGui import QGuiApplication
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+    from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+
+    class Panel(QWidget):
+        """The text while you speak, at the bottom of the screen, where no field shows it."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowDoesNotAcceptFocus
+                                | Qt.WindowType.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+            self.setWindowTitle("BMeet dictation")
+            self.label = QLabel(self)
+            self.label.setWordWrap(True)
+            self.label.setTextFormat(Qt.TextFormat.RichText)
+            self.label.setStyleSheet("QLabel { background: rgba(32, 33, 36, 230); color: #f1f3f4; "
+                                     "border-radius: 10px; padding: 10px 14px; font-size: 15px; }")
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self.label)
+            screen = QGuiApplication.primaryScreen()
+            self.setFixedWidth(min(900, int(screen.availableGeometry().width() * 0.6)) if screen else 900)
+            self.rich = ""
+            self.layer_shell()
+
+        def layer_shell(self) -> None:
+            """Anchored to the bottom edge, in the top layer, no keyboard focus (LayerShellQt,
+            through its C++ API: it has no Python binding)."""
+            if QGuiApplication.platformName() != "wayland":
+                return
+            try:
+                from PyQt6 import sip
+                lib = ctypes.CDLL("libLayerShellQtInterface.so.6")
+                get = lib._ZN12LayerShellQt6Window3getEP7QWindow
+                get.restype, get.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+                self.winId()   # (creates the QWindow; the surface comes with show())
+                window = get(sip.unwrapinstance(self.windowHandle()))
+
+                class Margins(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_int) for n in ("left", "top", "right", "bottom")]
+                self._margins = Margins(0, 0, 0, 72)
+                for name, arg in (("_ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE", ctypes.c_int(2)),
+                                  ("_ZN12LayerShellQt6Window8setLayerENS0_5LayerE", ctypes.c_int(2)),
+                                  ("_ZN12LayerShellQt6Window24setKeyboardInteractivityE"
+                                   "NS0_21KeyboardInteractivityE", ctypes.c_int(0)),
+                                  ("_ZN12LayerShellQt6Window10setMarginsERK8QMargins", ctypes.byref(self._margins))):
+                    f = getattr(lib, name)
+                    f.restype = None
+                    f(ctypes.c_void_p(window), arg)
+            except (OSError, AttributeError, ImportError) as exc:
+                log(f"WARNING: no layer-shell panel ({exc}); the panel is a normal window")
+
+        def show_text(self, rich: str) -> None:
+            self.rich = rich
+            self.label.setText(rich)
+            self.adjustSize()
+            if not self.isVisible():
+                self.show()
+
+    class Service(QObject):
+        def __init__(self, server: QLocalServer) -> None:
+            super().__init__()
+            self.server = server
+            server.newConnection.connect(self.connection)
+            self.panel = Panel()
+            self.engine: QProcess | None = None
+            self.ready = False
+            self.out = b""
+            self.state = "idle"
+            self.clipboard = False
+            self.final = self.draft = ""
+            self.queued: str | None = None     # a start waiting for the engine
+            self.last: dict = {}               # the last dictation's "done" event and how it went
+            self.slot: Slot | None = None
+            self.taken = False                 # we hold KWin's input-method slot
+            self.im: QLocalSocket | None = None    # bmeet-im, while it runs
+            self.im_in = b""
+            self.field = False                 # a text field shows the dictation (bmeet-im says)
+            self.committed = ""                # what bmeet-im put into fields
+            self.text = ""                     # the final text, once the engine is done
+            self.limit = QTimer(self)
+            self.limit.setSingleShot(True)
+            self.limit.timeout.connect(lambda: self.command("stop"))
+            self.grace = QTimer(self)
+            self.grace.setSingleShot(True)
+            self.grace.timeout.connect(self.refresh_panel)
+            self.commit_wait = QTimer(self)
+            self.commit_wait.setSingleShot(True)
+            self.commit_wait.timeout.connect(lambda: self.finish(None))
+            self.set_state("idle")
+            write_im_desktop()
+            if SLOT_FILE.exists():   # (an earlier run ended while it held the slot)
+                self.give_back("left over from an earlier run")
+            self.start_engine()
+
+        # -- the engine
+        def start_engine(self) -> None:
+            cmd = engine_command() + ["--dictate", "--language", dictation_language()]
+            self.engine = QProcess(self)
+            self.engine.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedErrorChannel)
+            self.engine.readyReadStandardOutput.connect(self.engine_output)
+            self.engine.finished.connect(self.engine_gone)
+            self.ready, self.out = False, b""
+            self.engine.start(cmd[0], cmd[1:])
+            log(f"engine: {shlex.join(cmd)}")
+
+        def to_engine(self, event: dict) -> None:
+            if self.engine is not None:
+                self.engine.write(json.dumps(event).encode() + b"\n")
+
+        def engine_output(self) -> None:
+            assert self.engine is not None
+            self.out += bytes(self.engine.readAllStandardOutput())
+            while b"\n" in self.out:
+                line, self.out = self.out.split(b"\n", 1)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                self.engine_event(event)
+
+        def engine_event(self, ev: dict) -> None:
+            if ev.get("ready"):
+                self.ready = True
+                if self.queued:
+                    queued, self.queued = self.queued, None
+                    self.begin(queued == "clipboard")
+            elif ev.get("started"):
+                log(f"dictating: {ev.get('language')}, {ev.get('model')} on {ev.get('device')}"
+                    + (", into the text field" if self.taken else ""))
+            elif "final" in ev and self.state in ("recording", "transcribing"):
+                self.final, self.draft = ev.get("final", ""), ev.get("draft", "")
+                self.to_im({"final": self.final, "draft": self.draft})
+                self.refresh_panel()
+            elif ev.get("done"):
+                self.limit.stop()
+                self.last, self.text = dict(ev), ev.get("text", "")
+                self.final, self.draft = self.text, ""
+                if self.im is not None and self.field:
+                    self.state = "committing"
+                    self.to_im({"done": True, "text": self.text})
+                    self.commit_wait.start(COMMIT_WAIT_MS)
+                else:
+                    self.finish(None)
+            elif ev.get("cancelled"):
+                pass
+            elif ev.get("error"):
+                log(f"ERROR: {ev['error']}")
+                self.limit.stop()
+                self.end_dictation()
+
+        def engine_gone(self) -> None:
+            if self.state != "idle":
+                log("ERROR: the engine stopped during a dictation")
+                self.limit.stop()
+                self.end_dictation()
+            self.engine, self.ready = None, False
+
+        # -- bmeet-im
+        def im_hello(self, conn: QLocalSocket) -> None:
+            if self.im is not None:
+                self.im.disconnectFromServer()
+            self.im, self.im_in, self.field = conn, b"", False
+            conn.readyRead.connect(self.im_output)
+            conn.disconnected.connect(self.im_gone)
+            if self.slot is not None and self.taken:
+                try:
+                    if not self.slot.activate():
+                        log("no text field of a Wayland window has the focus: the panel, and paste at the end")
+                except RuntimeError as exc:
+                    log(f"WARNING: {exc}")
+            if self.state == "recording":
+                self.to_im({"final": self.final, "draft": self.draft})
+
+        def to_im(self, event: dict) -> None:
+            if self.im is not None:
+                self.im.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
+                self.im.flush()
+
+        def im_output(self) -> None:
+            if self.im is None:
+                return
+            self.im_in += bytes(self.im.readAll())
+            while b"\n" in self.im_in:
+                line, self.im_in = self.im_in.split(b"\n", 1)
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if "all" in ev:
+                    self.committed = ev.get("all", "")
+                if "field" in ev:
+                    self.field = bool(ev["field"])
+                    self.refresh_panel()
+                if "committed" in ev and self.state == "committing":
+                    self.commit_wait.stop()
+                    self.finish(ev)
+
+        def im_gone(self) -> None:
+            self.im, self.field = None, False
+            if self.state == "committing":
+                self.commit_wait.stop()
+                self.finish(None)
+            else:
+                self.refresh_panel()
+
+        # -- KWin's slot
+        def take_slot(self) -> None:
+            if self.slot is None:
+                self.slot = Slot()
+            try:
+                if not self.slot.usable():
+                    log("WARNING: KWin's input-method slot is not there: the panel instead")
+                    return
+                self.slot.take()
+                self.taken = True
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                log(f"WARNING: could not take KWin's input-method slot ({exc}): the panel instead")
+                self.give_back("after a failed take")
+
+        def give_back(self, why: str = "") -> None:
+            self.taken = False
+            if self.slot is None:
+                self.slot = Slot()
+            try:
+                if self.slot.give_back() and why:
+                    log(f"gave KWin's input-method slot back ({why})")
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                log(f"ERROR: could not give KWin's input-method slot back ({exc}); kept in {SLOT_FILE}")
+
+        # -- dictations
+        def set_state(self, state: str) -> None:
+            self.state = state
+            try:
+                RUNTIME.mkdir(parents=True, exist_ok=True)
+                tmp = STATE.with_suffix(".tmp")
+                tmp.write_text(state + "\n")
+                tmp.replace(STATE)
+            except OSError:
+                pass
+
+        def refresh_panel(self) -> None:
+            """The panel shows the text where no field does (and right away for --clipboard)."""
+            dictating = self.state in ("recording", "transcribing")
+            wanted = dictating and not (self.taken and self.field) and not self.grace.isActive()
+            if not wanted:
+                self.panel.hide()
+                return
+            text = shown_text(self.final, self.draft) if (self.final or self.draft) else "<i>Listening…</i>"
+            self.panel.show_text(text + (" …" if self.state == "transcribing" else ""))
+
+        def begin(self, clipboard: bool) -> None:
+            if self.engine is None:
+                self.start_engine()
+            self.clipboard, self.final, self.draft, self.committed, self.text = clipboard, "", "", "", ""
+            self.set_state("recording")
+            if mode() == "on" and not clipboard and not self.taken:
+                self.take_slot()
+            self.grace.start(PANEL_GRACE_MS if self.taken else 0)
+            if not self.ready:
+                self.queued = "clipboard" if clipboard else "paste"
+                return
+            start: dict = {"language": dictation_language()}
+            if os.environ.get("BMEET_DICTATE_SOURCE"):
+                start["file"] = os.environ["BMEET_DICTATE_SOURCE"]
+            self.to_engine({"start": start})
+            self.limit.start(MAX_SECONDS * 1000)
+
+        def finish(self, answer: dict | None) -> None:
+            """The engine is done (and bmeet-im answered, or not): the rest goes by paste."""
+            if answer is not None:
+                self.committed = answer.get("all", self.committed)
+            rest = rest_of(self.text, self.committed)
+            try:
+                how = deliver(rest, self.clipboard)
+            except (OSError, subprocess.SubprocessError) as exc:
+                how = f"failed: {exc}"
+            if self.committed:
+                how = f"into the field{', the rest ' + how if rest else ''}"
+            self.last["delivered"] = how
+            log(f"done: {self.last.get('audio', 0):.1f} s, {len(self.text.split())} word(s), {how} "
+                f"(engine CPU {self.last.get('cpu', 0):.2f} s, {self.last.get('passes', 0)} passes)")
+            self.end_dictation()
+
+        def end_dictation(self) -> None:
+            self.grace.stop()
+            self.commit_wait.stop()
+            self.panel.hide()
+            self.set_state("idle")
+            if self.taken:
+                self.to_im({"cancel": True})
+                self.give_back()
+
+        def command(self, line: str) -> dict:
+            words = line.split()
+            cmd, clipboard = (words[0] if words else "status"), "--clipboard" in words
+            if cmd == "toggle":
+                cmd = "start" if self.state == "idle" else "stop"
+            if cmd == "start" and self.state == "idle":
+                self.begin(clipboard)
+            elif cmd == "stop" and self.state == "recording":
+                if self.queued:            # (the engine is still loading: nothing was said into it)
+                    self.queued = None
+                    self.end_dictation()
+                else:
+                    self.set_state("transcribing")
+                    self.refresh_panel()
+                    self.to_engine({"stop": {}})
+            elif cmd == "cancel" and self.state != "idle":
+                self.queued = None
+                self.to_engine({"cancel": {}})
+                self.limit.stop()
+                self.end_dictation()
+            elif cmd == "quit":
+                QTimer.singleShot(0, QApplication.instance().quit)
+            elif cmd not in ("status", "start", "stop", "cancel"):
+                return {"error": f"unknown command: {cmd}"}
+            return {"state": self.state, "final": self.final, "draft": self.draft, "mode": mode(),
+                    "panel": self.panel.isVisible(), "panel_text": self.panel.rich if self.panel.isVisible() else "",
+                    "field": self.field, "input_method": self.taken, "engine_ready": self.ready, "last": self.last}
+
+        def connection(self) -> None:
+            conn = self.server.nextPendingConnection()
+            if conn is None:
+                return
+
+            def readable() -> None:
+                if not conn.canReadLine():
+                    return
+                conn.readyRead.disconnect(readable)
+                line = bytes(conn.readLine()).decode(errors="replace").strip()
+                if line == "im":
+                    self.im_hello(conn)
+                    return
+                conn.write(json.dumps(self.command(line), ensure_ascii=False).encode() + b"\n")
+                conn.flush()
+                conn.disconnectFromServer()
+            conn.readyRead.connect(readable)
+            conn.disconnected.connect(conn.deleteLater)
+            readable()
+
+    app = QApplication(sys.argv[:1])
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("bmeet-dictate")
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    probe = QLocalSocket()
+    probe.connectToServer(str(SOCKET))
+    if probe.waitForConnected(500):
+        log("already running")
+        return 0
+    QLocalServer.removeServer(str(SOCKET))
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(str(SOCKET)):
+        log(f"ERROR: cannot listen on {SOCKET}: {server.errorString()}")
+        return 1
+    service = Service(server)
+    log(f"listening on {SOCKET}")
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: QTimer.singleShot(0, app.quit))
+    keepalive = QTimer()   # (lets Python see SIGTERM while Qt waits)
+    keepalive.start(500)
+    try:
+        return app.exec()
+    finally:
+        service.to_engine({"cancel": {}})
+        if service.taken:
+            service.give_back("the service stopped")
+        if service.engine is not None:
+            service.engine.closeWriteChannel()
+            service.engine.waitForFinished(3000)
+        try:
+            STATE.unlink()
+        except OSError:
+            pass
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "status"
+    if cmd in ("--version", "version"):
+        print(f"{PROG} {__version__}")
+        return 0
+    if cmd == "serve":
+        return serve()
+    if cmd == "give-back":
+        if not SLOT_FILE.exists():
+            return 0
+        from PyQt6.QtCore import QCoreApplication
+        app = QCoreApplication(sys.argv[:1])   # noqa: F841  (QtDBus wants one)
+        try:
+            Slot().give_back()
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            print(f"{PROG}: could not put KWin's input method back ({exc}); it is noted in {SLOT_FILE}",
+                  file=sys.stderr)
+            return 1
+        print(f"{PROG}: KWin's input method put back")
+        return 0
+    if cmd in ("toggle", "start", "stop", "cancel", "status", "quit"):
+        try:
+            print(json.dumps(send(" ".join(argv)), ensure_ascii=False))
+        except OSError as exc:
+            print(f"{PROG}: the service is not running ({exc})", file=sys.stderr)
+            return 1
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

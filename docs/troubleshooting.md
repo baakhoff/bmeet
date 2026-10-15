@@ -39,7 +39,7 @@ BMeet's own dictation (`~/.config/bmeet/live-dictation` says `on` or `panel`; [l
 ## Meeting speakers
 
 The speaker pass (You / Person 1 / Person 2 …) runs as the systemd user unit
-`bmeet-speakers-YYYY-MM-DD_HHMM` after each meeting; the BMeet app shows "Telling the
+`bmeet-speakers-YYYY-MM-DD_HHMM` after each meeting (`…_HHMM-2` for a second meeting started in the same minute); the BMeet app shows "Telling the
 speakers apart…" until it is done.
 
 | Symptom | What to check |

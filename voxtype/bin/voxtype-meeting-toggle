@@ -3,11 +3,12 @@
 # has transcribed the last chunk, then save a Markdown copy into ~/Documents/Meetings.
 #
 # Speakers (BMeet): while the meeting runs, bmeet-meeting-audio records both sources into
-# RAM ($XDG_RUNTIME_DIR/bmeet/meeting-audio/STAMP). After the stop, `npu-transcribe
-# --meeting` transcribes them again, tells the voices in the system audio apart (Person 1,
-# Person 2, ...) and replaces the Markdown copy; then the audio is deleted. Both run as
-# systemd user units (bmeet-meeting-audio, bmeet-speakers-STAMP), so this script never
-# waits for them. Off when ~/.config/bmeet/speakers does not say "on".
+# RAM ($XDG_RUNTIME_DIR/bmeet/meeting-audio/NAME: the start minute, YYYY-MM-DD_HHMM, with
+# -2, -3, ... for a second meeting in a minute whose recording is still there). After the
+# stop, `npu-transcribe --meeting` transcribes them again, tells the voices in the system audio
+# apart (Person 1, Person 2, ...) and replaces the Markdown copy; then the audio is deleted.
+# Both run as systemd user units (bmeet-meeting-audio, bmeet-speakers-NAME), so this script
+# never waits for them. Off when ~/.config/bmeet/speakers does not say "on".
 # Remembered voices (opt-in, ~/.config/bmeet/remember-voices "on"): the pass also names
 # people the BMeet app was told about, and keeps this meeting's voice fingerprints in
 # ~/.local/share/bmeet/voices so you can name its people afterwards.
@@ -32,7 +33,7 @@ set -eu
 OUT_DIR="${VOXTYPE_MEETING_DIR:-$HOME/Documents/Meetings}"
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
 STATE_FILE="$RUN_DIR/meeting_state"          # written by the voxtype daemon
-STAMP_FILE="$RUN_DIR/meeting-toggle.started"  # our own: start time for the file name
+STAMP_FILE="$RUN_DIR/meeting-toggle.started"  # our own: the recording's name (recording_name)
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/voxtype-meeting-toggle.lock"
 BIN_DIR="$HOME/.local/bin"
 SPEAKERS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/speakers"
@@ -40,6 +41,7 @@ REMEMBER_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/remember-voices"
 LIVE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet/live-transcript"
 VOICES_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bmeet/voices"
 AUDIO_ROOT="${XDG_RUNTIME_DIR:-/tmp}/bmeet/meeting-audio"
+MEETING_DB="${BMEET_MEETING_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/meetings/index.db}"
 REC_UNIT=bmeet-meeting-audio
 LIVE_UNIT=bmeet-live
 
@@ -56,6 +58,44 @@ speakers_on() {
         && [ -x "$BIN_DIR/bmeet-meeting-audio" ] && [ -x "$BIN_DIR/npu-transcribe" ]
 }
 
+unique_title() {  # $1 title: voxtype keeps each meeting's files in a folder named after its date
+    # and title, so two meetings with one title (both started in one minute) would share it: the
+    # second one's transcript overwrote the first one's, and deleting one deleted the other's.
+    # A title voxtype has already gets (2), (3), ...
+    local title=$1 n=1
+    while title_taken "$title"; do
+        n=$((n + 1))
+        title="$1 ($n)"
+    done
+    echo "$title"
+}
+
+title_taken() {  # $1 title: does voxtype's meeting index have a meeting with it?
+    [ -f "$MEETING_DB" ] && python3 -I -c 'import sqlite3, sys
+con = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=2)
+sys.exit(0 if con.execute("SELECT 1 FROM meetings WHERE title = ?", (sys.argv[2],)).fetchone() else 1)
+' "$MEETING_DB" "$1" 2>/dev/null
+}
+
+recording_name() {  # $1 the start minute (YYYY-MM-DD_HHMM): a name of this meeting's own
+    # for its recording and units. Two meetings can start in the same minute (one stopped, the
+    # next started at once): sharing the folder, the first one's speaker pass deleted the second
+    # one's recording when it ended. So a minute still in use gets -2, -3, ...
+    local name=$1 n=1
+    while [ -e "$AUDIO_ROOT/$name" ] || unit_busy "bmeet-speakers-$name.service"; do
+        n=$((n + 1))
+        name="$1-$n"
+    done
+    echo "$name"
+}
+
+unit_busy() {  # $1 a user unit that is running, starting or stopping
+    case "$(systemctl --user is-active "$1" 2>/dev/null)" in
+        ""|inactive|failed) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 clean_audio() {  # recordings no unit works on any more (a crash, a stop from elsewhere)
     local d
     for d in "$AUDIO_ROOT"/*/; do
@@ -65,7 +105,7 @@ clean_audio() {  # recordings no unit works on any more (a crash, a stop from el
     done
 }
 
-start_audio() {  # $1 stamp, $2 title, $3 in_person (1 or empty); best effort: the live
+start_audio() {  # $1 recording name, $2 title, $3 in_person (1 or empty); best effort: the live
     speakers_on || return 0  # transcript works without it
     systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true
     systemctl --user reset-failed "$REC_UNIT.service" 2>/dev/null || true
@@ -91,7 +131,7 @@ start_audio() {  # $1 stamp, $2 title, $3 in_person (1 or empty); best effort: t
         || notify "No live transcript" "Could not start npu-transcribe --live" dialog-warning
 }
 
-live_copy() {  # $1 stamp, $2 the Markdown copy: the live transcript instead of voxtype's
+live_copy() {  # $1 recording name, $2 the Markdown copy: the live transcript instead of voxtype's
     local dir="$AUDIO_ROOT/$1"
     systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true
     # It ends with the recording, once it has transcribed the last phrases (a second or two).
@@ -106,7 +146,7 @@ live_copy() {  # $1 stamp, $2 the Markdown copy: the live transcript instead of 
     fi
 }
 
-speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
+speaker_pass() {  # $1 recording name, $2 the Markdown copy to replace
     local dir="$AUDIO_ROOT/$1"
     systemctl --user stop "$REC_UNIT.service" 2>/dev/null || true  # (it also ends on "idle")
     [ -d "$dir" ] || return 0
@@ -117,8 +157,9 @@ speaker_pass() {  # $1 stamp, $2 the Markdown copy to replace
     local voices=()
     [ "$(head -n1 "$REMEMBER_FILE" 2>/dev/null)" = on ] && voices=(--voices "$VOICES_DIR")
     # ExecStopPost deletes the audio however the pass ends (done, failed, stopped, logout).
-    # The marker tells bmeet-ctl (and so the app) that the pass is running.
-    touch "$dir/speaker-pass"
+    # The marker tells bmeet-ctl (and so the app) that the pass is running, and which
+    # transcript it is going to replace.
+    printf '%s\n' "$2" > "$dir/speaker-pass"
     if systemd-run --user --quiet --collect --unit="bmeet-speakers-$1" -p Nice=10 \
             -p "ExecStopPost=/usr/bin/rm -rf $dir" \
             "$BIN_DIR/npu-transcribe" --meeting "$dir" --output "$2" "${voices[@]}" --notify; then
@@ -132,16 +173,17 @@ start_meeting() {
     local title
     title="Meeting $(date '+%Y-%m-%d %H:%M')"
     [ -z "$in_person" ] || title="In-person meeting $(date '+%Y-%m-%d %H:%M')"
+    title="$(unique_title "$title")"
     # Started from a shortcut there is no terminal, so say it when it does not work.
     if ! voxtype meeting start --title "$title"; then
         notify "Meeting NOT started" "Is voxtype running? systemctl --user status voxtype" dialog-error
         exit 1
     fi
     mkdir -p "$RUN_DIR"
-    local stamp
-    stamp="$(date '+%Y-%m-%d_%H%M')"
-    echo "$stamp" > "$STAMP_FILE"
-    start_audio "$stamp" "$title" "$in_person"
+    local recording
+    recording="$(recording_name "$(date '+%Y-%m-%d_%H%M')")"
+    echo "$recording" > "$STAMP_FILE"
+    start_audio "$recording" "$title" "$in_person"
     if [ -z "$in_person" ]; then
         notify "Meeting recording started" "Microphone + system audio. Press again to stop."
     elif speakers_on; then
@@ -158,8 +200,9 @@ stop_meeting() {
     fi
     notify "Meeting stopped" "Transcribing the last chunk..." media-playback-stop
 
-    local stamp file
-    stamp="$(cat "$STAMP_FILE" 2>/dev/null || date '+%Y-%m-%d_%H%M')"
+    local recording stamp file
+    recording="$(cat "$STAMP_FILE" 2>/dev/null || date '+%Y-%m-%d_%H%M')"
+    stamp="${recording:0:15}"   # the start minute (a recording name may go on: -2, -3)
     mkdir -p "$OUT_DIR"
     file="$OUT_DIR/$stamp-meeting.md"
     [ -e "$file" ] && file="$OUT_DIR/$stamp-meeting-$(date +%s).md"   # never overwrite
@@ -172,26 +215,26 @@ stop_meeting() {
     # (when voxtype's own transcript cannot be saved, the speaker pass still writes one)
     if [ "$(meeting_state)" != "idle" ]; then
         notify "Meeting export not done" "Daemon still busy. Later run: voxtype meeting export latest -o FILE.md" dialog-warning
-        live_copy "$stamp" "$file"
-        speaker_pass "$stamp" "$file"
+        live_copy "$recording" "$file"
+        speaker_pass "$recording" "$file"
         exit 1
     fi
     if ! voxtype meeting export latest --format markdown --timestamps --speakers --metadata --output "$file"; then
         notify "Meeting export failed" "Saved in voxtype's database; try: voxtype meeting export latest -o FILE.md" dialog-warning
-        live_copy "$stamp" "$file"
-        speaker_pass "$stamp" "$file"
+        live_copy "$recording" "$file"
+        speaker_pass "$recording" "$file"
         exit 1
     fi
-    live_copy "$stamp" "$file"
+    live_copy "$recording" "$file"
     rm -f "$STAMP_FILE"
-    if [ -d "$AUDIO_ROOT/$stamp" ]; then
+    if [ -d "$AUDIO_ROOT/$recording" ]; then
         notify "Meeting transcript saved" "$file
 Telling the speakers apart; the file is updated in a few minutes." document-save
     else
         notify "Meeting transcript saved" "$file" document-save
     fi
     echo "$file"
-    speaker_pass "$stamp" "$file"
+    speaker_pass "$recording" "$file"
 }
 
 # One toggle at a time (double-clicked panel button, key auto-repeat...).

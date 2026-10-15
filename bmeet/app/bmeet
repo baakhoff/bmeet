@@ -28,6 +28,7 @@ VOXTYPE_MEETING_DIR and NPU_TRANSCRIBE_HISTORY.
 """
 from __future__ import annotations
 
+import collections
 import fcntl
 import html
 import importlib.machinery
@@ -62,7 +63,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -297,18 +298,35 @@ class Meeting:
         return {minute_stamp(self.started_at), minute_stamp(self.started_at + 10)}
 
 
+def written_order(name: str) -> tuple[int, int, str]:
+    """YYYY-MM-DD_HHMM-meeting.md before -meeting-EPOCH.md: the order the toggle wrote them.
+    Anything else after its own (-meeting-speakers.md: the speaker pass's version of a
+    transcript you were editing, which stays the meeting's copy)."""
+    m = re.search(r"-meeting(?:-(\d+))?(\.md|-.*\.md)$", name)
+    return (int(m[1] or 0), m[2] != ".md", name) if m else (0, 1, name)
+
+
 def minute_stamp(epoch: float) -> str:
     return time.strftime("%Y-%m-%d_%H%M", time.localtime(epoch))
 
 
 def md_title(path: str) -> str:
-    """The "# Title" a meeting transcript starts with ("" if none)."""
+    """The "# Title" a meeting transcript starts with ("" if none); remembered per file
+    version, as the meetings list reloads often."""
+    sig = stat_sig(path)
+    if (hit := _MD_TITLES.get(path)) and hit[0] == sig:
+        return hit[1]
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             first = f.readline().strip()
     except OSError:
         return ""
-    return first[2:].strip() if first.startswith("# ") else ""
+    title = first[2:].strip() if first.startswith("# ") else ""
+    _MD_TITLES[path] = (sig, title)
+    return title
+
+
+_MD_TITLES: dict[str, tuple[tuple | None, str]] = {}
 
 
 def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
@@ -317,28 +335,61 @@ def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
     is taken just after `voxtype meeting start` returns, and voxtype's own start time
     can fall in the next or the previous minute (a file stamped 1532 for a meeting
     voxtype started at 15:33:00), so a neighbouring minute counts too when the file's
-    title is the meeting's. Files go out oldest first, so two meetings started in the same minute
-    each get their own."""
-    candidates: dict[str, list[tuple[float, str]]] = {}
+    title is the meeting's. Two meetings started in the same minute each get their own
+    (pick_md: the same rule as bmeet-ctl's pair_mds)."""
+    groups: dict[str, list[str]] = {}
     try:
         for entry in os.scandir(md_dir):
             m = MD_NAME.match(entry.name)
             if m and entry.is_file():
-                candidates.setdefault(m[1], []).append((entry.stat().st_mtime, entry.path))
+                groups.setdefault(m[1], []).append(entry.path)
     except OSError:
         return
-    for files in candidates.values():
-        files.sort()
-    chronological = sorted(meetings, key=lambda m: m.started_at)
+    for stamp, files in groups.items():
+        groups[stamp] = sorted(without_twins(files), key=lambda p: written_order(os.path.basename(p)))
+    titles = collections.Counter(m.title for m in meetings)
+    taken: set[str] = set()
     # exact minute, "the start took a moment", then a minute either side with the title
     for offset, by_title in ((0, False), (10, False), (-60, True), (60, True)):
-        for m in chronological:
-            if m.md_path is not None or not (files := candidates.get(minute_stamp(m.started_at + offset))):
-                continue
-            pick = next((f for f in files if not by_title or md_title(f[1]) == m.title), None)
-            if pick:
-                files.remove(pick)
-                m.md_path = pick[1]
+        for m in sorted(meetings, key=lambda m: m.started_at):
+            if m.md_path is None and (group := groups.get(minute_stamp(m.started_at + offset))):
+                if pick := pick_md(m.title, group, taken, titles, by_title, md_title, m.ended_at):
+                    taken.add(pick)
+                    m.md_path = pick
+
+
+def without_twins(paths: list[str]) -> list[str]:
+    """Leave out X-speakers.md next to X.md: the speaker pass's version of a transcript you
+    edited while it ran, which stays the meeting's copy. (Alone, it is the copy.)"""
+    names = {os.path.basename(p) for p in paths}
+    return [p for p in paths if not (p.endswith("-speakers.md")
+                                     and os.path.basename(p)[:-len("-speakers.md")] + ".md" in names)]
+
+
+def pick_md(title: str, group: list[str], taken: set[str], titles: collections.Counter, by_title: bool,
+            title_of, ended: int | None = None) -> str | None:
+    """A meeting's Markdown copy among the files of a minute (group, in the order written):
+    the one file of that minute with its title, if no other meeting (titles: how many have
+    each title) has it too; else (by_title: not at all) the first
+    written that is not taken, that no other meeting can claim by its title alone and,
+    named -meeting-EPOCH.md, that was written when this meeting ended (MD_WRITTEN_WITHIN of
+    `ended`: the toggle names it when the meeting stops). A title counts only when no other
+    file of the minute has it: on 2026-10-15 two meetings shared a recording, and both
+    copies got the second one's title. Modification times say nothing: the speaker pass
+    rewrites the files."""
+    named = [p for p in group if title_of(p) == title]
+    if len(named) == 1 and named[0] not in taken and titles[title] == 1:
+        return named[0]
+    if by_title:
+        return next((p for p in named if p not in taken), None)
+    others = {t for t, n in titles.items() if t != title and n == 1}  # (theirs alone)
+    return next((p for p in group if p not in taken and not (
+        title_of(p) in others and sum(title_of(q) == title_of(p) for q in group) == 1)
+        and not (ended and written_order(os.path.basename(p))[0]
+                 and abs(written_order(os.path.basename(p))[0] - ended) > MD_WRITTEN_WITHIN)), None)
+
+
+MD_WRITTEN_WITHIN = 600  # s: a -meeting-EPOCH.md copy is named when its meeting stops
 
 
 def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> list[Meeting]:
@@ -1479,7 +1530,7 @@ class MeetingsPage(ListDetailPage):
         self.live_sig: tuple | None = None        # ... as last shown
         self.follow: str | None = None            # a meeting that just started: select it once listed
         self.polled = False
-        self.speakers_pending: set[str] = set()   # start stamps of running speaker passes
+        self.speakers_pending: set[str] = set()   # running speaker passes (pass_running)
         self.error: str | None = None
         self._req = 0
         self._index_queue: list[str] = []
@@ -1579,11 +1630,22 @@ class MeetingsPage(ListDetailPage):
         text = " · ".join(parts)
         text += "\n" + (f"Markdown copy: {tilde(m.md_path)}" if m.md_path
                         else "From voxtype's meeting database (no Markdown copy)")
-        if m.stamps() & self.speakers_pending:
+        if self.pass_running(m):
             text += "\nTelling the speakers apart… the transcript is replaced when that is done."
         if self.is_live(m) and self.live_md:
             text += "\nLive: transcribed as people talk; in italics, what is still being said"
         return text
+
+    def pass_running(self, m: Meeting) -> bool:
+        """Is the speaker pass working on this meeting? (bmeet-ctl's speakers_pending: the
+        transcripts being replaced, or start stamps from markers that name none)"""
+        if self.is_live(m):  # (its pass starts when it stops)
+            return False
+        names = {Path(p).name for p in self.speakers_pending}  # (one folder: names are enough)
+        if m.md_path and Path(m.md_path).name in names or m.stamps() & self.speakers_pending:
+            return True
+        # no copy yet (the export failed): it may be the one the pass is going to write
+        return bool(not m.md_path and m.ended_at and m.stamps() & {n[:15] for n in names})
 
     def set_speakers_pending(self, pending: set[str]) -> None:
         self.speakers_pending = pending
@@ -1592,7 +1654,7 @@ class MeetingsPage(ListDetailPage):
             self.update_names_action(m)
 
     def update_names_action(self, m: Meeting) -> None:
-        busy = self.is_live(m) or bool(m.stamps() & self.speakers_pending)
+        busy = self.is_live(m) or self.pass_running(m)
         has_people = bool(m.md_path and md_speakers(self.texts.get(m.md_path) or ""))
         self.act_names.setEnabled(has_people and not busy)
         self.act_names.setToolTip(
@@ -1610,7 +1672,7 @@ class MeetingsPage(ListDetailPage):
 
     def name_speakers(self) -> None:
         m = self.current()
-        if m is None or not m.md_path or self.is_live(m) or m.stamps() & self.speakers_pending:
+        if m is None or not m.md_path or self.is_live(m) or self.pass_running(m):
             return
         text = read_text(m.md_path)
         speakers = md_speakers(text or "")

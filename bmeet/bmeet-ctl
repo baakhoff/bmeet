@@ -34,7 +34,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
@@ -163,16 +163,65 @@ def db() -> sqlite3.Connection | None:
 
 
 def meeting_md(started_at: int, title: str = "") -> str | None:
-    """Markdown copy written by voxtype-meeting-toggle, named YYYY-MM-DD_HHMM-meeting*.md
-    after the start minute. voxtype's own start time can be a few seconds off that, so a
-    minute either side counts too when the file's "# Title" is the meeting's (as in the app)."""
+    """The Markdown copy of one meeting (pair_mds)."""
+    return pair_mds([(None, started_at, title)]).get(None)
+
+
+def pair_mds(meetings: list[tuple]) -> dict:
+    """{key: Markdown copy} for (key, started_at, title[, ended_at]) meetings. voxtype-meeting-toggle
+    names the copy after the start minute, YYYY-MM-DD_HHMM-meeting.md (-EPOCH added for a
+    later meeting of the same minute). voxtype's own start time can be a few seconds off
+    that, so a minute either side counts too when the file's "# Title" is the meeting's. Of
+    a minute's files: the one with the meeting's title, if no other file of that minute and no
+    other meeting has it; else the first written that no other meeting claims by its title alone (the same
+    rule as the app's pick_md: on 2026-10-15 two meetings shared a recording, and both copies
+    got the second one's title), and a -meeting-EPOCH.md copy only for a meeting that ended
+    then (the toggle names it when the meeting stops)."""
     import time
+    titles = [m[2] for m in meetings]
+    found: dict = {}
+    taken: set[str] = set()
     for offset, by_title in ((0, False), (10, False), (-60, True), (60, True)):
-        stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at + offset))
-        for p in sorted(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")):
-            if not by_title or (title and md_title(p) == title):
-                return str(p)
-    return None
+        for key, started_at, title, *more in sorted(meetings, key=lambda m: m[1]):
+            ended = more[0] if more else None
+            if key in found:
+                continue
+            stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at + offset))
+            group = [str(p) for p in sorted(without_twins(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")),
+                                            key=written_order)]
+            named = [p for p in group if md_title(p) == title]
+            if len(named) == 1 and named[0] not in taken and titles.count(title) == 1:
+                pick = named[0]
+            elif by_title:
+                pick = next((p for p in named if p not in taken), None)
+            else:
+                pick = next((p for p in group if p not in taken and not (
+                    md_title(p) != title and titles.count(md_title(p)) == 1
+                    and sum(md_title(q) == md_title(p) for q in group) == 1)
+                    and not (ended and written_order(p)[0] and abs(written_order(p)[0] - ended) > 600)), None)
+            if pick:
+                found[key] = pick
+                taken.add(pick)
+    return found
+
+
+def without_twins(paths) -> list:
+    """Leave out X-speakers.md next to X.md: the speaker pass's version of a transcript you
+    edited while it ran, which stays the meeting's copy. (Alone, it is the copy.)"""
+    paths = list(paths)
+    names = {Path(p).name for p in paths}
+    return [p for p in paths if not (Path(p).name.endswith("-speakers.md")
+                                     and Path(p).name[:-len("-speakers.md")] + ".md" in names)]
+
+
+def written_order(path) -> tuple[int, int, str]:
+    """YYYY-MM-DD_HHMM-meeting.md before -meeting-EPOCH.md (the toggle never overwrites: a
+    later meeting of the same minute gets the time it stopped), not by modification time,
+    which the speaker pass changes. Anything else after its own (-meeting-speakers.md: the
+    speaker pass's version of a transcript you were editing, which stays the copy)."""
+    name = Path(path).name
+    m = re.search(r"-meeting(?:-(\d+))?(\.md|-.*\.md)$", name)
+    return (int(m[1] or 0), m[2] != ".md", name) if m else (0, 1, name)
 
 
 def md_title(path) -> str:
@@ -185,18 +234,24 @@ def md_title(path) -> str:
 
 
 def speakers_pending() -> list[str]:
-    """Start stamps (YYYY-MM-DD_HHMM, as in the Markdown file names) of meetings whose
-    speaker pass is running. voxtype-meeting-toggle marks their recording with a
-    "speaker-pass" file; the pass deletes the folder when it ends."""
+    """The meetings whose speaker pass is running: the Markdown copy each one will replace
+    (voxtype-meeting-toggle marks the recording with a "speaker-pass" file that names it; the
+    pass deletes the folder when it ends), or, for a marker that names none (before 0.8.1),
+    the start stamp YYYY-MM-DD_HHMM, as in the Markdown file names: the first 15 characters of
+    the recording's name (a second recording of a minute is named ..._HHMM-2)."""
+    pending = set()
     try:
-        return sorted(d.name for d in AUDIO_DIR.iterdir() if (d / "speaker-pass").exists())
+        for d in AUDIO_DIR.iterdir():
+            if (d / "speaker-pass").exists():
+                pending.add(read_first_line(d / "speaker-pass") or d.name[:15])
     except OSError:
         return []
+    return sorted(pending)
 
 
 def live_transcript() -> str | None:
     """The running meeting's live transcript (npu-transcribe --live; see voxtype-meeting-toggle):
-    live.md in its recording, named after the start stamp the toggle keeps in meeting-toggle.started."""
+    live.md in its recording, whose name the toggle keeps in meeting-toggle.started."""
     stamp = read_first_line(RUN / "meeting-toggle.started")
     path = AUDIO_DIR / stamp / "live.md" if re.fullmatch(r"[\w-]+", stamp) else None
     return str(path) if path and path.is_file() else None
@@ -235,12 +290,18 @@ def recent(limit: int) -> list[dict]:
     items: list[dict] = []
     con = db()
     if con:
-        for r in con.execute("SELECT id, title, started_at, duration_secs, status FROM meetings "
-                             "ORDER BY started_at DESC LIMIT ?", (limit,)):
+        rows = con.execute("SELECT id, title, started_at, ended_at, duration_secs, status FROM meetings "
+                           "ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        # (the meetings just before the oldest listed can share its minute: they claim copies too)
+        before = con.execute("SELECT id, title, started_at, ended_at FROM meetings WHERE started_at >= ? "
+                             f"AND id NOT IN ({','.join('?' * len(rows))})",
+                             [rows[-1]["started_at"] - 120] + [r["id"] for r in rows]).fetchall() if rows else []
+        con.close()
+        paths = pair_mds([(r["id"], r["started_at"], r["title"] or "", r["ended_at"]) for r in rows + before])
+        for r in rows:
             items.append({"kind": "meeting", "id": r["id"], "title": r["title"] or "Meeting",
                           "time": r["started_at"], "duration": r["duration_secs"],
-                          "status": r["status"], "path": meeting_md(r["started_at"], r["title"] or "")})
-        con.close()
+                          "status": r["status"], "path": paths.get(r["id"])})
     try:
         lines = FILE_HISTORY.read_text().splitlines()[-limit * 2:]
     except OSError:

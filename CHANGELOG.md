@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-10-15
+
+### Fixed
+- **A meeting started in the same minute as the one before lost its speaker pass and its live transcript:** each meeting's recording was named after its start minute. Stopping a meeting and starting the next at once (on 2026-10-15, a meeting and then an in-person one, both at 11:35) put the second recording into the first one's folder; when the first one's speaker pass ended, it deleted that folder, the second recording with it. The second meeting kept only voxtype's own transcript (everyone under *You* in person), and its audio was lost. Now a minute whose recording is still there gives the next one `-2`, `-3`, … (`voxtype-meeting-toggle`), and the first pass also no longer reads the second meeting's settings.
+- **Two meetings of one minute could swap transcripts in the app:** the app paired them with their Markdown copies by modification time, which the speaker pass changes. Now a copy goes to the meeting with its title when no other copy of that minute has that title, and otherwise in the order the copies were written (a later one is named `-meeting-EPOCH.md`); a meeting never gets a copy another meeting can claim by its title, nor a `-meeting-EPOCH.md` copy written long after it ended. On 2026-10-15 both copies got the second meeting's title (the first pass read the second meeting's settings), and they still pair right. The widget's recent list uses the same rule.
+- **Two normal meetings started in one minute shared voxtype's own copy:** voxtype keeps a meeting's files in a folder named after its date and title, and the titles only go down to the minute ("Meeting 2026-10-15 11:35"). The second meeting overwrote the first one's transcript there, and deleting one in the app deleted the other's. A title voxtype already has now gets " (2)", " (3)", …
+- **"Telling the speakers apart…" on the wrong meeting:** the speaker pass's marker now names the transcript it replaces, so only that meeting shows as busy, not every meeting of its start minute (a meeting without a copy yet: by its start minute, as before).
+
+### Tests
+- **`voxtype/tests/test_meeting_toggle.py`** (in CI): the meeting toggle itself, with stand-ins for voxtype, systemd and the clock: one meeting, two in one minute with the first speaker pass ending while the second records, three in one minute (titles), and a minute whose pass is still stopping. The app's tests pair same-minute copies in both the app and bmeet-ctl, including the 2026-10-15 shape.
+
 ## [0.8.0] - 2026-10-14
 
 See the text while you dictate: a prototype, off by default.
@@ -202,6 +213,8 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[0.8.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.1
+[0.8.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.0
 [0.7.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.1
 [0.7.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.0
 [0.6.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.6.0

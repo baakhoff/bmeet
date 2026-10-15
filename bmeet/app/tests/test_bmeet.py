@@ -308,6 +308,112 @@ class A_DataTests(unittest.TestCase):
         vn.assign_meeting_mds([m2, m3, m1], d)
         self.assertEqual((m1.md_path, m2.md_path, m3.md_path), (str(first), str(second), None))
 
+    def test_assign_same_minute_after_the_pass(self):
+        """A meeting stopped and the next started at once (2026-10-15): the first one's speaker
+        pass rewrote its file after the second one's was written, so modification times
+        no longer tell them apart; a title does only when no other file of that minute has it,
+        else the order they were written in. The app and bmeet-ctl (the widget) agree."""
+        d = WORK / "same-minute-2"
+        d.mkdir(exist_ok=True)
+        t0 = epoch(2026, 10, 15, 11, 35, 27)
+        stamp = minute_stamp(t0)
+        short, room = d / f"{stamp}-meeting.md", d / f"{stamp}-meeting-{t0 + 2500}.md"
+        theirs = d / f"{stamp}-meeting-speakers.md"            # the pass's version of an edited copy
+        theirs2 = d / f"{stamp}-meeting-{t0 + 2500}-speakers.md"
+        first, second = "Meeting 2026-10-15 11:35", "In-person meeting 2026-10-15 11:35"
+        cases = [  # (file -> its title; None: no such file), meetings' titles, expected copies
+            ({short: first, room: second}, (first, second), (short, room)),
+            ({short: second, room: first}, (first, second), (room, short)),    # titles say which
+            ({short: second, room: second}, (first, second), (short, room)),   # 2026-10-15 itself
+            ({short: first, room: first}, (first, first), (short, room)),      # written order
+            ({short: None, room: second}, (first, second), (None, room)),      # not the next one's
+            ({short: first, room: second, theirs: first}, (first, second), (short, room)),
+            ({short: None, room: first}, (first, first), (room, None)),        # (ends unknown)
+            ({short: None, room: first}, (first, first, 10, 2500), (None, room)),  # its end says whose
+            ({short: first, theirs: first, room: second, theirs2: second}, (first, second), (short, room)),
+            ({short: first, theirs: first, room: first, theirs2: first}, (first, first), (short, room)),
+            ({short: first, theirs: first}, (first, second), (short, None)),   # still recording: not the twin
+            ({short: "Budget review", theirs: first}, (first, second), (short, None)),  # you renamed it
+            ({short: None, theirs: first}, (first, second), (theirs, None)),   # the twin alone is the copy
+        ]
+        for files, (ta, tb, *ends), want in cases:
+            for f in (short, room, theirs, theirs2):
+                f.unlink(missing_ok=True)
+            for i, (f, title) in enumerate(files.items()):
+                if title is not None:
+                    f.write_text(f"# {title}\n")
+                    os.utime(f, (t0 + 2600 - i, t0 + 2600 - i))   # (the first one rewritten last)
+            ea, eb = (t0 + ends[0], t0 + ends[1]) if ends else (None, None)
+            a, b = vn.Meeting("a", ta, t0, ended_at=ea), vn.Meeting("b", tb, t0 + 12, ended_at=eb)
+            vn.assign_meeting_mds([b, a], d)
+            self.assertEqual((a.md_path, b.md_path), tuple(str(x) if x else None for x in want), files)
+            saved, vn.ctl.MEETING_MD_DIR = vn.ctl.MEETING_MD_DIR, d
+            try:
+                got = vn.ctl.pair_mds([("a", t0, ta, ea), ("b", t0 + 12, tb, eb)])
+            finally:
+                vn.ctl.MEETING_MD_DIR = saved
+            self.assertEqual((got.get("a"), got.get("b")), (a.md_path, b.md_path), files)
+        for f in (short, room, theirs, theirs2):
+            f.unlink(missing_ok=True)
+
+    def test_pass_running_on_the_right_meeting(self):
+        """The marker names the transcript its pass replaces: the other meeting of the minute
+        is not busy meanwhile. A marker that names none (before 0.8.1): the minute's meetings."""
+        stamp = "2026-10-15_1135"
+        page = vn.MeetingsPage.__new__(vn.MeetingsPage)
+        page.live_id, page.live_state = None, "idle"
+        a = vn.Meeting("a", "A", 0, md_path=f"/x/{stamp}-meeting.md")
+        b = vn.Meeting("b", "B", 0, md_path=f"/x/{stamp}-meeting-1792059436.md")
+        page.speakers_pending = {b.md_path}
+        self.assertEqual((vn.MeetingsPage.pass_running(page, a), vn.MeetingsPage.pass_running(page, b)), (False, True))
+        page.speakers_pending = {stamp}
+        self.assertEqual((vn.MeetingsPage.pass_running(page, a), vn.MeetingsPage.pass_running(page, b)), (True, True))
+        page.speakers_pending = {f"/x/./{stamp}-meeting-1792059436.md"}   # (spelt another way)
+        self.assertTrue(vn.MeetingsPage.pass_running(page, b))
+        # no copy yet (the export failed): the one the pass is going to write is of its minute
+        t = epoch(2026, 10, 15, 11, 35, 27)
+        c = vn.Meeting("c", "C", t, ended_at=t + 600)
+        page.speakers_pending = {f"/x/{stamp}-meeting.md"}
+        self.assertTrue(vn.MeetingsPage.pass_running(page, c))
+        page.speakers_pending = {"/x/2026-10-15_1210-meeting.md"}
+        self.assertFalse(vn.MeetingsPage.pass_running(page, c))
+        # ... but not the next meeting of that minute, still recording (its pass comes later)
+        d = vn.Meeting("d", "D", t + 12)
+        page.speakers_pending, page.live_id, page.live_state = {f"/x/{stamp}-meeting.md"}, "d", "recording"
+        self.assertFalse(vn.MeetingsPage.pass_running(page, d))
+        page.live_state = "idle"                   # (stopping: not live any more, not ended yet)
+        self.assertFalse(vn.MeetingsPage.pass_running(page, d))
+        page.live_state, page.speakers_pending = "recording", {stamp}   # an old marker: still not while live
+        self.assertFalse(vn.MeetingsPage.pass_running(page, d))
+
+    def test_widget_recent_pairs_past_its_limit(self):
+        """bmeet-ctl recent (the widget): the oldest meeting listed must not get the copy of a
+        meeting of the same minute that is just past the list's end."""
+        d = WORK / "recent-limit"
+        d.mkdir(exist_ok=True)
+        t0 = epoch(2026, 10, 15, 11, 35, 27)
+        stamp = minute_stamp(t0)
+        mine, first = d / f"{stamp}-meeting-{t0 + 2500}.md", d / f"{stamp}-meeting.md"
+        first.write_text("# Meeting 2026-10-15 11:35\n")
+        mine.write_text("# Meeting 2026-10-15 11:35\n")   # (a pair from before 0.8.1: one title)
+        db = d / "index.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, started_at INTEGER, ended_at INTEGER, "
+                    "duration_secs INTEGER, status TEXT)")
+        con.executemany("INSERT INTO meetings VALUES (?, ?, ?, ?, ?, 'completed')", [
+            ("a", "Meeting 2026-10-15 11:35", t0, t0 + 10, 10),
+            ("b", "Meeting 2026-10-15 11:35", t0 + 12, t0 + 2500, 2488),
+            ("c", "Later", t0 + 9000, t0 + 9600, 600)])
+        con.commit()
+        con.close()
+        saved = vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY
+        vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY = d, db, d / "none.jsonl"
+        try:
+            items = vn.ctl.recent(2)
+        finally:
+            vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY = saved
+        self.assertEqual([(i["id"], i["path"]) for i in items], [("c", None), ("b", str(mine))])
+
     def test_assign_neighbouring_minute_by_title(self):
         # The toggle stamped the file 15:32; voxtype said the meeting started at 15:33:00.
         d = WORK / "next-minute"
@@ -483,8 +589,11 @@ class A_DataTests(unittest.TestCase):
         (audio / "2026-10-12_1041").mkdir(parents=True)               # still recording
         (audio / "2026-10-12_0900").mkdir()
         (audio / "2026-10-12_0900" / "speaker-pass").touch()          # pass running
-        try:
-            self.assertEqual(vn.ctl.status()["speakers_pending"], ["2026-10-12_0900"])
+        (audio / "2026-10-12_1041-2").mkdir()                         # a second one that minute,
+        (audio / "2026-10-12_1041-2" / "speaker-pass").write_text("/m/2026-10-12_1041-meeting-9.md\n")
+        try:                                                          # (its marker names its transcript)
+            self.assertEqual(vn.ctl.status()["speakers_pending"],
+                             ["/m/2026-10-12_1041-meeting-9.md", "2026-10-12_0900"])
         finally:
             shutil.rmtree(audio)
 

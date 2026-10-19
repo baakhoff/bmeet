@@ -121,7 +121,7 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {
@@ -178,6 +178,7 @@ DIARIZATION_MODEL = SPEAKER_MODELS / "nemotron-3-diarization"   # embedder.xml, 
 USE_PYANNOTE = os.environ.get("NPU_DIARIZATION") == "pyannote"  # the old way: to compare, or a way out
 SEGMENTATION_MODEL = SPEAKER_MODELS / "pyannote-segmentation-3-0.onnx"
 EMBEDDING_MODEL = SPEAKER_MODELS / "nemo_en_titanet_small.onnx"  # NVIDIA TitaNet-small, CC-BY-4.0
+TITANET_COREML = lambda: EMBEDDING_MODEL.with_name("titanet.mlmodelc")  # noqa: E731  (macOS: its Core ML build)
 VOICE_ACTIVE = 0.5            # Nemotron: a voice talks where its probability is above this
 # Over a long recording Nemotron's speaker cache now and then opens a second voice for someone
 # (a 99 min podcast: the host as two voices, 0.92 alike; an AMI meeting: 0.89). Voices whose
@@ -1080,8 +1081,7 @@ class Turn:
 
 def speaker_models_missing() -> list[Path]:
     if MAC:  # Core ML builds (folders) of macos/prepare-coreml; no pyannote (see load_coreml)
-        return [p for p in (SPEAKER_MODELS / "titanet.mlmodelc", DIARIZATION_MODEL / "encoder.mlmodelc")
-                if not p.exists()]
+        return [p for p in (TITANET_COREML(), DIARIZATION_MODEL / "encoder.mlmodelc") if not p.exists()]
     who = SEGMENTATION_MODEL if USE_PYANNOTE else DIARIZATION_MODEL / "encoder.xml"
     return [p for p in (EMBEDDING_MODEL, who) if not p.is_file()
             and not (p == who and SEGMENTATION_MODEL.is_file())]   # (pyannote: before 0.6.0)
@@ -1129,7 +1129,7 @@ class SpeakerModels:
         if USE_PYANNOTE:
             raise RuntimeError("NPU_DIARIZATION=pyannote is not available on macOS")
         self.nemotron = Nemotron.coreml(devices)
-        self.emb, self.device = coreml_net(SPEAKER_MODELS / "titanet.mlmodelc", devices, "TitaNet-small")
+        self.emb, self.device = coreml_net(TITANET_COREML(), devices, "TitaNet-small")
         self.emb_out = "embs"
 
     def load_openvino(self, devices: list[str]) -> None:
@@ -2740,7 +2740,12 @@ def transcribe_meeting(args: argparse.Namespace, engines: Engines, gen_kwargs: d
 LIVE_TICK = 0.5           # seconds between looks at the recording
 LIVE_FRAME = SAMPLE_RATE // 10  # sound is measured per 100 ms (as in echo_gain)
 LIVE_NOISE = 300          # a track's background noise: the quietest tenth of its last 300 frames
-LIVE_SNR = 12.0           # sound: this many dB above that noise (and above SILENCE_DBFS)
+LIVE_SNR = 12.0           # sound: this many dB above that noise (and above SILENCE_DBFS) ...
+# ... and anything this loud is sound whatever the noise seems to be: in the first seconds of a
+# dictation or a phrase there may be no quiet to measure the noise in, and then the quietest tenth
+# is speech. Clean speech (-13..-17 dBFS) then fell under that "noise" + 12 dB (-12.7 dBFS), a
+# pause was heard in the middle of a sentence, and its words were lost (macOS, 2026-10-20).
+LIVE_SPEECH_DBFS = -30.0
 LIVE_PAUSE = 0.8          # a phrase ends after this much quiet ...
 LIVE_LONGEST = 20.0       # ... or is cut at its quietest moment when it gets this long
 LIVE_PAD = 0.3            # audio kept on both sides of a phrase
@@ -2859,7 +2864,7 @@ class LiveTrack:
         self.rms = np.concatenate([self.rms, frame_rms(self.audio(base, first * LIVE_FRAME, n * LIVE_FRAME),
                                                        LIVE_FRAME)])
         level = 20 * np.log10(np.maximum(self.rms[max(0, n - LIVE_NOISE):], 1e-10))
-        threshold = max(SILENCE_DBFS, float(np.percentile(level, 10)) + LIVE_SNR)
+        threshold = max(SILENCE_DBFS, min(float(np.percentile(level, 10)) + LIVE_SNR, LIVE_SPEECH_DBFS))
         pad, pause = int(LIVE_PAD * SAMPLE_RATE), int(LIVE_PAUSE * SAMPLE_RATE)
         loud = lambda i: (20 * math.log10(max(self.rms[i], 1e-10)) >= threshold
                           and (echo is None or i >= echo.size or self.rms[i] >= echo[i]))
@@ -3288,7 +3293,8 @@ class Dictation:
         if n == 0:
             return
         level = 20 * np.log10(np.maximum(self.rms, 1e-10))
-        threshold = max(SILENCE_DBFS, float(np.percentile(level[-LIVE_NOISE:], 10)) + LIVE_SNR)
+        threshold = max(SILENCE_DBFS, min(float(np.percentile(level[-LIVE_NOISE:], 10)) + LIVE_SNR,
+                                          LIVE_SPEECH_DBFS))
         start = self.frozen // LIVE_FRAME
         loud = np.flatnonzero(level[start:] >= threshold)
         self.sound = max(self.frozen, (start + int(loud[-1]) + 1) * LIVE_FRAME) if loud.size else self.frozen

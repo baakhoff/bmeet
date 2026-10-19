@@ -25,6 +25,10 @@ BMEET_SOCKET, BMEET_DEBUG=1, BMEET_DRY_RUN=1 (log instead of
 recording, starting meetings, switching language, opening files/folders,
 notifying), plus bmeet-ctl's BMEET_MEETING_DB, BMEET_RUN_DIR,
 VOXTYPE_MEETING_DIR and NPU_TRANSCRIBE_HISTORY.
+
+On macOS the same window runs inside BMeet.app (Contents/Helpers/BMeet Window.app, on BMeet's
+venv PyQt6): BMeet.app dictates and macos/bmeet-meeting records meetings, so its actions go
+through bmeet-ctl to BMeet.app, and exports and deletes through bmeet-meeting.
 """
 from __future__ import annotations
 
@@ -47,6 +51,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # importing bmeet-ctl must not drop a __pycache__ next to it
+MAC = sys.platform == "darwin" and os.environ.get("BMEET_PLATFORM") != "linux"   # (tests: Linux on a Mac)
+if MAC:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "macos"))
+    import bmeetmac  # noqa: E402
+    bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder; Homebrew in PATH
 
 from PyQt6.QtCore import (QDateTime, QFile, QLocale, QMimeDatabase, QObject,  # noqa: E402
                           QProcess, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal)
@@ -60,10 +69,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                              QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-                             QStackedWidget, QTextBrowser, QTextEdit, QToolBar, QToolButton,
+                             QStackedWidget, QStyle, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
@@ -76,6 +85,10 @@ DEBUG = bool(os.environ.get("BMEET_DEBUG"))
 DRY_RUN = bool(os.environ.get("BMEET_DRY_RUN"))
 CTL_PATH = Path(os.environ.get("BMEET_CTL") or APP_FILE.parent.parent / "bmeet-ctl")
 VOXTYPE = os.environ.get("BMEET_VOXTYPE") or "voxtype"
+# macOS: meetings are BMeet's own (macos/bmeet-meeting, the voxtype meeting commands BMeet uses)
+MEETING_CMD = [sys.executable, "-I", str(APP_FILE.parents[2] / "macos/bmeet-meeting")] if MAC else [VOXTYPE]
+ENGINE = "BMeet" if MAC else "voxtype"   # who records, in messages
+ENGINE_TITLE = "BMeet" if MAC else "Voxtype"   # ... at the start of a sentence
 COLORS = {"red": "#da4453", "orange": "#f67400", "green": "#27ae60", "blue": "#3daee9",
           "gray": "#7f8c8d"}
 KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -207,6 +220,21 @@ def pid_alive(pid: int | None) -> bool:
     """True while `pid` runs (zombies count as gone)."""
     if not pid:
         return False
+    if not os.path.isdir("/proc"):   # macOS: no /proc
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:   # our child, and it has ended (now reaped)
+                return False
+        except ChildProcessError:   # (not our child: detached)
+            pass
+        except OSError:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
@@ -415,7 +443,8 @@ def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> li
 
 
 def export_cmd(meeting_id: str, fmt: str = "markdown", output: str | None = None) -> list[str]:
-    cmd = [VOXTYPE, "meeting", "export", "--format", fmt, "--timestamps", "--speakers", "--metadata"]
+    cmd = (MEETING_CMD[:] if MAC else [VOXTYPE, "meeting"]) + ["export", "--format", fmt, "--timestamps",
+                                                              "--speakers", "--metadata"]
     if output:
         cmd += ["--output", output]
     return cmd + ["--", meeting_id]
@@ -924,6 +953,8 @@ def show_in_folder(path: str) -> None:
     debug("show-in-folder" + (" (dry run)" if DRY_RUN else ""), path)
     if DRY_RUN:
         return
+    if MAC and bmeetmac.reveal(Path(path)):   # Finder
+        return
     try:
         from PyQt6.QtDBus import QDBusConnection, QDBusMessage
         msg = QDBusMessage.createMethodCall("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
@@ -943,6 +974,11 @@ def move_to_trash(path: str) -> bool:
 
 
 def notify(summary: str, body: str, icon: str = "view-media-lyrics") -> None:
+    if MAC:
+        debug("notify", summary, body)
+        if not DRY_RUN:
+            bmeetmac.notify(summary, body)
+        return
     run_detached(["notify-send", f"--app-name={APP_NAME}", f"--icon={icon}", summary, body])
 
 
@@ -951,6 +987,29 @@ def icon(name: str, *fallbacks: str) -> QIcon:
         if QIcon.hasThemeIcon(n):
             return QIcon.fromTheme(n)
     return QIcon.fromTheme(name)
+
+
+# macOS has no freedesktop icon theme: the standard icons Qt draws itself stand in for the
+# theme icons the window uses (on Linux the theme has them, so this changes nothing there).
+THEME_FALLBACKS = {
+    "document-open": "SP_DialogOpenButton", "edit-delete": "SP_TrashIcon", "list-remove": "SP_DialogDiscardButton",
+    "edit-find": "SP_FileDialogContentsView", "media-playback-start": "SP_MediaPlay",
+    "media-playback-stop": "SP_MediaStop", "media-playback-pause": "SP_MediaPause",
+    "document-save": "SP_DialogSaveButton", "document-export": "SP_DialogSaveButton",
+    "edit-copy": "SP_FileDialogDetailedView", "folder-open": "SP_DirOpenIcon", "view-refresh": "SP_BrowserReload",
+    "dialog-warning": "SP_MessageBoxWarning", "dialog-error": "SP_MessageBoxCritical",
+    "dialog-information": "SP_MessageBoxInformation", "meeting-attending": "SP_ComputerIcon",
+    "view-media-lyrics": "SP_FileIcon", "document-import": "SP_ArrowDown", "audio-input-microphone": "SP_MediaVolume",
+}
+if MAC:
+    _from_theme = QIcon.fromTheme
+
+    def _theme_or_standard(name: str, *rest) -> QIcon:
+        found = _from_theme(name, *rest)
+        if found.isNull() and name in THEME_FALLBACKS and QApplication.instance() is not None:
+            return QApplication.style().standardIcon(getattr(QStyle.StandardPixmap, THEME_FALLBACKS[name]))
+        return found
+    QIcon.fromTheme = staticmethod(_theme_or_standard)
 
 
 def message_html(title: str, body: str = "", kind: str = "info") -> str:
@@ -1536,7 +1595,7 @@ class MeetingsPage(ListDetailPage):
         self._index_queue: list[str] = []
         self._index_busy = False
         self.act_refresh = self.add_action("view-refresh", "Reload", lambda: self.show_current_force(),
-                                           "Load the transcript again from voxtype")
+                                           f"Load the transcript again from {ENGINE}")
         self.act_copy = self.add_action("edit-copy", "Copy all", self.copy_text,
                                         "Copy the whole transcript (Markdown) to the clipboard")
         self.act_export = self.add_action("document-export", "Export…", self.export,
@@ -1547,7 +1606,7 @@ class MeetingsPage(ListDetailPage):
                                          "Put names on Person 1, Person 2, …; optionally recognise "
                                          "them by voice in later meetings")
         self.act_delete = self.add_action("edit-delete", "Delete…", self.delete,
-                                          "Delete this meeting from voxtype", QKeySequence.StandardKey.Delete)
+                                          f"Delete this meeting from {ENGINE}", QKeySequence.StandardKey.Delete)
 
     def is_live(self, m: Meeting) -> bool:
         return m.id == self.live_id and self.live_state in ("recording", "paused")
@@ -1629,7 +1688,7 @@ class MeetingsPage(ListDetailPage):
             parts.append(Path(m.model).name)
         text = " · ".join(parts)
         text += "\n" + (f"Markdown copy: {tilde(m.md_path)}" if m.md_path
-                        else "From voxtype's meeting database (no Markdown copy)")
+                        else f"From {ENGINE}'s meeting database (no Markdown copy)")
         if self.pass_running(m):
             text += "\nTelling the speakers apart… the transcript is replaced when that is done."
         if self.is_live(m) and self.live_md:
@@ -1713,7 +1772,7 @@ class MeetingsPage(ListDetailPage):
         self.update_names_action(m)
         self.act_delete.setEnabled(not live)
         self.act_delete.setToolTip("Stop the meeting before deleting it" if live
-                                   else "Delete this meeting from voxtype")
+                                   else f"Delete this meeting from {ENGINE}")
         self.load_body(m, live)
 
     def show_current_force(self) -> None:
@@ -1738,7 +1797,7 @@ class MeetingsPage(ListDetailPage):
             return
         self.current_text = ""
         self.act_copy.setEnabled(False)
-        self.view.show_message(message_html("Loading the transcript…", "voxtype meeting export", "busy"))
+        self.view.show_message(message_html("Loading the transcript…", f"{ENGINE} meeting export", "busy"))
 
         def done(code: int, out: str, err: str) -> None:
             if code == 0:
@@ -1751,8 +1810,8 @@ class MeetingsPage(ListDetailPage):
             else:
                 self.view.show_message(message_html(
                     "Could not load the transcript",
-                    (err.strip() or f"voxtype exited with status {code}")
-                    + ("\n\nIs the voxtype daemon running?" if code == -1 else ""), "error"))
+                    (err.strip() or f"{ENGINE} exited with status {code}")
+                    + (f"\n\nIs the {ENGINE} daemon running?" if code == -1 else ""), "error"))
         run_command(self, export_cmd(m.id), done, timeout_ms=60_000)
 
     def show_live(self, first: bool = False) -> None:
@@ -1873,7 +1932,7 @@ class MeetingsPage(ListDetailPage):
             if code == 0:
                 self.main.message(f"Exported to {tilde(path)}")
             else:
-                self.main.error_box("Export failed", err.strip() or f"voxtype exited with status {code}")
+                self.main.error_box("Export failed", err.strip() or f"{ENGINE} exited with status {code}")
         run_command(self, export_cmd(meeting_id, fmt, path), done, timeout_ms=60_000)
         return path
 
@@ -1890,7 +1949,7 @@ class MeetingsPage(ListDetailPage):
         """(delete?, also trash the Markdown copy?)"""
         box = QMessageBox(QMessageBox.Icon.Warning, "Delete meeting",
                           f"Delete “{m.title}” ({fmt_date(m.started_at)})?", parent=self)
-        box.setInformativeText("The meeting and its transcript are removed from voxtype's "
+        box.setInformativeText(f"The meeting and its transcript are removed from {ENGINE}'s "
                                "database. This cannot be undone.")
         cb = None
         if m.md_path and os.path.isfile(m.md_path):
@@ -1912,7 +1971,7 @@ class MeetingsPage(ListDetailPage):
 
         def done(code: int, _out: str, err: str) -> None:
             if code != 0:
-                self.main.error_box("Delete failed", err.strip() or f"voxtype exited with status {code}")
+                self.main.error_box("Delete failed", err.strip() or f"{ENGINE} exited with status {code}")
                 return
             self.export_cache.pop(m.id, None)
             if m.md_path:  # its voice fingerprints, if any (remembered names stay)
@@ -1926,7 +1985,8 @@ class MeetingsPage(ListDetailPage):
             self.main.message(text)
             self.reload()
             self.main.update_counts()
-        run_command(self, [VOXTYPE, "meeting", "delete", "--force", "--", m.id], done, timeout_ms=60_000)
+        cmd = MEETING_CMD + ["delete"] if MAC else [VOXTYPE, "meeting", "delete"]
+        run_command(self, cmd + ["--force", "--", m.id], done, timeout_ms=60_000)
 
     def select_md(self, path: str) -> bool:
         p = os.path.abspath(path)
@@ -2604,7 +2664,10 @@ def is_video(path: str) -> bool:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.settings = QSettings(APP_ID, APP_ID)
+        # (on a Mac too in ~/.config/bmeet/bmeet.conf, as on Linux, not in ~/Library/Preferences)
+        self.settings = QSettings(str(Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / APP_ID
+                                      / f"{APP_ID}.conf"), QSettings.Format.IniFormat) \
+            if sys.platform == "darwin" else QSettings(APP_ID, APP_ID)
         self.force_quit = False
         self.status: dict | None = None
         self._status_error = CTL_ERROR
@@ -2620,9 +2683,9 @@ class MainWindow(QMainWindow):
 
         self._build_toolbar()
         self.daemon_banner = Banner("warning")
-        self.daemon_banner.text.setText("Voxtype is not running: dictation and meeting recording are "
-                                        "unavailable.")
-        self.start_daemon_btn = self.daemon_banner.add_button("Start voxtype", self.start_daemon,
+        self.daemon_banner.text.setText(f"{ENGINE_TITLE} is not running: dictation and meeting "
+                                        "recording are unavailable.")
+        self.start_daemon_btn = self.daemon_banner.add_button(f"Start {ENGINE}", self.start_daemon,
                                                               "media-playback-start")
         self.ctl_banner = Banner("error")
         self.ctl_banner.text.setText(f"Live status is unavailable: {CTL_ERROR}" if CTL_ERROR else "")
@@ -2711,7 +2774,7 @@ class MainWindow(QMainWindow):
         w, self.dict_dot, self.dict_label = state_widget()
         fm = self.dict_label.fontMetrics()  # fixed width: the bar must not jump when the state changes
         self.dict_label.setMinimumWidth(max(fm.horizontalAdvance(t) for t in (
-            "Ready to dictate", "Listening…", "Transcribing…", "Voxtype is off", "Status unavailable")) + 4)
+            "Ready to dictate", "Listening…", "Transcribing…", f"{ENGINE_TITLE} is off", "Status unavailable")) + 4)
         tb.addWidget(w)
         self.act_dictate = QAction(icon("audio-input-microphone"), "Dictate to clipboard", self)
         self.act_dictate.setCheckable(True)
@@ -2784,7 +2847,7 @@ class MainWindow(QMainWindow):
 
         # dictation
         if not daemon_on:
-            color, text = COLORS["gray"], "Voxtype is off"
+            color, text = COLORS["gray"], f"{ENGINE_TITLE} is off"
         elif dictation == "recording":
             color, text = COLORS["red"], "Listening…"
         elif dictation == "transcribing":
@@ -2886,7 +2949,7 @@ class MainWindow(QMainWindow):
             why = ""
         self.act_lang.setEnabled(not why and not self._lang_pending)
         self.act_lang.setToolTip(why or f"Dictation language: {language_name(lang)}. Click to switch to "
-                                 f"{language_name(other)} (restarts voxtype, ~3 s; also Meta+Shift+H).")
+                                 f"{language_name(other)} (" + ("from the next dictation; also ⌃⌥⇧H" if MAC else "restarts voxtype, ~3 s; also Meta+Shift+H") + ").")
 
     @staticmethod
     def _set_banner(banner: Banner, visible: bool) -> None:
@@ -2918,10 +2981,16 @@ class MainWindow(QMainWindow):
         recording = (self.status or {}).get("dictation") == "recording"
         self.act_dictate.setChecked(recording)  # the daemon's state decides, not the click
         self._dictating_here = True
+        if MAC:   # (BMeet.app dictates; from the window the text goes to the clipboard, as on Linux)
+            self._side_effect([sys.executable, "-I", str(CTL_PATH), "dictate", "--clipboard"], "Dictation")
+            return
         self._side_effect([VOXTYPE, "record", "toggle", "--clipboard"], "Dictation")
 
     def cancel_dictation(self) -> None:
         self._dictating_here = False
+        if MAC:
+            self._side_effect([sys.executable, "-I", str(CTL_PATH), "cancel"], "Cancel")
+            return
         self._side_effect([VOXTYPE, "record", "cancel"], "Cancel")
 
     def toggle_language(self) -> None:
@@ -2930,25 +2999,33 @@ class MainWindow(QMainWindow):
         if not target:
             return
         self._lang_pending = (lang, time.time() + 15)
-        run_detached([str(BIN / "voxtype-lang"), target])
+        run_detached([sys.executable, "-I", str(CTL_PATH), "lang", target] if MAC
+                     else [str(BIN / "voxtype-lang"), target])
         self.act_lang.setText("…")
         self.act_lang.setEnabled(False)
 
     def start_meeting(self, in_person: bool = False) -> None:
         self._meeting_pending = ("starting", time.time() + 10)
-        run_detached([str(BIN / "voxtype-meeting-toggle"), "start"] + (["--in-person"] if in_person else []))
+        cmd = [sys.executable, "-I", str(CTL_PATH), "meeting"] if MAC else [str(BIN / "voxtype-meeting-toggle")]
+        run_detached(cmd + ["start"] + (["--in-person"] if in_person else []))
         self.poll()
 
     def stop_meeting(self) -> None:
         # Detached: it waits for the last chunk (can take minutes) and must outlive the window.
-        self._stop_pid = run_detached([str(BIN / "voxtype-meeting-toggle"), "stop"])
+        cmd = [sys.executable, "-I", str(CTL_PATH), "meeting"] if MAC else [str(BIN / "voxtype-meeting-toggle")]
+        self._stop_pid = run_detached(cmd + ["stop"])
         self.poll()
 
     def pause_meeting(self) -> None:
         action = "resume" if (self.status or {}).get("meeting") == "paused" else "pause"
-        self._side_effect([VOXTYPE, "meeting", action], action.capitalize())
+        cmd = [sys.executable, "-I", str(CTL_PATH), "meeting"] if MAC else [VOXTYPE, "meeting"]
+        self._side_effect(cmd + [action], action.capitalize())
 
     def start_daemon(self) -> None:
+        if MAC:   # BMeet.app (the menu bar app) dictates and records
+            run_detached(["open", "-g", "-b", "io.github.baakhoff.bmeet"])
+            QTimer.singleShot(2000, self.poll)
+            return
         self.start_daemon_btn.setEnabled(False)
         self.daemon_banner.text.setText("Starting voxtype…")
 

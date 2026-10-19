@@ -323,6 +323,13 @@ class NemotronParts(unittest.TestCase):
             tmp.mkdir()
             nt.DIARIZATION_MODEL, nt.SEGMENTATION_MODEL = tmp / "nemotron", tmp / "seg.onnx"
             nt.EMBEDDING_MODEL = tmp / "titanet.onnx"
+            if sys.platform == "darwin":   # (the Core ML builds; there is no pyannote on a Mac)
+                self.assertEqual(nt.speaker_models_missing(),
+                                 [tmp / "titanet.mlmodelc", tmp / "nemotron/encoder.mlmodelc"])
+                (tmp / "titanet.mlmodelc").mkdir()
+                (tmp / "nemotron/encoder.mlmodelc").mkdir(parents=True)
+                self.assertEqual(nt.speaker_models_missing(), [])
+                return
             self.assertEqual(nt.speaker_models_missing(), [tmp / "titanet.onnx", tmp / "nemotron/encoder.xml"])
             nt.EMBEDDING_MODEL.write_bytes(b"x")
             nt.SEGMENTATION_MODEL.write_bytes(b"x")        # an install from before 0.6.0

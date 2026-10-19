@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""bmeet-meeting - meetings on macOS: what voxtype and voxtype-meeting-toggle do on Linux.
+
+  bmeet-meeting start|stop|toggle [--in-person]   (in person: microphone only, split by voice)
+  bmeet-meeting pause|resume
+  bmeet-meeting delete [--force] [--] ID          forget a meeting (its Markdown copy stays)
+  bmeet-meeting export [--format markdown|text] [--output FILE] [...] [--] ID
+  bmeet-meeting list                              JSON: the meetings, newest first
+  bmeet-meeting cleanup                           recordings nothing works on any more; RAM disk
+
+On Linux voxtype records and transcribes a meeting, and BMeet adds the speaker pass. On a Mac
+BMeet does all of it, with the same pieces:
+- bmeet-record records the microphone and the system audio into
+  $XDG_RUNTIME_DIR/bmeet/meeting-audio/NAME (part-N-mic.wav, part-N-remote.wav), on a RAM disk
+  that this script mounts there (hidden, `diskutil`; detached again when no recording is left):
+  the audio never reaches the disk, as on Linux.
+- npu-transcribe --live follows the recording and writes live.md (You / Remote), which the
+  BMeet window shows. When the meeting stops, it becomes the Markdown copy in
+  ~/Documents/Meetings (YYYY-MM-DD_HHMM-meeting.md, as on Linux).
+- npu-transcribe --meeting (the speaker pass: Person 1, Person 2, ...) then replaces it, and the
+  audio is deleted. With ~/.config/bmeet/speakers "off" there is no speaker pass and the audio
+  is deleted as soon as the live transcript is done.
+- The meetings are listed in ~/.local/share/bmeet/meetings/index.db, with the columns of
+  voxtype's index, so bmeet-ctl and the BMeet app read both alike.
+The state goes where bmeet-ctl looks for voxtype's: $XDG_RUNTIME_DIR/bmeet/meeting_state
+(recording|paused|idle) and meeting-toggle.started (the recording's name).
+
+Its long-running parts run as "units" (systemd user units on Linux): detached processes with a
+pid file in $XDG_RUNTIME_DIR/bmeet/units, each with what to do when it ends. BMeet.app starts
+this script, so the recorder runs as part of BMeet.app and macOS asks for the microphone and the
+system audio once, for BMeet.
+Env (tests): BMEET_RECORD_MIC_FILE / BMEET_RECORD_SYSTEM_FILE (bmeet-record plays these instead
+of recording), BMEET_RECORD (another bmeet-record), BMEET_TRANSCRIBE (a stand-in for
+npu-transcribe, run with this Python), VOXTYPE_MEETING_DIR, BMEET_MEETING_DB, BMEET_NO_RAMDISK=1
+(audio in the runtime folder on disk instead: tests only), XDG_RUNTIME_DIR.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bmeetmac  # noqa: E402
+
+bmeetmac.setup()
+HOME = Path.home()
+RUN = bmeetmac.runtime()
+AUDIO_ROOT = bmeetmac.audio_root()
+STATE_FILE = RUN / "meeting_state"
+STAMP_FILE = RUN / "meeting-toggle.started"
+POINTER = RUN / "recording"
+UNITS = RUN / "units"
+LOCK = RUN / "meeting.lock"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet"
+DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+OUT_DIR = Path(os.environ.get("VOXTYPE_MEETING_DIR") or HOME / "Documents/Meetings")
+MEETING_DB = Path(os.environ.get("BMEET_MEETING_DB") or DATA / "bmeet/meetings/index.db")
+VOICES_DIR = DATA / "bmeet/voices"
+SRC = bmeetmac.ROOT
+PYTHON = sys.executable
+TRANSCRIBE = Path(os.environ.get("BMEET_TRANSCRIBE") or SRC / "transcribe/npu-transcribe")   # (tests: a stand-in)
+RAMDISK_MB = 2048            # ~8 h of meeting audio (two tracks, 230 MB per hour)
+LIVE_WAIT = 60               # seconds the live transcript may take for its last phrases
+PROG = "bmeet-meeting"
+
+
+def log(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
+
+
+def read_first_line(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text().splitlines()[0].strip() or default
+    except (OSError, IndexError):
+        return default
+
+
+def on(name: str, default: str) -> bool:
+    return read_first_line(CONFIG / name, default).lower() == "on"
+
+
+def meeting_state() -> str:
+    return read_first_line(STATE_FILE, "idle")
+
+
+def set_state(state: str) -> None:
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".new")
+    tmp.write_text(state + "\n")
+    tmp.replace(STATE_FILE)
+
+
+def notify(title: str, body: str = "", ok: bool = True) -> None:
+    bmeetmac.notify(title, body, ok)
+
+
+# --------------------------------------------------------------------------- the meeting index
+
+def db() -> sqlite3.Connection:
+    MEETING_DB.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(MEETING_DB, timeout=5)
+    con.execute("CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT, started_at INTEGER, "
+                "ended_at INTEGER, duration_secs INTEGER, status TEXT, chunk_count INTEGER DEFAULT 0, "
+                "storage_path TEXT, model TEXT, recording TEXT, md_path TEXT)")
+    return con
+
+
+def title_taken(title: str) -> bool:
+    with db() as con:
+        return con.execute("SELECT 1 FROM meetings WHERE title = ?", (title,)).fetchone() is not None
+
+
+def unique_title(title: str) -> str:
+    """A title the index does not have yet: (2), (3), ... (as voxtype-meeting-toggle does)."""
+    n, out = 1, title
+    while title_taken(out):
+        n += 1
+        out = f"{title} ({n})"
+    return out
+
+
+def active_meeting() -> sqlite3.Row | None:
+    con = db()
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute("SELECT * FROM meetings WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1").fetchone()
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------------- units
+
+def unit_pid(name: str) -> int | None:
+    try:
+        pid = int(read_first_line(UNITS / f"{name}.pid", "0"))
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return None
+    return pid
+
+
+def unit_active(name: str) -> bool:
+    return unit_pid(name) is not None
+
+
+def unit_start(name: str, cmd: list[str], after: list[str] | None = None, nice: int = 0) -> bool:
+    """Start `cmd` as the unit `name` (detached; its output goes to RUN/units/NAME.log). `after`:
+    a command run when it has ended, however it ended (systemd's ExecStopPost)."""
+    UNITS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if unit_active(name):
+        unit_stop(name)
+    argv = [PYTHON, "-I", str(Path(__file__).resolve()), "run-unit", name, "--nice", str(nice)]
+    if after:
+        argv += ["--after", json.dumps(after)]
+    argv += ["--", *cmd]
+    with open(UNITS / f"{name}.log", "ab") as out:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
+    for _ in range(50):   # (the unit writes its pid file itself)
+        if unit_pid(name) == proc.pid:
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.02)
+    return proc.poll() is None
+
+
+def unit_stop(name: str, sig: int = signal.SIGINT, timeout: float = 15.0) -> None:
+    pid = unit_pid(name)
+    if pid is None:
+        return
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + timeout
+    while unit_active(name) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if unit_active(name):
+        os.kill(pid, signal.SIGKILL)
+
+
+def run_unit(argv: list[str]) -> int:
+    """run-unit NAME [--nice N] [--after JSON] -- CMD...: the unit itself. Passes SIGINT/SIGTERM
+    on to CMD, waits for it, runs --after, removes its pid file."""
+    name, rest = argv[0], argv[1:]
+    nice, after = 0, None
+    while rest and rest[0] != "--":
+        if rest[0] == "--nice":
+            nice, rest = int(rest[1]), rest[2:]
+        elif rest[0] == "--after":
+            after, rest = json.loads(rest[1]), rest[2:]
+        else:
+            return 2
+    cmd = rest[1:]
+    pid_file = UNITS / f"{name}.pid"
+    pid_file.write_text(f"{os.getpid()}\n")
+    child = subprocess.Popen(cmd, preexec_fn=(lambda: os.nice(nice)) if nice else None)
+    stopping = {"sig": None}
+
+    def forward(sig, _frame):
+        stopping["sig"] = sig
+        try:
+            child.send_signal(sig)
+        except ProcessLookupError:
+            pass
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, forward)
+    code = child.wait()
+    print(f"{PROG}: unit {name} ended with status {code}", file=sys.stderr, flush=True)
+    if after:
+        subprocess.run(after, check=False)
+    if read_first_line(pid_file) == str(os.getpid()):
+        pid_file.unlink(missing_ok=True)
+    return code
+
+
+# --------------------------------------------------------------------------- the RAM disk
+
+def ram_device() -> str | None:
+    """The /dev/diskN mounted on AUDIO_ROOT, if it is mounted."""
+    out = subprocess.run(["mount"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        m = re.match(r"(/dev/disk\d+) on (.+) \(", line)
+        if m and os.path.realpath(m[2]) == os.path.realpath(AUDIO_ROOT):
+            return m[1]
+    return None
+
+
+def ensure_ramdisk() -> bool:
+    """A RAM disk on AUDIO_ROOT (hidden from Finder). False if it cannot be made."""
+    if os.environ.get("BMEET_NO_RAMDISK") == "1":
+        AUDIO_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return True
+    if ram_device():
+        return True
+    AUDIO_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if any(AUDIO_ROOT.iterdir()):
+        log(f"{AUDIO_ROOT} is not empty: not mounting the RAM disk over it")
+        return False
+    sectors = RAMDISK_MB * 1024 * 1024 // 512
+    attach = subprocess.run(["hdiutil", "attach", "-nomount", f"ram://{sectors}"], capture_output=True, text=True)
+    device = attach.stdout.split()[0] if attach.returncode == 0 and attach.stdout.split() else ""
+    if not device.startswith("/dev/disk"):
+        log(f"no RAM disk: {attach.stderr.strip()}")
+        return False
+    ok = subprocess.run(["newfs_hfs", "-v", "BMeet meeting audio", device], capture_output=True).returncode == 0 and \
+        subprocess.run(["diskutil", "mount", "-mountOptions", "nobrowse,noatime,nosuid,nodev", "-mountPoint",
+                        str(AUDIO_ROOT), device], capture_output=True).returncode == 0
+    if not ok:
+        subprocess.run(["hdiutil", "detach", device], capture_output=True)
+        log("no RAM disk: could not mount it")
+        return False
+    os.chmod(AUDIO_ROOT, 0o700)
+    return True
+
+
+def drop_ramdisk() -> None:
+    """Detach the RAM disk when no recording is left on it (its memory is only freed then)."""
+    device = ram_device()
+    if device is None or any(p.name not in (".fseventsd", ".Trashes", ".DS_Store") for p in AUDIO_ROOT.iterdir()):
+        return
+    subprocess.run(["diskutil", "unmount", "force", str(AUDIO_ROOT)], capture_output=True)
+    subprocess.run(["hdiutil", "detach", device, "-force"], capture_output=True)
+
+
+def cleanup() -> int:
+    """Recordings no unit works on any more (a crash, a stop from elsewhere), then the RAM disk."""
+    if AUDIO_ROOT.is_dir():
+        for d in AUDIO_ROOT.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            busy = unit_active(f"bmeet-speakers-{d.name}") or (
+                read_first_line(STAMP_FILE) == d.name and meeting_state() in ("recording", "paused"))
+            if not busy:
+                subprocess.run(["rm", "-rf", str(d)], check=False)
+    drop_ramdisk()
+    return 0
+
+
+# --------------------------------------------------------------------------- start / stop
+
+def recording_name(minute: str) -> str:
+    name, n = minute, 1
+    while (AUDIO_ROOT / name).exists() or unit_active(f"bmeet-speakers-{name}"):
+        n += 1
+        name = f"{minute}-{n}"
+    return name
+
+
+def start(in_person: bool) -> int:
+    if meeting_state() in ("recording", "paused"):
+        log("a meeting is already being recorded")
+        return 0
+    now = time.time()
+    title = unique_title(time.strftime("In-person meeting %Y-%m-%d %H:%M" if in_person else "Meeting %Y-%m-%d %H:%M",
+                                       time.localtime(now)))
+    if not ensure_ramdisk():
+        notify("Meeting NOT started", "BMeet could not make the RAM disk for the meeting audio", ok=False)
+        return 1
+    cleanup_stale()
+    name = recording_name(time.strftime("%Y-%m-%d_%H%M", time.localtime(now)))
+    folder = AUDIO_ROOT / name
+    folder.mkdir(mode=0o700)
+    (folder / "meeting.json").write_text(json.dumps({"title": title, "started": int(now), "in_person": in_person}) + "\n")
+    mid = str(uuid.uuid4())
+    with db() as con:
+        con.execute("INSERT INTO meetings (id, title, started_at, status, storage_path, model, recording) "
+                    "VALUES (?, ?, ?, 'recording', ?, ?, ?)", (mid, title, int(now), str(folder),
+                                                                "whisper-large-v3-turbo", name))
+    STAMP_FILE.write_text(name + "\n")
+    set_state("recording")
+    rec = [str(bmeetmac.helper("bmeet-record")), "meeting", str(folder)] + (["--mic-only"] if in_person else [])
+    if not unit_start("bmeet-meeting-audio", rec):
+        set_state("idle")
+        with db() as con:
+            con.execute("DELETE FROM meetings WHERE id = ?", (mid,))
+        subprocess.run(["rm", "-rf", str(folder)], check=False)
+        notify("Meeting NOT started", "The meeting recorder did not start", ok=False)
+        return 1
+    unit_start("bmeet-live", [PYTHON, "-I", str(TRANSCRIBE), "--live", str(folder)], nice=5)
+    if in_person:
+        notify("In-person meeting started", "Microphone only; the voices are told apart when you stop.")
+    else:
+        notify("Meeting recording started", "Microphone + system audio. Press ⌃⌥M again to stop.")
+    return 0
+
+
+def cleanup_stale() -> None:
+    """Before a new meeting: recordings of meetings that are over and that no pass works on."""
+    if not AUDIO_ROOT.is_dir():
+        return
+    for d in AUDIO_ROOT.iterdir():
+        if d.is_dir() and not d.name.startswith(".") and not unit_active(f"bmeet-speakers-{d.name}"):
+            subprocess.run(["rm", "-rf", str(d)], check=False)
+
+
+def markdown_path(stamp: str) -> Path:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / f"{stamp}-meeting.md"
+    return OUT_DIR / f"{stamp}-meeting-{int(time.time())}.md" if path.exists() else path   # never overwrite
+
+
+def stop() -> int:
+    if meeting_state() not in ("recording", "paused"):
+        log("no meeting is being recorded")
+        return 0
+    row = active_meeting()
+    name = read_first_line(STAMP_FILE)
+    folder = AUDIO_ROOT / name if name else None
+    set_state("idle")              # bmeet-record ends its part and stops; --live hears it end
+    unit_stop("bmeet-meeting-audio", timeout=20)
+    for _ in range(LIVE_WAIT * 2):  # (the last phrases: a second or two)
+        if not unit_active("bmeet-live"):
+            break
+        time.sleep(0.5)
+    unit_stop("bmeet-live")
+    ended = int(time.time())
+    started = int(row["started_at"]) if row else ended
+    file = markdown_path(time.strftime("%Y-%m-%d_%H%M", time.localtime(started)))
+    saved = False
+    if folder and (folder / "live.done").exists() and (folder / "live.md").stat().st_size > 0:
+        tmp = file.with_name(file.name + f".live.{os.getpid()}")
+        tmp.write_text((folder / "live.md").read_text(encoding="utf-8"), encoding="utf-8")
+        tmp.replace(file)
+        saved = True
+    if row is not None:
+        with db() as con:
+            con.execute("UPDATE meetings SET ended_at = ?, duration_secs = ?, status = 'completed', md_path = ? "
+                        "WHERE id = ?", (ended, recorded_seconds(folder) or ended - started,
+                                         str(file) if saved else None, row["id"]))
+    STAMP_FILE.unlink(missing_ok=True)
+    speakers = on("speakers", "on") and folder is not None and any(folder.glob("part-*.wav"))
+    if speakers:
+        notify("Meeting transcript saved", f"{file}\nTelling the speakers apart; the file is updated in a few minutes.")
+        print(file)
+        speaker_pass(name, folder, file)
+    else:
+        if folder:
+            subprocess.run(["rm", "-rf", str(folder)], check=False)
+        drop_ramdisk()
+        notify("Meeting transcript saved" if saved else "Meeting stopped", str(file) if saved else
+               "Nothing was transcribed")
+        if saved:
+            print(file)
+    return 0
+
+
+def recorded_seconds(folder: Path | None) -> int | None:
+    if not folder:
+        return None
+    total = 0
+    for wav in folder.glob("part-*-mic.wav"):
+        total += max(0, wav.stat().st_size - 44) // 32000
+    return total or None
+
+
+def speaker_pass(name: str, folder: Path, file: Path) -> None:
+    voices = ["--voices", str(VOICES_DIR)] if on("remember-voices", "off") else []
+    (folder / "speaker-pass").write_text(f"{file}\n")
+    cmd = [PYTHON, "-I", str(TRANSCRIBE), "--meeting", str(folder), "--output", str(file), *voices, "--notify"]
+    after = ["rm", "-rf", str(folder)]
+    if not unit_start(f"bmeet-speakers-{name}", cmd, after=after, nice=10):
+        subprocess.run(after, check=False)
+        notify("Speakers not told apart", "Could not start npu-transcribe; the transcript has You/Remote only", ok=False)
+    # (a separate unit drops the RAM disk when the pass is over)
+    unit_start(f"bmeet-cleanup-{name}", [PYTHON, "-I", str(Path(__file__).resolve()), "wait-and-cleanup", name])
+
+
+def wait_and_cleanup(name: str) -> int:
+    time.sleep(1)
+    while unit_active(f"bmeet-speakers-{name}"):
+        time.sleep(2)
+    return cleanup()
+
+
+def pause(resume: bool) -> int:
+    state = meeting_state()
+    if state not in ("recording", "paused"):
+        log("no meeting is being recorded")
+        return 1
+    set_state("recording" if resume else "paused")
+    row = active_meeting()
+    if row is not None:
+        with db() as con:
+            con.execute("UPDATE meetings SET status = ? WHERE id = ?", ("recording" if resume else "paused", row["id"]))
+    return 0
+
+
+def toggle(in_person: bool) -> int:
+    return stop() if meeting_state() in ("recording", "paused") else start(in_person)
+
+
+# --------------------------------------------------------------------------- list, delete, export
+
+def list_meetings() -> int:
+    con = db()
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute("SELECT * FROM meetings ORDER BY started_at DESC")]
+    con.close()
+    print(json.dumps(rows, ensure_ascii=False, indent=1))
+    return 0
+
+
+def delete(args: list[str]) -> int:
+    ids = [a for a in args if not a.startswith("-")]
+    if not ids:
+        print("usage: bmeet-meeting delete [--force] [--] ID", file=sys.stderr)
+        return 2
+    with db() as con:
+        for mid in ids:
+            if con.execute("SELECT ended_at FROM meetings WHERE id = ?", (mid,)).fetchone() is None:
+                print(f"{PROG}: no meeting {mid}", file=sys.stderr)
+                return 1
+            con.execute("DELETE FROM meetings WHERE id = ?", (mid,))
+    return 0
+
+
+def export(args: list[str]) -> int:
+    """The meeting's Markdown copy (BMeet's only transcript on a Mac), as Markdown or text."""
+    fmt, output, mid, i = "markdown", None, None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--format":
+            fmt, i = args[i + 1], i + 1
+        elif a == "--output":
+            output, i = args[i + 1], i + 1
+        elif a == "--":
+            mid = args[i + 1] if i + 1 < len(args) else None
+            break
+        elif not a.startswith("-"):
+            mid = a
+        i += 1
+    if not mid:
+        print("usage: bmeet-meeting export [--format markdown|text] [--output FILE] [--] ID", file=sys.stderr)
+        return 2
+    con = db()
+    row = con.execute("SELECT md_path FROM meetings WHERE id = ?", (mid,)).fetchone()
+    con.close()
+    path = Path(row[0]) if row and row[0] else None
+    if path is None or not path.is_file():
+        print(f"{PROG}: meeting {mid} has no transcript", file=sys.stderr)
+        return 1
+    text = path.read_text(encoding="utf-8")
+    if fmt == "text":
+        text = re.sub(r"[*#_`]", "", text)
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    if cmd == "run-unit":
+        return run_unit(args)
+    if cmd == "wait-and-cleanup":
+        return wait_and_cleanup(args[0])
+    if cmd == "list":
+        return list_meetings()
+    if cmd == "delete":
+        return delete(args)
+    if cmd == "export":
+        return export(args)
+    if cmd == "cleanup":
+        return cleanup()
+    in_person = "--in-person" in args
+    if cmd not in ("start", "stop", "toggle", "pause", "resume"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    import fcntl
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(LOCK, "w") as lock:   # one at a time (a double press, key repeat)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log("a meeting start or stop is already running")
+            return 0
+        if cmd == "start":
+            return start(in_person)
+        if cmd == "stop":
+            return stop()
+        if cmd == "toggle":
+            return toggle(in_person)
+        return pause(resume=cmd == "resume")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

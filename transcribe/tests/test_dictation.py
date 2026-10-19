@@ -156,6 +156,18 @@ class Drafts(unittest.TestCase):
         later = [draft for t, final, draft in events if t > final_at and draft]
         self.assertTrue(later and all("Alpha" not in draft for draft in later))
 
+    def test_clean_speech_is_sound_without_a_noise_floor(self):
+        """3 s of clean speech (-13..-19 dBFS) with one short breath: the quietest tenth is speech, so
+        it cannot be the noise. Speech above LIVE_SPEECH_DBFS is sound anyway; it was taken for a pause
+        in the middle of a sentence, which made the words in it final too early and lost them."""
+        tone = lambda amp: (amp * np.sin(2 * np.pi * 200 * np.arange(nt.LIVE_FRAME) / RATE)).astype(np.float32)
+        frames = [tone(0.3 if i % 2 else 0.15) for i in range(30)]
+        x = np.concatenate(frames[:12] + [quiet(0.2, 1)] + frames[12:])
+        d = nt.Dictation(FakeGigaAM(), {})
+        d.append(x)
+        d.listen()
+        self.assertGreaterEqual(d.sound, x.size - nt.LIVE_FRAME)
+
     def test_no_sentence_end_no_freeze(self):
         s = Speech().say("Alpha bravo charlie", pause=1.2).say("delta echo.")
         events, d = dictate(s, FakeGigaAM())

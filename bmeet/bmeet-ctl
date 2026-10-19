@@ -24,6 +24,12 @@ Actions that can take long (meeting stop waits for the last chunk) run detached.
 Path overrides for testing (env): BMEET_RUN_DIR, BMEET_AUDIO_DIR, BMEET_MEETING_DB,
 VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP, BMEET_RUNTIME_DIR (bmeet-dictate's),
 BMEET_DICTATE_START (how to start bmeet-dictate when it is not running).
+
+On macOS there is no voxtype: BMeet.app (macos/BMeetApp) dictates, and macos/bmeet-meeting
+records meetings. bmeet-ctl reads their state from the same file names in
+$XDG_RUNTIME_DIR/bmeet (your temp folder; see macos/bmeetmac.py), the meetings from
+~/.local/share/bmeet/meetings/index.db (voxtype's columns), the dictation language from
+~/.config/bmeet/language, and sends its actions to BMeet.app. It runs on BMeet's venv Python there.
 """
 import json
 import os
@@ -34,11 +40,17 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
+
+MAC = sys.platform == "darwin" and os.environ.get("BMEET_PLATFORM") != "linux"   # (tests: Linux on a Mac)
+if MAC:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "macos"))
+    import bmeetmac  # noqa: E402
+    bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
-           or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "voxtype")
+           or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / ("bmeet" if MAC else "voxtype"))
 # Meeting audio waiting for (or in) the speaker pass; see voxtype-meeting-toggle.
 AUDIO_DIR = Path(os.environ.get("BMEET_AUDIO_DIR")
                  or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bmeet/meeting-audio")
@@ -47,7 +59,9 @@ CONFIG = XDG_CONFIG / "voxtype/config.toml"
 LANGUAGES_FILE = XDG_CONFIG / "bmeet/languages"
 LANG_CODE = re.compile(r"^[a-z]{2,3}$")  # Whisper language codes ("en", "haw", ...)
 MEETING_DB = Path(os.environ.get("BMEET_MEETING_DB")
-                  or HOME / ".local/share/voxtype/meetings/index.db")
+                  or HOME / (".local/share/bmeet/meetings/index.db" if MAC else ".local/share/voxtype/meetings/index.db"))
+MAC_LANGUAGE = XDG_CONFIG / "bmeet/language"   # macOS: the dictation language (voxtype's config on Linux)
+MEETING = Path(__file__).resolve().parents[1] / "macos/bmeet-meeting"   # macOS: the meeting runner
 MEETING_MD_DIR = Path(os.environ.get("VOXTYPE_MEETING_DIR", HOME / "Documents/Meetings"))
 FILE_HISTORY = Path(os.environ.get("NPU_TRANSCRIBE_HISTORY")
                     or HOME / ".local/share/npu-transcribe/history.jsonl")
@@ -107,6 +121,8 @@ def to_dictate(command: str, start: bool = True) -> dict | None:
 
 def dictation_state() -> str:
     """idle / recording / transcribing: voxtype's, or bmeet-dictate's when BMeet dictates."""
+    if MAC:   # BMeet.app's (it writes RUN/state as voxtype does)
+        return read_first_line(RUN / "state", "idle") if daemon_running() else "off"
     if live_dictation() != "off":
         state = read_first_line(DICTATE_SOCKET.parent / "dictation", "idle")
         return "transcribing" if state == "committing" else state
@@ -128,6 +144,9 @@ def daemon_running() -> bool:
 
 
 def config() -> dict:
+    if MAC:   # (voxtype's [openvino] section, for status())
+        return {"openvino": {"language": read_first_line(MAC_LANGUAGE, "en"), "model": "whisper-large-v3-turbo",
+                             "device": "ANE"}}
     try:
         with CONFIG.open("rb") as f:
             return tomllib.load(f)
@@ -326,8 +345,65 @@ def detached(*cmd: str) -> None:
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+def to_app(command: dict, start: bool = True) -> dict | None:
+    """macOS: one command to BMeet.app (its answer). start: open BMeet.app first if it is not
+    running (it records, dictates and pastes, so macOS asks for its permissions only)."""
+    answer = bmeetmac.agent(command)
+    if answer is not None or not start:
+        return answer
+    subprocess.run(["open", "-g", "-b", "io.github.baakhoff.bmeet"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import time
+    for _ in range(100):
+        time.sleep(0.1)
+        if (answer := bmeetmac.agent(command)) is not None:
+            return answer
+    print("bmeet-ctl: BMeet.app is not running (open it from ~/Applications)", file=sys.stderr)
+    return None
+
+
+def set_mac_language(target: str) -> int:
+    """macOS `lang`: the dictation language BMeet.app uses from the next dictation on."""
+    current = read_first_line(MAC_LANGUAGE, "en")
+    language = next_language(current) if target == "toggle" else target
+    if not language:
+        return 0
+    MAC_LANGUAGE.parent.mkdir(parents=True, exist_ok=True)
+    MAC_LANGUAGE.write_text(language + "\n")
+    to_app({"op": "language", "language": language}, start=False)
+    return 0
+
+
+def mac_main(cmd: str, args: list[str]) -> int | None:
+    """The actions on macOS (None: not one of them; status, recent, version are shared)."""
+    if cmd == "dictate":
+        return 0 if to_app({"op": "dictate", "clipboard": "--clipboard" in args}) else 1
+    if cmd == "cancel":
+        to_app({"op": "cancel"}, start=False)
+        return 0
+    if cmd == "lang":
+        target = (args[:1] or ["toggle"])[0].lower()
+        if target != "toggle" and not LANG_CODE.match(target):
+            print(f"bmeet-ctl: not a language code: {target!r}", file=sys.stderr)
+            return 2
+        return set_mac_language(target)
+    if cmd == "meeting":
+        action = args[0] if args else "toggle"
+        extra = [a for a in args[1:] if a == "--in-person"]
+        if action not in ("start", "stop", "toggle", "pause", "resume") or len(extra) != len(args[1:]) \
+                or (extra and action in ("pause", "resume")):
+            print("usage: bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]", file=sys.stderr)
+            return 2
+        return 0 if to_app({"op": "meeting", "action": action, "in_person": bool(extra)}) else 1
+    if cmd == "open":
+        return 0 if to_app({"op": "open", "args": args}) else 1
+    return None
+
+
 def main(argv: list[str]) -> int:
     cmd, args = (argv[0], argv[1:]) if argv else ("status", [])
+    if MAC and (code := mac_main(cmd, args)) is not None:
+        return code
     if cmd == "status":
         print(json.dumps(status()))
     elif cmd == "recent":

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # BMeet installer: voice typing, meeting transcripts and file transcription
-# with Whisper on the Intel NPU, for Ubuntu/Kubuntu 26.04 with KDE Plasma 6.
+# with Whisper on the Intel NPU, for Ubuntu/Kubuntu 26.04 with KDE Plasma 6 -
+# and on the Neural Engine of a Mac with Apple silicon (macos/install.sh takes over there).
 #
 # One line (downloads the release, asks for your sudo password once):
 #   curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
@@ -32,7 +33,7 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.8.1
+    local VERSION=0.9.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -94,6 +95,10 @@ main() {
             exec bash "$tmp/install.sh" ${args[@]+"${args[@]}"} </dev/tty
         fi
         exec bash "$tmp/install.sh" ${args[@]+"${args[@]}"}
+    fi
+    # --- a Mac with Apple silicon: its own installer (the same options, where they apply) ---
+    if [ "$(uname -s)" = Darwin ]; then
+        exec bash "$src/macos/install.sh" ${args[@]+"${args[@]}"}
     fi
     local version
     version="$(cat "$src/VERSION")"

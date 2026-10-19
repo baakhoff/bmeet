@@ -181,6 +181,7 @@ ENV = {
     "BMEET_DRY_RUN": "1",
     "BMEET_SOCKET": str(WORK / "bmeet.sock"),
     "NPU_MODELS_DIR": NPU_MODELS,
+    "BMEET_PLATFORM": "linux",   # (on a Mac too: these tests are the Linux window's, with fake voxtype)
 }
 os.environ.update(ENV)
 os.environ.pop("XDG_ACTIVATION_TOKEN", None)
@@ -192,6 +193,15 @@ sys.modules[_loader.name] = vn  # dataclasses look the module up
 _loader.exec_module(vn)
 QApplication = vn.QApplication
 app = QApplication.instance() or QApplication(["bmeet-test"])
+if sys.platform == "darwin":
+    # Qt's moveToTrash puts files into your own Trash on a Mac (Linux's goes to $XDG_DATA_HOME/Trash,
+    # here the work dir): keep the tests' files out of it, in the place the tests look.
+    def _work_trash(path: str) -> bool:
+        dest = WORK / "data/Trash/files" / Path(path).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(path, dest)
+        return True
+    vn.move_to_trash = _work_trash
 vn.QGuiApplication.setDesktopFileName("bmeet")
 
 
@@ -1318,7 +1328,8 @@ class C_SingleInstanceTests(unittest.TestCase):
             app = WORK / "bmeet-app"
             app.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{APP_PATH}" "$@"\n')
             app.chmod(0o755)
-            r = subprocess.run([str(CTL_PATH), "open", "transcribe", "--file", FIX["files"]["a.ogg"]],
+            ctl = [sys.executable, "-I", str(CTL_PATH)] if sys.platform == "darwin" else [str(CTL_PATH)]
+            r = subprocess.run(ctl + ["open", "transcribe", "--file", FIX["files"]["a.ogg"]],
                                env=dict(self.env, BMEET_APP=str(app)), capture_output=True,
                                text=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stderr)

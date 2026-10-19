@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""warm-up - have macOS prepare BMeet's models for the Neural Engine once, at install time.
+
+The first time a Core ML model is loaded for the Neural Engine, macOS compiles it for the chip
+(Whisper turbo: ~2 minutes on an M1; GigaAM and Nemotron: seconds to a minute) and keeps the
+result. Doing it here means the first dictation or meeting after the install does not wait.
+Each model is loaded and run once on silence; a model that is missing is skipped.
+Run with BMeet's venv Python (macos/install.sh does).
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load_npu_transcribe():
+    loader = importlib.machinery.SourceFileLoader("npu_transcribe", str(HERE.parent / "transcribe/npu-transcribe"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def main() -> int:
+    nt = load_npu_transcribe()
+    np = nt.np
+    silence = np.zeros(nt.SAMPLE_RATE * 2, np.float32)
+    for name in ("turbo", "small"):
+        if not (nt.MODELS[name] / nt.MODEL_FILE).exists():
+            continue
+        t0 = time.monotonic()
+        print(f"  Whisper {name}: ", end="", flush=True)
+        try:
+            w = nt.WhisperANE(nt.MODELS[name], ["ANE", "CPU"])
+            w.generate(silence, language="<|en|>", return_timestamps=True)
+            print(f"ready on {w.device} ({time.monotonic() - t0:.0f} s)")
+        except Exception as exc:  # (the first use does it then)
+            print(f"not now ({exc})")
+    if nt.gigaam_ready():
+        t0 = time.monotonic()
+        g = nt.GigaAM(["ANE", "CPU"])
+        g.words(silence)
+        print(f"  GigaAM v3: ready on {g.device} ({time.monotonic() - t0:.0f} s)")
+    if not nt.speaker_models_missing():
+        t0 = time.monotonic()
+        s = nt.SpeakerModels(["ANE", "CPU"])
+        s.embed([silence])
+        s.nemotron(np.zeros(nt.SAMPLE_RATE * 5, np.float32))
+        print(f"  speaker models: ready on {s.device} ({time.monotonic() - t0:.0f} s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

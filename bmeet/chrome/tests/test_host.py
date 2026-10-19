@@ -10,6 +10,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -39,7 +40,9 @@ class Host(unittest.TestCase):
         shutil.rmtree(self.work, ignore_errors=True)
 
     def run_host(self, data: bytes) -> subprocess.CompletedProcess:
-        return subprocess.run([str(HOST)], input=data, env=self.env, capture_output=True, timeout=10)
+        # (on a Mac the host runs on BMeet's Python, as its wrapper in ~/.local/bin does it)
+        cmd = [sys.executable, "-I", str(HOST)] if sys.platform == "darwin" else [str(HOST)]
+        return subprocess.run(cmd, input=data, env=self.env, capture_output=True, timeout=10)
 
     def log(self) -> list[dict]:
         path = self.meeting / "call-mic.jsonl"

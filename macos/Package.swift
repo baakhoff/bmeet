@@ -17,5 +17,7 @@ let package = Package(
             dependencies: [.product(name: "WhisperKit", package: "argmax-oss-swift")]
         ),
         .executableTarget(name: "bmeet-record"),
+        // BMeet.app's executable: the menu bar app (macos/install.sh puts it in the bundle)
+        .executableTarget(name: "BMeet"),
     ]
 )

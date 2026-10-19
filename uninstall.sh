@@ -12,6 +12,9 @@
 set -euo pipefail
 
 src="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [ "$(uname -s)" = Darwin ]; then   # macOS: its own uninstaller
+    exec bash "$src/macos/uninstall.sh" "$@"
+fi
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 root="$data/bmeet"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}"

@@ -41,8 +41,14 @@ def temp_dir() -> Path:
 
 
 def setup() -> None:
-    """Give BMeet's Linux-shaped code its runtime folder (see the module doc)."""
+    """Give BMeet's Linux-shaped code its runtime folder (see the module doc), and Homebrew's
+    programs (ffmpeg): apps started from the Dock or at login get only /usr/bin:/bin in PATH."""
     os.environ.setdefault("XDG_RUNTIME_DIR", str(temp_dir()).rstrip("/"))
+    path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin").split(":")
+    for brew in ("/opt/homebrew/bin", "/usr/local/bin"):
+        if brew not in path and os.path.isdir(brew):
+            path.append(brew)
+    os.environ["PATH"] = ":".join(path)
 
 
 def runtime() -> Path:

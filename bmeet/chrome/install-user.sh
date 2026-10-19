@@ -19,24 +19,36 @@ name=io.github.baakhoff.bmeet
 id=pfhnhicfaajjfidmknapnoekclpjoaoc   # fixed by the "key" in extension/manifest.json
 browsers=(google-chrome google-chrome-beta google-chrome-unstable chromium
           BraveSoftware/Brave-Browser microsoft-edge vivaldi)
+mac=""
+if [[ $(uname -s) == Darwin ]]; then
+    # macOS: the browsers' folders in ~/Library/Application Support; the host is the wrapper
+    # macos/install.sh puts in ~/.local/bin (it runs it with BMeet's Python)
+    mac=1
+    config="$HOME/Library/Application Support"
+    browsers=("Google/Chrome" "Google/Chrome Beta" "Google/Chrome Canary" Chromium
+              BraveSoftware/Brave-Browser "Microsoft Edge" Vivaldi)
+fi
 
 case ${1:-} in
     --uninstall)
         for b in "${browsers[@]}"; do
             rm -fv "$config/$b/NativeMessagingHosts/$name.json"
         done
-        if [[ -L $bin_dir/bmeet-chrome-host ]]; then rm -v "$bin_dir/bmeet-chrome-host"; fi
+        if [[ -L $bin_dir/bmeet-chrome-host || -n $mac ]]; then rm -fv "$bin_dir/bmeet-chrome-host"; fi
         exit 0 ;;
     "") ;;
     *) echo "usage: $0 [--uninstall]" >&2; exit 2 ;;
 esac
 
 mkdir -p "$bin_dir"
-ln -sfn "$here/bmeet-chrome-host" "$bin_dir/bmeet-chrome-host"
-found=()
+[[ -n $mac ]] || ln -sfn "$here/bmeet-chrome-host" "$bin_dir/bmeet-chrome-host"
+found=() blocked=()
 for b in "${browsers[@]}"; do
     [[ -d $config/$b ]] || continue
-    install -d -m 0755 "$config/$b/NativeMessagingHosts"
+    if ! install -d -m 0755 "$config/$b/NativeMessagingHosts" 2>/dev/null; then
+        blocked+=("$b")   # (macOS may keep other programs out of a browser's folder)
+        continue
+    fi
     cat > "$config/$b/NativeMessagingHosts/$name.json" <<JSON
 {
   "name": "$name",
@@ -48,6 +60,10 @@ for b in "${browsers[@]}"; do
 JSON
     found+=("$b")
 done
+if ((${#blocked[@]})); then
+    echo "  macOS did not let this program write into: ${blocked[*]} (it protects other apps' data)"
+    echo "  Allow it when macOS asks, or run this again from your terminal: bash $here/install-user.sh"
+fi
 if ((${#found[@]})); then
     echo "  native host for: ${found[*]}"
 else

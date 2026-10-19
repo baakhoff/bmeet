@@ -1,8 +1,10 @@
 # BMeet
 
-Voice typing, meeting transcripts and file transcription for **KDE Plasma 6**. Whisper
-runs locally on the **Intel NPU** of Core Ultra laptops. It's fast, it stays on your
-machine, and the CPU and GPU are left alone.
+Voice typing, meeting transcripts and file transcription for **KDE Plasma 6** and for
+**Macs with Apple silicon**. Whisper runs locally on the **Intel NPU** of Core Ultra laptops,
+or on the **Neural Engine** of an M1 or later. It's fast, it stays on your machine, and the
+CPU and GPU are left alone. On a Mac it is a menu bar app with ⌃⌥ shortcuts: see
+[docs/macos.md](docs/macos.md).
 
 [![CI](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml/badge.svg)](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/baakhoff/bmeet)](https://github.com/baakhoff/bmeet/releases)
@@ -48,6 +50,12 @@ BMeet adds:
 
 ## Requirements
 
+**Mac:** Apple silicon (M1 or later), macOS 14.2 or later, the Command Line Tools
+(`xcode-select --install`) and [Homebrew](https://brew.sh); about 5 GB of disk. Everything
+below about Linux has its Mac counterpart in [docs/macos.md](docs/macos.md).
+
+**Linux:**
+
 - **CPU:** an Intel Core Ultra with an NPU (`/dev/accel/accel0`).
   - Tested on Lunar Lake (Core Ultra 7 258V).
   - Meteor Lake and Arrow Lake should work, but are untested.
@@ -61,7 +69,8 @@ BMeet adds:
 curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
 ```
 
-The installer asks for your sudo password once. It then:
+On a Mac the same line installs the Mac version, without sudo ([docs/macos.md](docs/macos.md)).
+On Linux the installer asks for your sudo password once. It then:
 
 1. **Installs packages:** voxtype 1.1.0, the OpenVINO GenAI SDK, ydotool, ffmpeg and PyQt6, plus Intel's NPU driver if it's missing.
    - Every download is checked against a pinned sha256.
@@ -205,6 +214,7 @@ bash ~/.local/share/bmeet/src/uninstall.sh
 | [`voxtype/`](voxtype) | voxtype config, shortcuts, meeting and language helpers, `verify.sh` |
 | [`transcribe/`](transcribe) | `npu-transcribe` and its tests |
 | [`bmeet/`](bmeet) | `bmeet-ctl`, the BMeet app, the Plasma widget and the Chrome extension |
+| [`macos/`](macos) | the Mac version: BMeet.app (menu bar, Swift), the Whisper server on the Neural Engine (WhisperKit), the recorder, the meeting runner, the Core ML builds of the models, the installer ([docs/macos.md](docs/macos.md)) |
 | [`docs/`](docs) | design notes, benchmarks, troubleshooting |
 
 ## Development
@@ -244,7 +254,7 @@ database, and never open your real one.
   - People are numbered until you name them in the app; only remembered voices are named automatically.
 - **Muted in the call:** only Google Meet and Slack in Chrome (or another Chromium-based browser), with the extension loaded. Desktop call apps (Zoom, Teams) are not seen. The first second or so after you mute can still be transcribed.
 - **Opening the app from the widget** may only flash it in the task bar (Wayland focus-stealing prevention).
-- **Only Ubuntu/Kubuntu 26.04 has been tested;** the pinned packages are built for it.
+- **Only Ubuntu/Kubuntu 26.04 has been tested;** the pinned packages are built for it. On the Mac side: an M1 with macOS 27; the differences from Linux are in [docs/macos.md](docs/macos.md#differences-from-linux).
 
 More in [docs/troubleshooting.md](docs/troubleshooting.md).
 
@@ -257,5 +267,6 @@ More in [docs/troubleshooting.md](docs/troubleshooting.md).
 - NVIDIA's [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) ([OpenMDW-1.1](https://openmdw.ai/license/1-1/)): who speaks when.
 - NVIDIA's [TitaNet-small](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) (CC-BY-4.0): voice fingerprints, for remembered voices; [pyannote segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT): the way of telling voices apart before 0.6.0, kept as a fallback.
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0): the ONNX exports of these models, and the GTCRN speech enhancement model.
+- On a Mac: [WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) by Argmax (MIT) and its [Core ML exports of Whisper](https://huggingface.co/argmaxinc/whisperkit-coreml); Apple's [coremltools](https://github.com/apple/coremltools) (BSD-3-Clause) and Microsoft's [ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT) for building the Core ML models.
 
 They're downloaded at install time under their own licenses. This repository is [MIT](LICENSE).

@@ -39,9 +39,14 @@ let variants: [String: (folder: String, tokenizer: String)] = [
     "small": ("openai_whisper-small_216MB", "openai/whisper-small"),
 ]
 
+/// $XDG_RUNTIME_DIR/bmeet, as BMeet's Python programs see it (macos/bmeetmac.py: your temp folder).
 func runtimeDir() -> URL {
-    if let dir = ProcessInfo.processInfo.environment["BMEET_RUNTIME_DIR"], !dir.isEmpty {
+    let env = ProcessInfo.processInfo.environment
+    if let dir = env["BMEET_RUNTIME_DIR"], !dir.isEmpty {
         return URL(fileURLWithPath: dir)
+    }
+    if let dir = env["XDG_RUNTIME_DIR"], !dir.isEmpty {
+        return URL(fileURLWithPath: dir).appendingPathComponent("bmeet")
     }
     var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
     let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)

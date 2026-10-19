@@ -19,6 +19,11 @@ import sys
 import time
 from pathlib import Path
 
+if sys.platform == "darwin":  # macOS: $XDG_RUNTIME_DIR is BMeet's runtime folder (macos/bmeetmac.py)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "macos"))
+    import bmeetmac  # noqa: E402
+    bmeetmac.setup()
+
 RUN = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
 POINTER = Path(os.environ.get("BMEET_RECORDING_FILE") or RUN / "bmeet/recording")
 AUDIO_ROOT = Path(os.environ.get("BMEET_AUDIO_DIR") or RUN / "bmeet/meeting-audio")

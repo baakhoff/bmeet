@@ -99,6 +99,16 @@ from typing import Generator, Iterator
 # stub when the module cannot be imported, so make it unimportable for us.
 sys.modules["openvino_telemetry"] = None
 
+# On a Mac with Apple silicon the same program runs the models on the Neural Engine through Core
+# ML (macos/): Whisper in bmeet-whisper (WhisperKit), GigaAM and the speaker models as Core ML
+# programs that macos/prepare-coreml builds from the same files. "NPU" then means the Neural
+# Engine (shown as ANE), and the CPU is the fallback, as on Linux.
+MAC = sys.platform == "darwin"
+if MAC:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "macos"))
+    import bmeetmac  # noqa: E402
+    bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder
+
 # The models run on the NPU. numpy's BLAS would start a thread per core for the small matrix
 # products of the audio features, and they busy-wait afterwards: in a 5-minute meeting that
 # was 12 s of CPU instead of 0.9 s, for the same wall time. One thread is plenty.
@@ -118,6 +128,11 @@ MODELS = {
     "turbo": MODELS_DIR / "whisper-large-v3-turbo-int8-ov",
     "small": MODELS_DIR / "whisper-small-int8-ov",
 }
+MODEL_FILE = "openvino_encoder_model.xml"   # what makes a folder a Whisper model
+if MAC:  # WhisperKit's Core ML exports (macos/models/whisperkit.tsv)
+    MODELS = {"turbo": MODELS_DIR / "whisperkit/openai_whisper-large-v3-v20240930_626MB",
+              "small": MODELS_DIR / "whisperkit/openai_whisper-small_216MB"}
+    MODEL_FILE = "AudioEncoder.mlmodelc"
 # GigaAM v3 e2e CTC (Sber, MIT; Russian only, with punctuation): sherpa-onnx's export, made
 # NPU-safe once by transcribe/prepare-models (fixed 30 s input; docs/npu-transcribe.md).
 GIGAAM_DIR = MODELS_DIR / "gigaam-v3-ctc-ru"
@@ -506,6 +521,118 @@ class Whisper:
         return None
 
 
+class WhisperANE:
+    """macOS: Whisper on the Apple Neural Engine. WhisperKit runs it in bmeet-whisper, one server
+    that every BMeet process shares (one loaded model on an 8 GB Mac, not one per process; it
+    starts when first asked and exits when idle). The same generate() as Whisper above, with an
+    answer shaped like WhisperPipeline's (WhisperResult)."""
+
+    def __init__(self, model_dir: Path, devices: list[str], word_timestamps: bool = False,
+                 priority: int = 0) -> None:
+        self.model_dir, self.devices = model_dir, devices
+        self.word_timestamps = word_timestamps
+        self.model = "small" if model_dir == MODELS["small"] else "turbo"   # the server's names
+        if model_dir not in MODELS.values():
+            raise SystemExit(f"{PROG}: on a Mac --model is turbo or small")
+        self.priority = priority   # dictation 2, live transcript 1, files 0: who goes first
+        self.device = ""
+        self.used = False
+        self.failures = 0
+        self._load()
+
+    def _request(self, extra: dict) -> dict:
+        return {"model": self.model, "compute": "cpu" if self.devices[0] == "CPU" else "ane",
+                "priority": self.priority, **extra}
+
+    def _load(self) -> None:
+        log(f"loading {self.model_dir.name} on {self.devices[0]} (bmeet-whisper; the first time macOS "
+            "compiles it for the Neural Engine: ~2 min for turbo, once)")
+        t0 = time.monotonic()
+        answer = bmeetmac.whisper(self._request({"op": "load"}), timeout=None)
+        self.device = answer.get("device") or self.devices[0]
+        log(f"model ready on {self.device} in {time.monotonic() - t0:.1f} s")
+
+    def ready_for_detection(self) -> None:
+        pass   # (detection works on every request here)
+
+    def detect(self, samples: np.ndarray) -> str | None:
+        try:
+            return bmeetmac.whisper(self._request({"op": "detect"}), samples).get("language") or None
+        except (RuntimeError, OSError) as exc:
+            log(f"WARNING: language detection failed: {exc}")
+            return None
+
+    def generate(self, samples: np.ndarray, **kwargs):
+        """Like Whisper.generate(): a WhisperResult, or None when this block cannot be
+        transcribed (after one retry; the server falls back to the CPU itself)."""
+        language = (kwargs.get("language") or "").strip("<|>") or None
+        req = self._request({"op": "transcribe", "language": language,
+                             "task": kwargs.get("task", "transcribe"),
+                             "timestamps": bool(kwargs.get("return_timestamps", True)),
+                             "words": bool(kwargs.get("word_timestamps", False))})
+        for attempt in (1, 2):
+            try:
+                answer = bmeetmac.whisper(req, samples)
+                self.used, self.failures = True, 0
+                self.device = answer.get("device") or self.device
+                return WhisperResult(answer)
+            except (RuntimeError, OSError) as exc:
+                reason = " ".join(str(exc).split())
+                if attempt == 1:
+                    log(f"WARNING: transcription failed: {reason}; retrying this block")
+        self.failures += 1
+        log("WARNING: a block could not be transcribed: skipped")
+        return None
+
+
+class WhisperResult:
+    """bmeet-whisper's answer in the shape of OpenVINO GenAI's WhisperDecodedResults: texts,
+    language ("<|en|>"), chunks (text, start_ts, end_ts) and words (word, start_ts, end_ts),
+    times from the start of the audio sent."""
+
+    def __init__(self, answer: dict) -> None:
+        from types import SimpleNamespace
+        segments = answer.get("segments") or []
+        self.texts = [" ".join((answer.get("text") or "").split())]
+        self.language = f"<|{answer.get('language') or ''}|>"
+        self.chunks = [SimpleNamespace(text=s.get("text", ""), start_ts=s.get("start", 0.0), end_ts=s.get("end", 0.0))
+                       for s in segments]
+        self.words = [SimpleNamespace(word=w["word"], start_ts=w["start"], end_ts=w["end"])
+                      for s in segments for w in s.get("words") or []] or None
+
+
+class CoreMLNet:
+    """macOS: a compiled Core ML model (.mlmodelc, built by macos/prepare-coreml) with OpenVINO's
+    infer(): {input: array} -> {output: array}. "ANE" lets Core ML use the Neural Engine."""
+
+    def __init__(self, path: Path, device: str) -> None:
+        import coremltools as ct
+        units = ct.ComputeUnit.CPU_AND_NE if device == "ANE" else ct.ComputeUnit.CPU_ONLY
+        self.model = ct.models.CompiledMLModel(str(path), compute_units=units)
+
+    def infer(self, inputs: dict) -> dict:
+        feed = {k: (v.astype(np.int32) if v.dtype == np.int64 else v) for k, v in inputs.items()}
+        return self.model.predict(feed)
+
+
+def coreml_net(path: Path, devices: list[str], what: str) -> tuple[CoreMLNet, str]:
+    """`path` on the first of `devices` that loads it (macOS: ANE, then CPU)."""
+    for i, dev in enumerate(devices):
+        log(f"loading {what} on {dev}")
+        t0 = time.monotonic()
+        try:
+            net = CoreMLNet(path, dev)
+        except Exception as exc:
+            reason = " ".join(f"loading on {dev} failed: {exc}".split())
+            if i == len(devices) - 1:
+                raise RuntimeError(reason)
+            log(f"WARNING: {reason}; falling back to {devices[i + 1]}")
+            continue
+        log(f"model ready on {dev} in {time.monotonic() - t0:.1f} s")
+        return net, dev
+    raise RuntimeError(f"no device for {what}")
+
+
 @dataclass
 class Word:
     start: float
@@ -534,6 +661,8 @@ class Transcript:
 # --------------------------------------------------------------------------- gigaam
 
 def gigaam_ready() -> bool:
+    if MAC:  # (model.mlmodelc is a folder)
+        return all((GIGAAM_DIR / f).exists() for f in ("model.mlmodelc", "tokens.txt"))
     return all((GIGAAM_DIR / f).is_file() for f in ("model.xml", "model.bin", "tokens.txt"))
 
 
@@ -548,13 +677,16 @@ class GigaAM:
     STEP = 4 * HOP / SAMPLE_RATE                                # 40 ms per output frame
 
     def __init__(self, devices: list[str]) -> None:
-        import openvino as ov
         self.devices, self.device, self.model_dir = devices, "", GIGAAM_DIR
         self.tokens = [line.rsplit(" ", 1)[0]
                        for line in (GIGAAM_DIR / "tokens.txt").read_text(encoding="utf-8").splitlines()]
         self.blank = len(self.tokens) - 1
         self.window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.N_FFT) / self.N_FFT)  # periodic Hann
         self.mel = self.mel_filters()
+        if MAC:  # the Core ML build of macos/prepare-coreml, on the Neural Engine
+            self.req, self.device = coreml_net(GIGAAM_DIR / "model.mlmodelc", self.devices, "GigaAM v3")
+            return
+        import openvino as ov
         core = ov.Core()
         while True:
             dev = self.devices[0]
@@ -947,6 +1079,9 @@ class Turn:
 
 
 def speaker_models_missing() -> list[Path]:
+    if MAC:  # Core ML builds (folders) of macos/prepare-coreml; no pyannote (see load_coreml)
+        return [p for p in (SPEAKER_MODELS / "titanet.mlmodelc", DIARIZATION_MODEL / "encoder.mlmodelc")
+                if not p.exists()]
     who = SEGMENTATION_MODEL if USE_PYANNOTE else DIARIZATION_MODEL / "encoder.xml"
     return [p for p in (EMBEDDING_MODEL, who) if not p.is_file()
             and not (p == who and SEGMENTATION_MODEL.is_file())]   # (pyannote: before 0.6.0)
@@ -974,12 +1109,32 @@ class SpeakerModels:
     MELS, N_FFT, WIN, HOP = 80, 512, 400, 160
 
     def __init__(self, devices: list[str]) -> None:
-        import openvino as ov
         if missing := speaker_models_missing():
             raise RuntimeError(f"speaker model missing: {missing[0]} - run the installer again")
-        core = ov.Core()
         self.emb_frames = int(self.EMB_SECONDS * SAMPLE_RATE / self.HOP) + 1
         self.nemotron: Nemotron | None = None
+        if MAC:
+            self.load_coreml(devices)
+        else:
+            self.load_openvino(devices)
+        self.mel = slaney_filters(self.MELS, self.N_FFT)
+        win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.WIN) / self.WIN)  # periodic Hann
+        self.window = np.pad(win, ((self.N_FFT - self.WIN) // 2, (self.N_FFT - self.WIN + 1) // 2))
+
+    def load_coreml(self, devices: list[str]) -> None:
+        """macOS: the same models as Core ML programs (macos/prepare-coreml) on the Neural Engine;
+        TitaNet's float16 fix (titanet_npu_safe) is built into its Core ML program. The pyannote
+        way of before 0.6.0 is not there: a Mac install always has Nemotron (and ONNX Runtime,
+        which pyannote would need, crashes next to Core ML in one process)."""
+        if USE_PYANNOTE:
+            raise RuntimeError("NPU_DIARIZATION=pyannote is not available on macOS")
+        self.nemotron = Nemotron.coreml(devices)
+        self.emb, self.device = coreml_net(SPEAKER_MODELS / "titanet.mlmodelc", devices, "TitaNet-small")
+        self.emb_out = "embs"
+
+    def load_openvino(self, devices: list[str]) -> None:
+        import openvino as ov
+        core = ov.Core()
         while True:
             dev = devices[0]
             try:
@@ -1005,9 +1160,6 @@ class SpeakerModels:
             self.device = dev
             break
         self.emb_out = next(o for o in self.emb.model_outputs if "emb" in o.get_any_name())
-        self.mel = slaney_filters(self.MELS, self.N_FFT)
-        win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(self.WIN) / self.WIN)  # periodic Hann
-        self.window = np.pad(win, ((self.N_FFT - self.WIN) // 2, (self.N_FFT - self.WIN + 1) // 2))
 
     def features(self, x: np.ndarray) -> np.ndarray:
         """NeMo's: preemphasis 0.97, centred STFT, power, log mel, normalised per feature"""
@@ -1084,6 +1236,18 @@ class Nemotron:
             raise RuntimeError(f"unexpected Nemotron model in {DIARIZATION_MODEL} - run the installer again")
         self.silence = np.load(DIARIZATION_MODEL / "silence.npy")
         self.setup_features()
+
+    @classmethod
+    def coreml(cls, devices: list[str]) -> "Nemotron":
+        """macOS: the Core ML build (macos/prepare-coreml, the same graph and sizes)."""
+        self = cls.__new__(cls)
+        self.embedder, _ = coreml_net(DIARIZATION_MODEL / "embedder.mlmodelc", devices, "Nemotron 3 embedder")
+        self.encoder, _ = coreml_net(DIARIZATION_MODEL / "encoder.mlmodelc", devices, "Nemotron 3 Diarization")
+        self.block = cls.CHUNK + cls.AHEAD
+        self.step = SpeakerCache.LENGTH + SpeakerCache.FIFO + cls.CHUNK + cls.AHEAD
+        self.silence = np.load(DIARIZATION_MODEL / "silence.npy")
+        self.setup_features()
+        return self
 
     def setup_features(self) -> None:
         self.mel = slaney_filters(self.MELS, self.N_FFT)
@@ -2108,6 +2272,10 @@ def write_atomic(path: Path, text: str, private: bool = False) -> None:
 
 def notify(ok: bool, body: list[str], summary: str = "") -> None:
     """Desktop notification (used by the Dolphin service menu and meetings)."""
+    if MAC:   # (BMeet.app posts it)
+        bmeetmac.notify(summary or ("Transcription finished" if ok else "Transcription failed"),
+                        "\n".join(body[:10]), ok)
+        return
     if not shutil.which("notify-send"):
         return
     summary = summary or ("Transcription finished" if ok else "Transcription failed")
@@ -2176,9 +2344,10 @@ def output_stem(out_dir: Path, src: Path, formats: list[str], overwrite: bool) -
 
 def resolve_model(value: str) -> Path:
     path = MODELS.get(value) or Path(value).expanduser()
-    if not (path / "openvino_encoder_model.xml").is_file():
+    if not (path / MODEL_FILE).exists():
         hint = " - install it with the BMeet installer (--with-turbo)" if value == "turbo" else ""
-        raise SystemExit(f"{PROG}: model not found: {path} (expected an OpenVINO Whisper export){hint}")
+        kind = "a WhisperKit Core ML model" if MAC else "an OpenVINO Whisper export"
+        raise SystemExit(f"{PROG}: model not found: {path} (expected {kind}){hint}")
     return path
 
 
@@ -2198,6 +2367,8 @@ def pick_devices(requested: str) -> list[str]:
     (OpenVINO's "AUTO" plugin runs Whisper on the CPU here, measured 2026-10-11,
     because the NPU needs the static Whisper pipeline that only "NPU" selects.)
     """
+    if MAC:  # the Neural Engine (Core ML), the CPU as the fallback
+        return ["CPU"] if requested == "CPU" else ["ANE", "CPU"]
     if requested == "CPU":
         return ["CPU"]
     import openvino as ov
@@ -2218,8 +2389,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--model", default=None, metavar="turbo|small|DIR",
                    help="turbo (default if installed, else small), small, or a path to an "
                         "OpenVINO Whisper model dir")
-    p.add_argument("--device", default="NPU", type=str.upper, choices=("NPU", "CPU", "AUTO"),
-                   help="NPU (default, falls back to CPU), CPU, or AUTO (NPU if present)")
+    p.add_argument("--device", default="NPU", type=str.upper, choices=("NPU", "ANE", "CPU", "AUTO"),
+                   help="NPU (default, falls back to CPU; on a Mac the Neural Engine, also called ANE), CPU, "
+                        "or AUTO (NPU if present)")
     p.add_argument("--language", default="auto", metavar="auto|en|ru|...",
                    help="spoken language (default: detected from the first 30 s with speech of each file)")
     p.add_argument("--translate", action="store_true", help="translate the speech to English")
@@ -2283,7 +2455,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if not args.formats or set(args.formats) - set(FORMATS):
         p.error(f"--format: choose from {', '.join(FORMATS)}")
     if args.model is None:
-        turbo_installed = (MODELS["turbo"] / "openvino_encoder_model.xml").is_file()
+        turbo_installed = (MODELS["turbo"] / MODEL_FILE).exists()
         args.model = "small" if args.translate or not turbo_installed else "turbo"
         if args.translate and turbo_installed:
             log("--translate: using the small model (turbo was not trained to translate)")
@@ -2311,7 +2483,11 @@ class Engines:
         if self._whisper is not None and words and not self._whisper.word_timestamps:
             self._whisper = None  # (frees the pipeline without them)
         if self._whisper is None:
-            self._whisper = Whisper(self.model_dir, list(self.devices), word_timestamps=words)
+            if MAC:   # (dictation goes first at the shared server, then the live transcript)
+                priority = 2 if self.args.dictate or self.args.dictate_file else 1 if self.args.live else 0
+                self._whisper = WhisperANE(self.model_dir, list(self.devices), words, priority)
+            else:
+                self._whisper = Whisper(self.model_dir, list(self.devices), word_timestamps=words)
         return self._whisper
 
     def english_terms(self, samples: np.ndarray, t: Transcript) -> int:
@@ -2347,10 +2523,15 @@ class Engines:
                     continue
                 whisper = self.whisper()
                 whisper.ready_for_detection()
-                result = whisper.generate(block, return_timestamps=False, task="transcribe")
-                if result is None:
-                    continue
-                language = (result.language or "?").strip("<|>")
+                if MAC:   # (the server detects without transcribing)
+                    language = whisper.detect(block)
+                    if language is None:
+                        continue
+                else:
+                    result = whisper.generate(block, return_timestamps=False, task="transcribe")
+                    if result is None:
+                        continue
+                    language = (result.language or "?").strip("<|>")
                 if first is None:
                     log(f"language: {language} (detected from the first 30 s with sound)")
                     yours = user_languages()
@@ -3188,6 +3369,9 @@ class MicSource:
     COMMAND = ["pw-record", "--raw", "--rate", str(SAMPLE_RATE), "--channels", "1", "--format", "s16",
                "--latency", "50ms", "-P", '{ "media.name": "BMeet dictation", "application.name": "BMeet" }', "-"]
 
+    if MAC:   # BMeet's recorder (macos/Sources/bmeet-record): the same format, and it buffers itself
+        COMMAND = [str(bmeetmac.helper("bmeet-record")), "raw"]
+
     def __init__(self) -> None:
         self.proc = subprocess.Popen(self.COMMAND, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
@@ -3195,7 +3379,7 @@ class MicSource:
         self.fd, self.rest, self.eof = self.proc.stdout.fileno(), b"", False
         try:
             fcntl.fcntl(self.fd, fcntl.F_SETPIPE_SZ, 1 << 20)
-        except OSError:
+        except (OSError, AttributeError):   # (F_SETPIPE_SZ is Linux's)
             pass
         os.set_blocking(self.fd, False)
 
@@ -3354,7 +3538,7 @@ def dictate_serve(args: argparse.Namespace, engines: Engines) -> int:
             if d.step():
                 emit(text_event(d, clock))
             if isinstance(source, MicSource) and source.ended():
-                raise RuntimeError("the microphone stopped (pw-record ended)")
+                raise RuntimeError("the microphone stopped (the recorder ended)")
         except Exception as exc:
             source.kill()
             d = source = None

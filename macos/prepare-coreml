@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""prepare-coreml - build BMeet's speech models for the Apple Neural Engine, once, at install time.
+
+On Linux the models run on the Intel NPU through OpenVINO. On a Mac with Apple silicon the
+same models run on the Neural Engine, which only Core ML can reach, and which computes in
+float16 only. ONNX Runtime's Core ML backend keeps an ONNX model in float32 and so leaves it
+on the CPU (measured on an M1: TitaNet as fast with the Neural Engine allowed as without, and
+bit-identical to the CPU), so this script builds real Core ML programs instead:
+
+- ONNX models (GigaAM v3, TitaNet-small) are first given fixed input shapes and constant-folded
+  by ONNX Runtime's basic optimiser (all shape arithmetic becomes constants), then translated
+  op by op into a Core ML ML Program (onnx_to_mil below: the ~35 ONNX ops these two models
+  use) and saved with float16 compute precision, the Neural Engine's.
+- Nemotron 3 Diarization is built from its weights by transcribe/prepare-diarization's own
+  graph code, given Core ML ops instead of OpenVINO's (MilOps): the same model as on the NPU.
+
+Each model is compiled (.mlmodelc), checked against ONNX Runtime / numpy on the CPU, and
+its compute plan is asked how much of it Core ML puts on the Neural Engine.
+
+Usage:
+  prepare-coreml gigaam GIGAAM_SRC OUT_DIR       sherpa-onnx's GigaAM v3 folder -> model.mlmodelc, tokens.txt
+  prepare-coreml titanet TITANET.onnx OUT_DIR    -> titanet.mlmodelc (16 x 4 s per call)
+  prepare-coreml nemotron MODEL.safetensors OUT_DIR   -> embedder.mlmodelc, encoder.mlmodelc, silence.npy
+  prepare-coreml plan MODEL.mlmodelc             where Core ML runs each op of a model
+Run with the npu-transcribe venv's Python (coremltools, onnx, onnxruntime, numpy).
+"""
+from __future__ import annotations
+
+import collections
+import importlib.machinery
+import importlib.util
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+TRANSCRIBE = HERE.parent / "transcribe"
+GIGAAM_FRAMES = 2999                  # 30 s of features (npu-transcribe's GigaAM.FRAMES)
+TITANET_BATCH, TITANET_FRAMES = 16, 401   # npu-transcribe's SpeakerModels.EMB_BATCH, 4 s of frames
+TITANET_SCALE = 64.0                  # see titanet_fp16_safe
+
+
+def load_script(name: str):
+    """A sibling script without .py (prepare-models, prepare-diarization) as a module."""
+    path = TRANSCRIBE / name
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------- ONNX -> Core ML
+
+def static_and_folded(src: Path, shapes: dict[str, list[int]], work: Path):
+    """The ONNX model with fixed input shapes, constant-folded by ONNX Runtime (basic level:
+    only standard ONNX ops come out)."""
+    import onnx
+    import onnxruntime as ort
+    m = onnx.load(str(src))
+    for i in m.graph.input:
+        if i.name in shapes:
+            for d, v in zip(i.type.tensor_type.shape.dim, shapes[i.name]):
+                d.ClearField("dim_param")
+                d.dim_value = v
+    fixed = work / "static.onnx"
+    onnx.save(m, str(fixed), save_as_external_data=True, location="static.onnx.data")
+    folded = work / "folded.onnx"
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    so.optimized_model_filepath = str(folded)
+    so.add_session_config_entry("session.optimized_model_external_initializers_file_name", "folded.onnx.data")
+    so.add_session_config_entry("session.optimized_model_external_initializers_min_size_in_bytes", "1024")
+    ort.InferenceSession(str(fixed), so, providers=["CPUExecutionProvider"])
+    return onnx.load(str(folded))
+
+
+class OnnxToMil:
+    """Translate one ONNX graph (fixed shapes, constant-folded) into a Core ML ML Program.
+
+    Values are numpy arrays while they are constants and MIL Vars once they depend on an
+    input; an op on constants only is still emitted (coremltools folds it), and its value is
+    read back where an op needs a constant (a shape, axes, slice bounds). int64 becomes int32
+    (Core ML has no int64 tensors), float64 float32."""
+
+    def __init__(self, model, inputs: dict[str, tuple[tuple[int, ...], str]]) -> None:
+        from coremltools.converters.mil import Builder as mb
+        from onnx import numpy_helper
+        self.mb, self.model, self.inputs = mb, model, inputs
+        self.env: dict[str, object] = {}
+        for init in model.graph.initializer:
+            self.env[init.name] = numpy_helper.to_array(init)
+
+    # values ---------------------------------------------------------------------------
+    def get(self, name: str):
+        return self.env[name] if name else None
+
+    @staticmethod
+    def narrow(a):
+        a = np.asarray(a)
+        if a.dtype == np.int64:
+            return a.astype(np.int32)
+        if a.dtype == np.float64:
+            return a.astype(np.float32)
+        return a
+
+    def mil(self, x):
+        """x as something a MIL op takes: a Var, or a (narrowed) numpy constant."""
+        return self.narrow(x) if isinstance(x, (np.ndarray, np.generic, int, float)) else x
+
+    @staticmethod
+    def value(x) -> np.ndarray | None:
+        if isinstance(x, (np.ndarray, np.generic)):
+            return np.asarray(x)
+        val = getattr(x, "val", None)
+        return None if val is None else np.asarray(val)
+
+    def need(self, x, what: str) -> np.ndarray:
+        v = self.value(x)
+        if v is None:
+            raise SystemExit(f"onnx_to_mil: {what} is not a constant")
+        return v
+
+    @staticmethod
+    def shape(x) -> tuple[int, ...]:
+        if isinstance(x, (np.ndarray, np.generic)):
+            return tuple(np.shape(x))
+        return tuple(int(d) for d in x.shape)
+
+    # the translation --------------------------------------------------------------------
+    def build(self):
+        import coremltools as ct
+        from coremltools.converters.mil.mil import Function, Program, types
+        dtypes = {"fp32": types.fp32, "int32": types.int32}
+        specs = {n: self.mb.placeholder(shape=s, dtype=dtypes[t]) for n, (s, t) in self.inputs.items()}
+        prog = Program()
+        with Function(specs, opset_version=ct.target.macOS14) as fn:
+            for n in self.inputs:
+                self.env[n] = fn.inputs[n]
+            for node in self.model.graph.node:
+                self.node(node)
+            outs = []
+            for o in self.model.graph.output:
+                v = self.env[o.name]
+                outs.append(self.mb.identity(x=v, name=o.name) if not isinstance(v, np.ndarray) else v)
+            fn.set_outputs(outs)
+        prog.add_function("main", fn)
+        return prog
+
+    def node(self, node) -> None:
+        from onnx import helper
+        attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+        ins = [self.get(i) for i in node.input]
+        handler = getattr(self, "op_" + node.op_type, None)
+        if handler is None:
+            raise SystemExit(f"onnx_to_mil: no translation for {node.op_type} ({node.name})")
+        out = handler(ins, attrs, node)
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        for name, v in zip(node.output, outs):
+            self.env[name] = v
+
+    # elementwise
+    def _bin(self, op, ins):
+        a, b = ins
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            return None
+        return getattr(self.mb, op)(x=self.mil(a), y=self.mil(b))
+
+    def op_Add(self, ins, a, n):
+        return self._np2(np.add, ins) if self._consts(ins) else self._bin("add", ins)
+
+    def op_Sub(self, ins, a, n):
+        return self._np2(np.subtract, ins) if self._consts(ins) else self._bin("sub", ins)
+
+    def op_Mul(self, ins, a, n):
+        return self._np2(np.multiply, ins) if self._consts(ins) else self._bin("mul", ins)
+
+    def op_Div(self, ins, a, n):
+        if self._consts(ins):
+            x, y = ins
+            return (x // y if np.issubdtype(x.dtype, np.integer) else x / y).astype(x.dtype)
+        return self._bin("real_div", ins)
+
+    def op_Pow(self, ins, a, n):
+        x, e = ins
+        ev = self.value(e)
+        if ev is not None and ev.size == 1 and float(ev) == 2.0:
+            return self.mb.mul(x=self.mil(x), y=self.mil(x))
+        if ev is not None and ev.size == 1 and float(ev) == 0.5:
+            return self.mb.sqrt(x=self.mil(x))
+        return self.mb.pow(x=self.mil(x), y=self.mil(e))
+
+    def _consts(self, ins) -> bool:
+        return all(isinstance(i, np.ndarray) for i in ins if i is not None)
+
+    @staticmethod
+    def _np2(f, ins):
+        x, y = ins
+        return np.asarray(f(x, y)).astype(np.result_type(x, y))
+
+    def _un(self, op, ins):
+        return getattr(self.mb, op)(x=self.mil(ins[0]))
+
+    def op_Sqrt(self, ins, a, n): return self._un("sqrt", ins)
+    def op_Abs(self, ins, a, n): return self._un("abs", ins)
+    def op_Relu(self, ins, a, n): return self._un("relu", ins)
+    def op_Sigmoid(self, ins, a, n): return self._un("sigmoid", ins)
+    def op_Tanh(self, ins, a, n): return self._un("tanh", ins)
+    def op_Erf(self, ins, a, n): return self._un("erf", ins)
+    def op_Floor(self, ins, a, n):
+        return np.floor(ins[0]) if self._consts(ins) else self._un("floor", ins)
+
+    def op_Neg(self, ins, a, n):
+        return -ins[0] if self._consts(ins) else self.mb.mul(x=self.mil(ins[0]), y=np.float32(-1.0))
+
+    def op_Not(self, ins, a, n):
+        return np.logical_not(ins[0]) if self._consts(ins) else self.mb.logical_not(x=ins[0])
+
+    def op_Less(self, ins, a, n):
+        return np.less(*ins) if self._consts(ins) else self._bin("less", ins)
+
+    def op_Equal(self, ins, a, n):
+        return np.equal(*ins) if self._consts(ins) else self._bin("equal", ins)
+
+    def op_Where(self, ins, a, n):
+        c, x, y = ins
+        if self._consts(ins):
+            return np.where(c, x, y)
+        return self.mb.select(cond=self.mil(c), a=self.mil(x), b=self.mil(y))
+
+    def op_Cast(self, ins, a, n):
+        import onnx
+        to = a["to"]
+        if self._consts(ins):
+            return ins[0].astype(onnx.helper.tensor_dtype_to_np_dtype(to))
+        dtype = {onnx.TensorProto.FLOAT: "fp32", onnx.TensorProto.FLOAT16: "fp16",
+                 onnx.TensorProto.INT64: "int32", onnx.TensorProto.INT32: "int32",
+                 onnx.TensorProto.BOOL: "bool"}[to]
+        return self.mb.cast(x=ins[0], dtype=dtype)
+
+    def op_Clip(self, ins, a, n):
+        x = ins[0]
+        lo = self.value(ins[1]) if len(ins) > 1 and ins[1] is not None else np.float32(-65504)
+        hi = self.value(ins[2]) if len(ins) > 2 and ins[2] is not None else np.float32(65504)
+        return self.mb.clip(x=self.mil(x), alpha=np.float32(lo), beta=np.float32(hi))
+
+    # linear algebra
+    def op_MatMul(self, ins, a, n):
+        x, y = ins
+        if isinstance(y, np.ndarray) and y.ndim == 2:   # a weight: linear (one op, ANE-friendly)
+            return self.mb.linear(x=self.mil(x), weight=np.ascontiguousarray(y.T.astype(np.float32)))
+        return self.mb.matmul(x=self.mil(x), y=self.mil(y))
+
+    def op_Gemm(self, ins, a, n):
+        x, w = ins[:2]
+        b = ins[2] if len(ins) > 2 else None
+        alpha, beta = a.get("alpha", 1.0), a.get("beta", 1.0)
+        if a.get("transA", 0):
+            x = self.mb.transpose(x=x, perm=[1, 0])
+        if not isinstance(w, np.ndarray):
+            raise SystemExit("onnx_to_mil: Gemm with a computed weight")
+        w = w if a.get("transB", 0) else w.T          # linear wants (out, in)
+        bias = None if b is None else (np.asarray(b, np.float32) * beta)
+        return self.mb.linear(x=self.mil(x), weight=np.ascontiguousarray(w.astype(np.float32) * alpha),
+                              bias=None if bias is None else np.broadcast_to(bias, (w.shape[0],)).copy())
+
+    def op_Conv(self, ins, a, n):
+        x, w = ins[:2]
+        b = ins[2] if len(ins) > 2 else None
+        k = len(w.shape) - 2
+        if a.get("auto_pad", b"NOTSET") not in (b"NOTSET", "NOTSET"):
+            raise SystemExit(f"onnx_to_mil: Conv auto_pad={a['auto_pad']!r}")
+        pads = list(a.get("pads", [0] * 2 * k))
+        pad = [p for i in range(k) for p in (pads[i], pads[i + k])]
+        return self.mb.conv(x=self.mil(x), weight=self.mil(w), bias=None if b is None else self.mil(b),
+                            strides=list(a.get("strides", [1] * k)), dilations=list(a.get("dilations", [1] * k)),
+                            pad_type="custom", pad=pad, groups=int(a.get("group", 1)))
+
+    def op_BatchNormalization(self, ins, a, n):
+        x, gamma, beta, mean, var = ins
+        return self.mb.batch_norm(x=self.mil(x), mean=self.mil(mean), variance=self.mil(var),
+                                  gamma=self.mil(gamma), beta=self.mil(beta), epsilon=np.float32(a.get("epsilon", 1e-5)))
+
+    def op_LayerNormalization(self, ins, a, n):
+        x, gamma = ins[:2]
+        beta = ins[2] if len(ins) > 2 else None
+        rank = len(self.shape(x))
+        axis = a.get("axis", -1) % rank
+        return self.mb.layer_norm(x=self.mil(x), axes=list(range(axis, rank)), gamma=self.mil(gamma),
+                                  beta=None if beta is None else self.mil(beta),
+                                  epsilon=np.float32(a.get("epsilon", 1e-5)))
+
+    def op_Softmax(self, ins, a, n):
+        return self.mb.softmax(x=self.mil(ins[0]), axis=int(a.get("axis", -1)))
+
+    def op_LogSoftmax(self, ins, a, n):
+        axis = int(a.get("axis", -1))
+        x = self.mil(ins[0])
+        return self.mb.sub(x=x, y=self.mb.reduce_log_sum_exp(x=x, axes=[axis], keep_dims=True))
+
+    def op_ReduceSum(self, ins, a, n):
+        x = ins[0]
+        axes = self.need(ins[1], "ReduceSum axes").tolist() if len(ins) > 1 and ins[1] is not None \
+            else a.get("axes")
+        if axes is None or len(axes) == 0:
+            if a.get("noop_with_empty_axes", 0):
+                return x
+            axes = list(range(len(self.shape(x))))
+        return self.mb.reduce_sum(x=self.mil(x), axes=[int(v) for v in axes], keep_dims=bool(a.get("keepdims", 1)))
+
+    # shapes
+    def op_Shape(self, ins, a, n):
+        return np.array(self.shape(ins[0]), np.int64)
+
+    def op_Reshape(self, ins, a, n):
+        x, s = ins
+        shape = [int(v) for v in self.need(s, "Reshape shape")]
+        src = self.shape(x)
+        if not a.get("allowzero", 0):
+            shape = [src[i] if v == 0 else v for i, v in enumerate(shape)]
+        if -1 in shape:
+            known = int(np.prod([v for v in shape if v != -1]))
+            shape[shape.index(-1)] = int(np.prod(src)) // known
+        if isinstance(x, np.ndarray):
+            return x.reshape(shape)
+        return self.mb.reshape(x=x, shape=np.array(shape, np.int32))
+
+    def op_Transpose(self, ins, a, n):
+        x = ins[0]
+        perm = list(a.get("perm", range(len(self.shape(x)) - 1, -1, -1)))
+        return np.transpose(x, perm) if isinstance(x, np.ndarray) else self.mb.transpose(x=x, perm=perm)
+
+    def _axes(self, ins, a, what):
+        if len(ins) > 1 and ins[1] is not None:
+            return [int(v) for v in self.need(ins[1], what).ravel()]
+        return [int(v) for v in a.get("axes", [])]
+
+    def op_Unsqueeze(self, ins, a, n):
+        x, axes = ins[0], self._axes(ins, a, "Unsqueeze axes")
+        if isinstance(x, np.ndarray):
+            out = x
+            rank = x.ndim + len(axes)
+            for ax in sorted(v % rank for v in axes):
+                out = np.expand_dims(out, ax)
+            return out
+        return self.mb.expand_dims(x=x, axes=axes)
+
+    def op_Squeeze(self, ins, a, n):
+        x, axes = ins[0], self._axes(ins, a, "Squeeze axes")
+        if isinstance(x, np.ndarray):
+            return np.squeeze(x, tuple(axes) if axes else None)
+        return self.mb.squeeze(x=x, axes=axes) if axes else self.mb.squeeze(x=x)
+
+    def op_Concat(self, ins, a, n):
+        vals = [v for v in ins if v is not None]
+        axis = int(a["axis"])
+        if self._consts(vals):
+            return np.concatenate(vals, axis)
+        return self.mb.concat(values=[self.mil(v) for v in vals], axis=axis)
+
+    def op_Slice(self, ins, a, n):
+        x = ins[0]
+        shape = self.shape(x)
+        starts = self.need(ins[1], "Slice starts")
+        ends = self.need(ins[2], "Slice ends")
+        axes = self.need(ins[3], "Slice axes") if len(ins) > 3 and ins[3] is not None else np.arange(len(starts))
+        steps = self.need(ins[4], "Slice steps") if len(ins) > 4 and ins[4] is not None else np.ones(len(starts))
+        begin, end, stride = [0] * len(shape), list(shape), [1] * len(shape)
+        for s, e, ax, st in zip(starts.tolist(), ends.tolist(), axes.tolist(), steps.tolist()):
+            ax, dim, st = int(ax) % len(shape), shape[int(ax) % len(shape)], int(st)
+            sl = slice(int(s), int(e), st)
+            b, e2, st2 = sl.indices(dim)
+            begin[ax], end[ax], stride[ax] = b, e2, st2
+        if isinstance(x, np.ndarray):
+            return x[tuple(slice(b, e, s) for b, e, s in zip(begin, end, stride))]
+        end_mask = [stride[i] < 0 and end[i] < 0 for i in range(len(shape))]
+        end = [0 if m else v for v, m in zip(end, end_mask)]
+        return self.mb.slice_by_index(x=x, begin=np.array(begin, np.int32), end=np.array(end, np.int32),
+                                      stride=np.array(stride, np.int32), end_mask=end_mask)
+
+    def op_Split(self, ins, a, n):
+        x = ins[0]
+        axis = int(a.get("axis", 0))
+        if len(ins) > 1 and ins[1] is not None:
+            sizes = [int(v) for v in self.need(ins[1], "Split sizes")]
+        elif "split" in a:
+            sizes = [int(v) for v in a["split"]]
+        else:
+            k = len(n.output)
+            sizes = [self.shape(x)[axis] // k] * k
+        if isinstance(x, np.ndarray):
+            return np.split(x, np.cumsum(sizes)[:-1], axis)
+        return list(self.mb.split(x=x, split_sizes=sizes, axis=axis))
+
+    def op_Gather(self, ins, a, n):
+        x, idx = ins
+        axis = int(a.get("axis", 0))
+        if self._consts(ins):
+            return np.take(x, idx, axis)
+        i = self.need(idx, "Gather indices")
+        return self.mb.gather(x=self.mil(x), indices=i.astype(np.int32), axis=axis)
+
+    def op_Tile(self, ins, a, n):
+        x, reps = ins
+        r = [int(v) for v in self.need(reps, "Tile repeats")]
+        return np.tile(x, r) if isinstance(x, np.ndarray) else self.mb.tile(x=x, reps=r)
+
+    def op_Expand(self, ins, a, n):
+        x, s = ins
+        target = [int(v) for v in self.need(s, "Expand shape")]
+        src = list(self.shape(x))
+        out = list(np.broadcast_shapes(tuple(src), tuple(target)))
+        if isinstance(x, np.ndarray):
+            return np.broadcast_to(x, out).copy()
+        if len(src) < len(out):
+            x = self.mb.expand_dims(x=x, axes=list(range(len(out) - len(src))))
+            src = [1] * (len(out) - len(src)) + src
+        reps = [o // s if s else 1 for o, s in zip(out, src)]
+        return self.mb.tile(x=x, reps=reps) if any(r != 1 for r in reps) else x
+
+    def op_Constant(self, ins, a, n):
+        from onnx import numpy_helper
+        if "value" in a:
+            return numpy_helper.to_array(a["value"])
+        for key in ("value_float", "value_int"):
+            if key in a:
+                return np.array(a[key])
+        for key in ("value_floats", "value_ints"):
+            if key in a:
+                return np.array(list(a[key]))
+        raise SystemExit("onnx_to_mil: unsupported Constant")
+
+    def op_ConstantOfShape(self, ins, a, n):
+        from onnx import numpy_helper
+        val = numpy_helper.to_array(a["value"]) if "value" in a else np.zeros(1, np.float32)
+        return np.full([int(v) for v in self.need(ins[0], "ConstantOfShape shape")], val.ravel()[0], val.dtype)
+
+    def op_Range(self, ins, a, n):
+        s, l, d = (self.need(v, "Range bounds") for v in ins)
+        return np.arange(s, l, d).astype(np.result_type(s, l, d))
+
+    def op_Identity(self, ins, a, n):
+        return ins[0]
+
+
+def to_mlpackage(prog, out: Path):
+    import coremltools as ct
+    model = ct.convert(prog, convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
+                       minimum_deployment_target=ct.target.macOS14, compute_units=ct.ComputeUnit.CPU_AND_NE)
+    if out.exists():
+        shutil.rmtree(out)
+    model.save(str(out))
+    return model
+
+
+def compile_mlpackage(pkg: Path, dst: Path) -> Path:
+    """.mlpackage -> .mlmodelc (what npu-transcribe loads; loading it skips the compile)."""
+    import coremltools as ct
+    tmp = Path(ct.models.utils.compile_model(str(pkg)))
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.move(str(tmp), str(dst))
+    return dst
+
+
+def plan(compiled: Path) -> collections.Counter:
+    """How many of the model's ops Core ML would run on the Neural Engine / GPU / CPU."""
+    import coremltools as ct
+    from coremltools.models.compute_plan import MLComputePlan
+    cp = MLComputePlan.load_from_path(str(compiled), compute_units=ct.ComputeUnit.CPU_AND_NE)
+    counts: collections.Counter = collections.Counter()
+
+    def walk(block):
+        for op in block.operations:
+            usage = cp.get_compute_device_usage_for_mlprogram_operation(op)
+            if usage is not None:
+                counts[type(usage.preferred_compute_device).__name__.replace("ML", "").replace("ComputeDevice", "")] += 1
+            for b in op.blocks:
+                walk(b)
+    walk(cp.model_structure.program.functions["main"].block)
+    return counts
+
+
+def report_plan(compiled: Path) -> float:
+    counts = plan(compiled)
+    total = sum(counts.values()) or 1
+    ane = counts.get("NeuralEngine", 0)
+    print(f"  compute plan: {ane}/{total} ops on the Neural Engine"
+          + "".join(f", {v} on {k}" for k, v in counts.items() if k != "NeuralEngine"))
+    return ane / total
+
+
+def load(compiled: Path, units: str = "CPU_AND_NE"):
+    import coremltools as ct
+    return ct.models.CompiledMLModel(str(compiled), compute_units=getattr(ct.ComputeUnit, units))
+
+
+def timed(model, feed: dict, runs: int = 3) -> tuple[dict, float]:
+    out = model.predict(feed)
+    t0 = time.monotonic()
+    for _ in range(runs):
+        out = model.predict(feed)
+    return out, (time.monotonic() - t0) / runs
+
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a, b = a.astype(np.float64).ravel(), b.astype(np.float64).ravel()
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+
+# --------------------------------------------------------------------------- the models
+
+def prepare_gigaam(src: Path, out: Path) -> None:
+    import onnxruntime as ort
+    prep = load_script("prepare-models")
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        work = Path(tmp)
+        n = prep.dequantize(src / "model.int8.onnx", work / "float.onnx")
+        print(f"  {n} quantised layers back to float")
+        model = static_and_folded(work / "float.onnx", {"features": [1, 64, GIGAAM_FRAMES], "feature_lengths": [1]},
+                                  work)
+        prog = OnnxToMil(model, {"features": ((1, 64, GIGAAM_FRAMES), "fp32"),
+                                 "feature_lengths": ((1,), "int32")}).build()
+        to_mlpackage(prog, work / "model.mlpackage")
+        compiled = compile_mlpackage(work / "model.mlpackage", out / "model.mlmodelc")
+        shutil.copyfile(src / "tokens.txt", out / "tokens.txt")
+        # check: the test recording through Core ML vs. the float ONNX model on the CPU
+        wav = next((src / "test_wavs").glob("*.wav"), None)
+        feats = np.zeros((1, 64, GIGAAM_FRAMES), np.float32)
+        n_frames = GIGAAM_FRAMES
+        if wav is not None:
+            nt = load_npu_transcribe()
+            audio = nt.decode_all(wav)[:30 * nt.SAMPLE_RATE]
+            g = nt.GigaAM.__new__(nt.GigaAM)
+            g.window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(g.N_FFT) / g.N_FFT)
+            g.mel = g.mel_filters()
+            f = g.features(np.pad(audio, (0, max(0, g.N_FFT - audio.size))))
+            n_frames = min(f.shape[1], GIGAAM_FRAMES)
+            feats[0, :, :n_frames] = f[:, :n_frames]
+        lengths = np.array([n_frames], np.int64)
+        ref = ort.InferenceSession(str(work / "static.onnx"), providers=["CPUExecutionProvider"]) \
+            .run(None, {"features": feats, "feature_lengths": lengths})[0]
+        got, secs = timed(load(compiled), {"features": feats, "feature_lengths": lengths.astype(np.int32)})
+        got = next(iter(got.values()))
+        valid = (n_frames + 3) // 4
+        same = float((got[0, :valid].argmax(-1) == ref[0, :valid].argmax(-1)).mean())
+        print(f"  {out}/model.mlmodelc ready: {secs * 1000:.0f} ms per 30 s, "
+              f"{same * 100:.2f} % of the output frames agree with the CPU")
+        report_plan(compiled)
+
+
+def titanet_fp16_safe(model, scale: float = TITANET_SCALE) -> None:
+    """npu-transcribe's titanet_npu_safe, on the ONNX graph: TitaNet's attentive statistics
+    pooling underflows in float16 (attention weights ~1/T times squared deviations ~1e-3),
+    on the Neural Engine as on the Intel NPU. Feed the statistics scale*x and scale the means
+    and standard deviations back down where they leave."""
+    from onnx import helper, numpy_helper
+    g = model.graph
+    by = {n.name.rsplit("/", 1)[-1]: n for n in g.node if "/decoder/_pooling/" in n.name}
+    x = by["Sub"].input[0]
+    g.initializer.extend([numpy_helper.from_array(np.array(scale, np.float32), "bmeet_scale"),
+                          numpy_helper.from_array(np.array(1.0 / scale, np.float32), "bmeet_inv_scale")])
+    nodes = [helper.make_node("Mul", [x, "bmeet_scale"], ["bmeet_xs"], name="bmeet/scale_x")]
+    for name in ("Mul", "Mul_2"):
+        node = by[name]
+        node.input[:] = ["bmeet_xs" if i == x else i for i in node.input]
+    for name in ("Sub", "Sub_1"):
+        by[name].input[0] = "bmeet_xs"
+
+    def scale_down(src_name: str, consumer, tag: str) -> None:
+        out = src_name + "_bmeet_down"
+        nodes.append(helper.make_node("Mul", [src_name, "bmeet_inv_scale"], [out], name="bmeet/" + tag))
+        consumer.input[:] = [out if i == src_name else i for i in consumer.input]
+
+    scale_down(by["Unsqueeze_4"].output[0], by["Expand"], "mean")
+    scale_down(by["Sqrt"].output[0], by["Unsqueeze_9"], "std")
+    concat_out = by["Concat_5"].output[0]
+    down = concat_out + "_bmeet_down"
+    for n in g.node:
+        n.input[:] = [down if i == concat_out else i for i in n.input]
+    nodes.append(helper.make_node("Mul", [concat_out, "bmeet_inv_scale"], [down], name="bmeet/stats"))
+    # (insert each new node right after the node that makes its input: topological order)
+    order = list(g.node)
+    for new in nodes:
+        src = new.input[0]
+        at = next((i for i, n in enumerate(order) if src in n.output), -1)
+        order.insert(at + 1, new)
+    del g.node[:]
+    g.node.extend(order)
+
+
+def prepare_titanet(src: Path, out: Path) -> None:
+    import onnx
+    import onnxruntime as ort
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        work = Path(tmp)
+        m = onnx.load(str(src))
+        titanet_fp16_safe(m)
+        onnx.save(m, str(work / "safe.onnx"))
+        model = static_and_folded(work / "safe.onnx", {"audio_signal": [TITANET_BATCH, 80, TITANET_FRAMES],
+                                                       "length": [TITANET_BATCH]}, work)
+        prog = OnnxToMil(model, {"audio_signal": ((TITANET_BATCH, 80, TITANET_FRAMES), "fp32"),
+                                 "length": ((TITANET_BATCH,), "int32")}).build()
+        to_mlpackage(prog, work / "titanet.mlpackage")
+        compiled = compile_mlpackage(work / "titanet.mlpackage", out / "titanet.mlmodelc")
+        rng = np.random.default_rng(1)
+        feats = rng.standard_normal((TITANET_BATCH, 80, TITANET_FRAMES)).astype(np.float32)
+        lengths = np.array([TITANET_FRAMES - 20 * i for i in range(TITANET_BATCH)], np.int64)
+        sess = ort.InferenceSession(str(src), providers=["CPUExecutionProvider"])
+        ref = sess.run(["embs"], {"audio_signal": feats, "length": lengths})[0]
+        got, secs = timed(load(compiled), {"audio_signal": feats, "length": lengths.astype(np.int32)})
+        got = got["embs"]
+        sims = [cosine(got[i], ref[i]) for i in range(TITANET_BATCH)]
+        print(f"  {out}/titanet.mlmodelc ready: {secs * 1000:.0f} ms per {TITANET_BATCH} fingerprints, "
+              f"{min(sims):.4f} alike to the CPU's at worst")
+        report_plan(compiled)
+
+
+# --------------------------------------------------------------------------- Nemotron
+
+class MilOps:
+    """The few openvino.opset13 functions prepare-diarization builds Nemotron with, as Core ML
+    (MIL) ops, so that its graph code builds the same model for the Neural Engine."""
+
+    def __init__(self) -> None:
+        from coremltools.converters.mil import Builder as mb
+        self.mb = mb
+        self.params: dict[str, tuple] = {}
+
+    def constant(self, a):
+        return np.asarray(a)
+
+    def _v(self, x):
+        if isinstance(x, np.ndarray):
+            return x.astype(np.int32) if x.dtype == np.int64 else (
+                x.astype(np.float32) if x.dtype == np.float64 else x)
+        return x
+
+    def parameter(self, shape, dtype, name):
+        self.params[name] = (tuple(shape), name)
+        return ("param", name)          # replaced by the Function's input (build_mil)
+
+    def reshape(self, x, shape, special_zero):
+        return self.mb.reshape(x=self._v(x), shape=self._v(np.asarray(shape)).astype(np.int32))
+
+    def matmul(self, a, b, ta, tb):
+        if isinstance(b, np.ndarray) and b.ndim == 2:
+            w = b if tb else b.T            # linear wants (out, in)
+            if ta:
+                a = self.mb.transpose(x=a, perm=[0, 2, 1])
+            return self.mb.linear(x=self._v(a), weight=np.ascontiguousarray(w.astype(np.float32)))
+        return self.mb.matmul(x=self._v(a), y=self._v(b), transpose_x=ta, transpose_y=tb)
+
+    def add(self, a, b):
+        return self._fold(np.add, a, b) or self.mb.add(x=self._v(a), y=self._v(b))
+
+    def subtract(self, a, b):
+        return self._fold(np.subtract, a, b) or self.mb.sub(x=self._v(a), y=self._v(b))
+
+    def multiply(self, a, b):
+        return self._fold(np.multiply, a, b) or self.mb.mul(x=self._v(a), y=self._v(b))
+
+    @staticmethod
+    def _fold(f, a, b):
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            return np.asarray(f(a, b))
+        return None
+
+    def transpose(self, x, perm):
+        return self.mb.transpose(x=self._v(x), perm=[int(v) for v in np.asarray(perm)])
+
+    def mvn(self, x, axes, normalize_variance, eps, mode):
+        return self.mb.layer_norm(x=self._v(x), axes=[int(v) for v in np.asarray(axes).ravel()],
+                                  epsilon=np.float32(eps))
+
+    def softmax(self, x, axis):
+        return self.mb.softmax(x=self._v(x), axis=int(axis))
+
+    def gelu(self, x, mode):
+        return self.mb.gelu(x=self._v(x), mode="EXACT")
+
+    def relu(self, x):
+        return self.mb.relu(x=self._v(x))
+
+    def sigmoid(self, x):
+        return self.mb.sigmoid(x=self._v(x))
+
+    def convolution(self, x, w, strides, pads_begin, pads_end, dilations):
+        pad = [p for b, e in zip(pads_begin, pads_end) for p in (b, e)]
+        return self.mb.conv(x=self._v(x), weight=self._v(np.asarray(w, np.float32)), strides=list(strides),
+                            dilations=list(dilations), pad_type="custom", pad=pad)
+
+
+def load_npu_transcribe():
+    path = TRANSCRIBE / "npu-transcribe"
+    loader = importlib.machinery.SourceFileLoader("npu_transcribe", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def prepare_nemotron(weights: Path, out: Path) -> None:
+    """Nemotron's two parts as Core ML programs, built by prepare-diarization's graph code."""
+    import coremltools as ct
+    from coremltools.converters.mil.mil import Function, Program, types
+    diar = load_script("prepare-diarization")
+    w = diar.read_safetensors(weights)
+    out.mkdir(parents=True, exist_ok=True)
+    builder = diar.build_graph   # (the graph code, shared with the OpenVINO build)
+
+    with tempfile.TemporaryDirectory(dir=out) as tmp:
+        work = Path(tmp)
+        for part in ("embedder", "encoder"):
+            ops = MilOps()
+            shapes = diar.graph_inputs(part)
+            specs = {name: ops.mb.placeholder(shape=shape, dtype=types.fp32) for name, shape in shapes.items()}
+            prog = Program()
+            with Function(specs, opset_version=ct.target.macOS14) as fn:
+                outputs = builder(ops, w, part, {name: fn.inputs[name] for name in shapes})
+                fn.set_outputs([ops.mb.identity(x=v, name=name) for name, v in outputs.items()])
+            prog.add_function("main", fn)
+            to_mlpackage(prog, work / f"{part}.mlpackage")
+            compile_mlpackage(work / f"{part}.mlpackage", out / f"{part}.mlmodelc")
+            print(f"  {out}/{part}.mlmodelc ready")
+            report_plan(out / f"{part}.mlmodelc")
+        np.save(out / "silence.npy", w["silence_embeds"].astype(np.float32))
+    check_nemotron(w, out)
+
+
+def check_nemotron(w: dict, out: Path) -> None:
+    """The encoder on random embeddings (a full step, half of it masked) vs. numpy in float32."""
+    diar = load_script("prepare-diarization")
+    shapes = diar.graph_inputs("encoder")
+    rng = np.random.default_rng(2)
+    x = (rng.standard_normal(shapes["embeds"]) * 0.5).astype(np.float32)
+    mask = np.ones(shapes["mask"], np.float32)
+    mask[0, shapes["mask"][1] // 2:] = 0.0
+    ref = diar.build_graph(NumpyOps(), w, "encoder", {"embeds": x, "mask": mask})["probs"]
+    got, secs = timed(load(out / "encoder.mlmodelc"), {"embeds": x, "mask": mask})
+    got = got["probs"]
+    valid = int(mask.sum()) * 8
+    agree = float(((got[0, :valid] > 0.5) == (ref[0, :valid] > 0.5)).mean())
+    print(f"  encoder: {secs * 1000:.0f} ms per step, {agree * 100:.2f} % of the 10 ms voice decisions "
+          f"agree with float32 numpy, largest difference {np.abs(got[0, :valid] - ref[0, :valid]).max():.3f}")
+
+
+class NumpyOps:
+    """prepare-diarization's ops in float32 numpy: the reference the Core ML build is checked against."""
+
+    def constant(self, a):
+        return np.asarray(a)
+
+    def parameter(self, shape, dtype, name):
+        raise AssertionError("inputs are given")
+
+    def reshape(self, x, shape, special_zero):
+        return np.reshape(x, [int(v) for v in np.asarray(shape)])
+
+    def matmul(self, a, b, ta, tb):
+        a = np.swapaxes(a, -1, -2) if ta else a
+        b = np.swapaxes(b, -1, -2) if tb else b
+        return (a.astype(np.float32) @ b.astype(np.float32)).astype(np.float32)
+
+    def add(self, a, b): return np.add(a, b, dtype=np.float32)
+    def subtract(self, a, b): return np.subtract(a, b, dtype=np.float32)
+    def multiply(self, a, b): return np.multiply(a, b, dtype=np.float32)
+    def transpose(self, x, perm): return np.transpose(x, [int(v) for v in np.asarray(perm)])
+
+    def mvn(self, x, axes, normalize_variance, eps, mode):
+        ax = tuple(int(v) for v in np.asarray(axes).ravel())
+        mean = x.mean(axis=ax, keepdims=True)
+        var = ((x - mean) ** 2).mean(axis=ax, keepdims=True)
+        return ((x - mean) / np.sqrt(var + eps)).astype(np.float32)
+
+    def softmax(self, x, axis):
+        e = np.exp(x - x.max(axis=axis, keepdims=True))
+        return (e / e.sum(axis=axis, keepdims=True)).astype(np.float32)
+
+    def gelu(self, x, mode):
+        from math import erf, sqrt
+        return (0.5 * x * (1.0 + np.vectorize(erf)(x / sqrt(2.0)))).astype(np.float32)
+
+    def relu(self, x): return np.maximum(x, 0).astype(np.float32)
+    def sigmoid(self, x): return (1.0 / (1.0 + np.exp(-x))).astype(np.float32)
+
+    def convolution(self, x, w, strides, pads_begin, pads_end, dilations):
+        # 1-D, stride 1, dilation 1 (the upsampler): out[o, t] = sum_i,k w[o, i, k] x[i, t + k - pad]
+        x = np.pad(x, ((0, 0), (0, 0), (pads_begin[0], pads_end[0])))
+        k = w.shape[-1]
+        t = x.shape[-1] - k + 1
+        cols = np.stack([x[0, :, j:j + t] for j in range(k)], -1)        # (in, t, k)
+        return np.einsum("oik,itk->ot", w, cols)[None].astype(np.float32)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__.split("Usage:")[1].split("Run with")[0].rstrip(), file=sys.stderr)
+        return 2
+    sys.modules["openvino_telemetry"] = None
+    what, args = argv[0], [Path(a) for a in argv[1:]]
+    if what == "gigaam" and len(args) == 2:
+        prepare_gigaam(*args)
+    elif what == "titanet" and len(args) == 2:
+        prepare_titanet(*args)
+    elif what == "nemotron" and len(args) == 2:
+        prepare_nemotron(*args)
+    elif what == "plan" and len(args) == 1:
+        report_plan(args[0])
+    else:
+        print(__doc__.split("Usage:")[1].split("Run with")[0].rstrip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

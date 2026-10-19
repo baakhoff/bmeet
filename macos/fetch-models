@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""fetch-models - download the WhisperKit Core ML models listed in whisperkit.tsv, checked.
+
+  fetch-models MANIFEST DEST [VARIANT...]
+
+MANIFEST is macos/models/whisperkit.tsv: every file of the pinned Hugging Face revision with
+its size and hash (sha256 for LFS files, git:BLOB for the small files Hugging Face keeps in
+git, checked as a git blob hash). DEST receives VARIANT/... (the model folders) and
+tokenizers/openai/whisper-*/ (WhisperKit's tokenizer files). Without VARIANT, every model
+in the manifest. Files already there with the right hash are kept, so a run cut short goes on
+where it stopped; a file with the wrong hash is fetched again and checked once more.
+Downloads go through curl (resumable, retried). Stdlib only.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HF = "https://huggingface.co"
+WHISPERKIT_REPO = "argmaxinc/whisperkit-coreml"
+
+
+def file_hash(path: Path, kind: str) -> str:
+    """sha256 of the file, or its git blob hash (sha1 over "blob SIZE\\0" + content)."""
+    h = hashlib.sha1() if kind == "git" else hashlib.sha256()
+    if kind == "git":
+        h.update(b"blob %d\0" % path.stat().st_size)
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def matches(path: Path, size: int, expected: str) -> bool:
+    if not path.is_file() or path.stat().st_size != size:
+        return False
+    kind, _, digest = expected.rpartition(":")
+    return file_hash(path, "git" if kind == "git" else "sha256") == digest
+
+
+def fetch(url: str, path: Path, size: int, expected: str) -> None:
+    if matches(path, size, expected):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".part")
+    for attempt in (1, 2):
+        mb = size / 1048576
+        print(f"  {path.parent.name}/{path.name} ({mb:.0f} MB)" if mb >= 1 else f"  {path.parent.name}/{path.name}",
+              flush=True)
+        cmd = ["curl", "-fL", "--retry", "3", "--retry-delay", "2", "-C", "-", "-o", str(part), url]
+        if mb < 5:
+            cmd.insert(1, "-s")
+        else:
+            cmd.insert(1, "--progress-bar")
+        if subprocess.run(cmd).returncode != 0 and attempt == 2:
+            sys.exit(f"fetch-models: could not download {url}")
+        if matches(part, size, expected):
+            part.replace(path)
+            return
+        part.unlink(missing_ok=True)   # wrong bytes (a changed file, a cut-off resume): start over
+    sys.exit(f"fetch-models: {url} does not have the expected size/hash")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    manifest, dest, wanted = Path(argv[0]), Path(argv[1]).expanduser(), set(argv[2:])
+    revision, files, tokenizers = "", [], []
+    for line in manifest.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if cols[0] == "revision":
+            revision = cols[1]
+        elif cols[0] == "tokenizer":
+            tokenizers.append(cols[1:])
+        else:
+            files.append(cols)
+    variants = sorted({p.split("/")[0] for p, _, _ in files})
+    unknown = wanted - set(variants)
+    if unknown:
+        sys.exit(f"fetch-models: not in {manifest.name}: {' '.join(sorted(unknown))}")
+    for variant in (sorted(wanted) if wanted else variants):
+        print(f"{variant} (revision {revision[:8]})", flush=True)
+        for path, size, expected in files:
+            if path.split("/")[0] == variant:
+                fetch(f"{HF}/{WHISPERKIT_REPO}/resolve/{revision}/{path}", dest / path, int(size), expected)
+    # (both variants are small enough that their two tokenizers always come along)
+    for repo, rev, name, size, expected in tokenizers:
+        fetch(f"{HF}/{repo}/resolve/{rev}/{name}", dest / "tokenizers" / repo / name, int(size), expected)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,10 @@
+# npu-transcribe's Python environment on macOS (the installer puts it in
+# ~/.local/share/bmeet/venv). Versions as tested on an M1 with macOS 27.
+# The models run on the Neural Engine through Core ML: ONNX Runtime's Core ML
+# execution provider for the ONNX models, coremltools for the ones BMeet builds.
+numpy==2.5.4
+onnx==1.23.2
+onnxruntime==1.31.0
+coremltools==9.0
+# The BMeet app (on Linux it uses the system PyQt6)
+PyQt6==6.11.0

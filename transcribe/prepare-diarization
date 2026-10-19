@@ -20,7 +20,8 @@ Usage: prepare-diarization MODEL.safetensors OUT_DIR [--compile]
   MODEL.safetensors  nvidia/Nemotron-3-Diarization's model.safetensors
   OUT_DIR            receives embedder.xml, encoder.xml (+ .bin) and silence.npy
   --compile          also compile them for the NPU into ~/.cache/npu-ov-cache (~20 s, once)
-Run with the npu-transcribe venv's Python (openvino, numpy).
+Run with the npu-transcribe venv's Python (openvino, numpy). On a Mac, macos/prepare-coreml
+builds the same graph (build_graph) for the Apple Neural Engine instead.
 """
 from __future__ import annotations
 
@@ -55,12 +56,8 @@ def read_safetensors(path: Path) -> dict[str, np.ndarray]:
     return out
 
 
-def prepare(weights: Path, out: Path, compile_npu: bool) -> None:
-    import openvino as ov
-    import openvino.opset13 as ops
-    w = read_safetensors(weights)
-    hidden, heads, mels, stack, step = NEMOTRON_HIDDEN, NEMOTRON_HEADS, NEMOTRON_MELS, NEMOTRON_STACK, NEMOTRON_STEP
-    dim = hidden // heads
+def check_weights(w: dict[str, np.ndarray]) -> None:
+    hidden, mels, stack = NEMOTRON_HIDDEN, NEMOTRON_MELS, NEMOTRON_STACK
     expect = {"model.audio_tower.embedder.projection.weight": (hidden, stack * mels),
               f"model.audio_tower.layers.{NEMOTRON_LAYERS - 1}.mlp.fc2.weight": (hidden, 4 * hidden),
               "model.upsampler.conv.weight": (192 * stack, 192, 3), "classifier.out_proj.weight": (8, 192),
@@ -70,19 +67,29 @@ def prepare(weights: Path, out: Path, compile_npu: bool) -> None:
             raise SystemExit(f"{name}: not {shape}: is this the right model?")
     if f"model.audio_tower.layers.{NEMOTRON_LAYERS}.mlp.fc2.weight" in w:
         raise SystemExit(f"more than {NEMOTRON_LAYERS} layers: is this the right model?")
+
+
+def graph_inputs(part: str) -> dict[str, list[int]]:
+    """The fixed input shapes of the embedder or the encoder."""
+    if part == "embedder":
+        return {"features": [1, NEMOTRON_EMBED * NEMOTRON_STACK, NEMOTRON_MELS]}
+    return {"embeds": [1, NEMOTRON_STEP, NEMOTRON_HIDDEN], "mask": [1, NEMOTRON_STEP]}
+
+
+def build_graph(ops, w: dict[str, np.ndarray], part: str, inputs: dict) -> dict:
+    """The embedder's or the encoder's outputs ({name: node}) from `inputs` ({name: node}),
+    built with `ops`: openvino.opset13 here, and on a Mac the Core ML (and numpy) stand-ins of
+    macos/prepare-coreml, which build the same model for the Apple Neural Engine."""
+    hidden, heads, mels, stack, step = NEMOTRON_HIDDEN, NEMOTRON_HEADS, NEMOTRON_MELS, NEMOTRON_STACK, NEMOTRON_STEP
+    dim = hidden // heads
     const = lambda a: ops.constant(np.ascontiguousarray(a, np.float32))
     shape = lambda *v: ops.constant(np.array(v, np.int64))
-    out.mkdir(parents=True, exist_ok=True)
 
-    feats = ops.parameter([1, NEMOTRON_EMBED * stack, mels], np.float32, name="features")
-    stacked = ops.reshape(feats, shape(1, NEMOTRON_EMBED, stack * mels), False)
-    embeds = ops.matmul(stacked, const(w["model.audio_tower.embedder.projection.weight"]), False, True)
-    embeds.output(0).get_tensor().set_names({"embeds"})
-    ov.save_model(ov.Model([embeds], [feats], "nemotron_embedder"), str(out / "embedder.xml"),
-                  compress_to_fp16=True)
+    if part == "embedder":
+        stacked = ops.reshape(inputs["features"], shape(1, NEMOTRON_EMBED, stack * mels), False)
+        return {"embeds": ops.matmul(stacked, const(w["model.audio_tower.embedder.projection.weight"]), False, True)}
 
-    x = ops.parameter([1, step, hidden], np.float32, name="embeds")
-    mask = ops.parameter([1, step], np.float32, name="mask")
+    x, mask = inputs["embeds"], inputs["mask"]
     additive = ops.reshape(ops.multiply(ops.subtract(const(1.0), mask), const(-30000.0)),
                            shape(1, 1, 1, step), False)
     inv_freq = 1.0 / (10000.0 ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
@@ -128,10 +135,22 @@ def prepare(weights: Path, out: Path, compile_npu: bool) -> None:
     h = ops.add(h, const(w["model.upsampler.conv.bias"].reshape(1, -1, 1)))
     h = ops.reshape(ops.transpose(h, shape(0, 2, 1)), shape(1, step * stack, 192), False)
     h = linear(ops.relu(linear(ops.relu(h), "classifier.dense")), "classifier.out_proj")
-    probs = ops.sigmoid(h)
-    probs.output(0).get_tensor().set_names({"probs"})
-    ov.save_model(ov.Model([probs], [x, mask], "nemotron_encoder"), str(out / "encoder.xml"),
-                  compress_to_fp16=True)
+    return {"probs": ops.sigmoid(h)}
+
+
+def prepare(weights: Path, out: Path, compile_npu: bool) -> None:
+    import openvino as ov
+    import openvino.opset13 as ops
+    w = read_safetensors(weights)
+    check_weights(w)
+    out.mkdir(parents=True, exist_ok=True)
+    for part in ("embedder", "encoder"):
+        params = {name: ops.parameter(shape, np.float32, name=name) for name, shape in graph_inputs(part).items()}
+        outputs = build_graph(ops, w, part, params)
+        for name, node in outputs.items():
+            node.output(0).get_tensor().set_names({name})
+        ov.save_model(ov.Model(list(outputs.values()), list(params.values()), f"nemotron_{part}"),
+                      str(out / f"{part}.xml"), compress_to_fp16=True)
     np.save(out / "silence.npy", w["silence_embeds"].astype(np.float32))
     print(f"  {out}/encoder.xml ready")
     if compile_npu:

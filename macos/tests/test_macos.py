@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests of BMeet's macOS parts, without models, permissions or BMeet.app (macOS only).
+"""Tests of BMeet's macOS parts, without models, permissions or BMeet.app (macOS only, but for
+the meeting runner with a stand-in recorder, which runs on Linux too).
 
 Run: ~/.local/share/bmeet/venv/bin/python -I macos/tests/test_macos.py -v
 (numpy is needed; bmeet-record is used from macos/.build/release or the install, and its tests
@@ -12,6 +13,10 @@ skip without it: swift build -c release --package-path macos)
   finished WAV headers, the pointer file.
 - bmeet-meeting start / pause / resume / stop: with that recorder, a stand-in for npu-transcribe
   and no RAM disk: the units, the state, the index, the Markdown copy, the speaker pass, cleanup.
+- bmeet-meeting with a stand-in recorder too: what goes wrong (a recorder that dies, a live
+  transcript that fails, no access to the Meetings folder, a speaker pass ending while the next
+  meeting stops), and its units.
+- bmeetmac's runtime folder.
 - bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket.
 """
 from __future__ import annotations
@@ -107,12 +112,13 @@ class StandIn(threading.Thread):
 class WhisperProtocol(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))   # (short: sockets have a 104-byte path limit)
-        os.environ["XDG_RUNTIME_DIR"] = str(self.tmp)
+        os.environ["BMEET_RUNTIME_ROOT"] = str(self.tmp)
         self.nt = load(REPO / "transcribe/npu-transcribe", "npu_transcribe_mac_test")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("XDG_RUNTIME_DIR", None)
+        for k in ("BMEET_RUNTIME_ROOT", "XDG_RUNTIME_DIR"):
+            os.environ.pop(k, None)
 
     def test_generate_shapes_like_whisper_pipeline(self) -> None:
         import numpy as np
@@ -219,12 +225,12 @@ class Recorder(unittest.TestCase):
 
 
 FAKE_TRANSCRIBE = r'''
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 if "--live" in args:
     folder = Path(args[args.index("--live") + 1])
-    pointer = Path(__import__("os").environ["XDG_RUNTIME_DIR"]) / "bmeet/recording"
+    pointer = Path(os.environ["XDG_RUNTIME_DIR"]) / "bmeet/recording"
     seen = False
     while True:
         try:
@@ -235,7 +241,10 @@ if "--live" in args:
         if seen and not ours:
             break
         time.sleep(0.2)
-    (folder / "live.md").write_text("# Live\n\n### You\n\nhello\n")
+    (folder / "live.md").write_text("# Live\n\n## Meeting Info\n\n- **Speakers:** You\n\n"
+                                    "## Transcript\n\n### You\n\nhello\n")
+    if os.environ.get("FAKE_LIVE_FAIL"):   # (an error: no live.done)
+        sys.exit(1)
     (folder / "live.done").touch()
 elif "--meeting" in args:
     folder = Path(args[args.index("--meeting") + 1])
@@ -253,9 +262,10 @@ class MeetingRunner(unittest.TestCase):
         (self.tmp / "fake-transcribe").write_text(FAKE_TRANSCRIBE)
         (self.tmp / "config/bmeet").mkdir(parents=True)
         (self.tmp / "config/bmeet/speakers").write_text("on\n")
-        self.env = dict(os.environ, XDG_RUNTIME_DIR=str(self.tmp / "run"), XDG_CONFIG_HOME=str(self.tmp / "config"),
+        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "run"),
+                        XDG_CONFIG_HOME=str(self.tmp / "config"),
                         BMEET_MEETING_DB=str(self.tmp / "index.db"), VOXTYPE_MEETING_DIR=str(self.tmp / "Meetings"),
-                        BMEET_NO_RAMDISK="1", BMEET_RECORD=str(recorder()),
+                        BMEET_NO_RAMDISK="1", BMEET_RECORD=str(recorder()), BMEET_WHISPER="/usr/bin/true",
                         BMEET_RECORD_MIC_FILE=str(self.tmp / "mic.wav"), BMEET_RECORD_SYSTEM_FILE=str(self.tmp / "mic.wav"),
                         BMEET_TRANSCRIBE=str(self.tmp / "fake-transcribe"))
         self.env.pop("BMEET_RUN_DIR", None)
@@ -319,11 +329,210 @@ class MeetingRunner(unittest.TestCase):
         self.assertEqual(len(set(titles)), 2, titles)
 
 
+FAKE_RECORD = r'''
+# bmeet-record meeting DIR [--mic-only] [--state FILE] [--pointer FILE] without devices: a part per
+# stretch of "recording". FAKE_RECORD_DIE_AFTER=SECONDS: it dies then (and leaves its pointer).
+import os, signal, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+run = Path(os.environ["XDG_RUNTIME_DIR"]) / "bmeet"
+folder = Path(args[1])
+state = Path(args[args.index("--state") + 1]) if "--state" in args else run / "meeting_state"
+pointer = Path(args[args.index("--pointer") + 1]) if "--pointer" in args else run / "recording"
+
+
+def first(path):
+    try:
+        return path.read_text().split("\n")[0].strip()
+    except OSError:
+        return "idle"
+
+
+folder.mkdir(parents=True, exist_ok=True)
+pointer.write_text(f"{folder}\n")
+stop = []
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, lambda *_: stop.append(sig))
+t0, part, recording = time.monotonic(), 0, False
+die = float(os.environ.get("FAKE_RECORD_DIE_AFTER") or 0)
+while not stop and first(state) in ("recording", "paused"):
+    if first(state) == "recording" and not recording:
+        part += 1
+        (folder / f"part-{part}-mic.wav").write_bytes(bytes(44 + 32000))
+    recording = first(state) == "recording"
+    if die and time.monotonic() - t0 > die:
+        os._exit(1)
+    time.sleep(0.1)
+if first(pointer) == str(folder):
+    pointer.unlink()
+'''
+
+
+def alive(pid: int) -> bool:
+    """Is `pid` running (a zombie is not)?"""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
+class MeetingStandIns(unittest.TestCase):
+    """bmeet-meeting with a stand-in recorder and npu-transcribe, and no RAM disk (on Linux too)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        (self.tmp / "fake-transcribe").write_text(FAKE_TRANSCRIBE)
+        rec = self.tmp / "fake-record"
+        rec.write_text(f"#!{PY}\n" + FAKE_RECORD)
+        rec.chmod(0o755)
+        (self.tmp / "config/bmeet").mkdir(parents=True)
+        (self.tmp / "config/bmeet/speakers").write_text("on\n")
+        self.run_dir = self.tmp / "run/bmeet"
+        # (XDG_RUNTIME_DIR too: on Linux bmeet-meeting would otherwise use the real one, BMeet's own)
+        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "run"),
+                        XDG_CONFIG_HOME=str(self.tmp / "config"), XDG_DATA_HOME=str(self.tmp / "data"),
+                        BMEET_MEETING_DB=str(self.tmp / "index.db"), VOXTYPE_MEETING_DIR=str(self.tmp / "Meetings"),
+                        BMEET_NO_RAMDISK="1", BMEET_RECORD=str(rec), BMEET_WHISPER="/usr/bin/true",
+                        BMEET_TRANSCRIBE=str(self.tmp / "fake-transcribe"))
+        for k in ("BMEET_RUN_DIR", "FAKE_LIVE_FAIL", "FAKE_RECORD_DIE_AFTER"):
+            self.env.pop(k, None)
+
+    def tearDown(self) -> None:
+        subprocess.run(self.cmd("cleanup"), env=self.env, capture_output=True, timeout=60)
+        if (self.tmp / "locked").exists():
+            (self.tmp / "locked").chmod(0o700)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def cmd(self, *args: str) -> list[str]:
+        return [PY, "-I", str(MACOS / "bmeet-meeting"), *args]
+
+    def run_cmd(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(self.cmd(*args), env=self.env, capture_output=True, text=True, timeout=120)
+
+    def state(self) -> str:
+        return (self.run_dir / "meeting_state").read_text().strip()
+
+    def folder(self) -> Path:
+        return self.run_dir / "meeting-audio" / (self.run_dir / "meeting-toggle.started").read_text().strip()
+
+    def rows(self) -> list[tuple]:
+        con = sqlite3.connect(self.tmp / "index.db")
+        try:
+            return con.execute("SELECT status, md_path FROM meetings ORDER BY started_at").fetchall()
+        finally:
+            con.close()
+
+    def wait_for(self, check, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not check():
+            if time.monotonic() > deadline:
+                self.fail("timed out")
+            time.sleep(0.1)
+
+    def test_a_finished_pass_leaves_other_recordings(self) -> None:
+        # a meeting being stopped: "idle" already, its own speaker pass not started yet
+        folder = self.run_dir / "meeting-audio/2026-10-20_1147-2"
+        folder.mkdir(parents=True)
+        (folder / "part-1-mic.wav").write_bytes(bytes(44))
+        (self.run_dir / "meeting-toggle.started").write_text(f"{folder.name}\n")
+        (self.run_dir / "meeting_state").write_text("idle\n")
+        # the meeting before it: its speaker pass has just ended
+        r = self.run_cmd("wait-and-cleanup", "2026-10-20_1147")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((folder / "part-1-mic.wav").exists())
+        self.assertEqual(self.run_cmd("cleanup").returncode, 0)
+        self.assertTrue((folder / "part-1-mic.wav").exists())
+        (self.run_dir / "meeting-toggle.started").unlink()
+        self.assertEqual(self.run_cmd("cleanup").returncode, 0)
+        self.assertFalse(folder.exists())          # (nothing owns it now)
+
+    def test_unfinished_live_transcript_is_kept(self) -> None:
+        (self.tmp / "config/bmeet/speakers").write_text("off\n")
+        self.env["FAKE_LIVE_FAIL"] = "1"
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        r = self.run_cmd("stop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        md = Path(r.stdout.strip())
+        text = md.read_text()
+        self.assertIn("hello", text)
+        self.assertLess(text.index("- **Incomplete:**"), text.index("## Transcript"))
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.rows(), [("completed", str(md))])
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes anywhere")
+    def test_meetings_folder_not_writable(self) -> None:
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        self.env["VOXTYPE_MEETING_DIR"] = str(locked / "Meetings")
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        r = self.run_cmd("stop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        md = Path(r.stdout.strip())
+        self.assertEqual(md.parent, self.tmp)      # (next to the index)
+        self.assertFalse((self.run_dir / "meeting-toggle.started").exists())
+        self.wait_for(lambda: not folder.exists() and "Person 1" in md.read_text())
+        self.assertEqual(self.rows(), [("completed", str(md))])
+
+    def test_recorder_that_dies_stops_the_meeting(self) -> None:
+        self.env["FAKE_RECORD_DIE_AFTER"] = "1"
+        t0 = time.monotonic()
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        self.wait_for(lambda: self.state() == "idle", 40)
+        self.assertLess(time.monotonic() - t0, 40)  # (--live did not wait 60 s for the recording to end)
+        self.wait_for(lambda: not folder.exists())
+        [(status, md)] = self.rows()
+        self.assertEqual(status, "completed")
+        self.assertIn("Person 1", Path(md).read_text())
+
+    def test_units(self) -> None:
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ.update(self.env)
+        bm = load(MACOS / "bmeet-meeting", "bmeet_meeting_test")
+        pid_file = self.tmp / "child.pid"
+        code = ("import os, signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)")
+        self.assertTrue(bm.unit_start("bmeet-test", [PY, "-c", code]))
+        self.wait_for(lambda: pid_file.exists() and pid_file.read_text())
+        child = int(pid_file.read_text())
+        # its command ignores SIGINT: after the timeout, the whole unit is killed
+        bm.unit_stop("bmeet-test", timeout=1)
+        self.wait_for(lambda: not alive(child), 5)
+        self.assertFalse((bm.UNITS / "bmeet-test.pid").exists())
+        # a pid file left behind, its number now another process's: not the unit
+        (bm.UNITS / "bmeet-test.pid").write_text(f"{os.getpid()}\n")
+        self.assertFalse(bm.unit_active("bmeet-test"))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS only")
+class RuntimeFolder(unittest.TestCase):
+    def test_the_temp_folder_whatever_the_shell_says(self) -> None:
+        mac = load(MACOS / "bmeetmac.py", "bmeetmac_runtime_test")
+        saved = dict(os.environ)
+        try:
+            os.environ.pop("BMEET_RUNTIME_ROOT", None)
+            os.environ["XDG_RUNTIME_DIR"] = "/tmp/run-from-a-shell"
+            self.assertEqual(mac.runtime(), Path(str(mac.temp_dir()).rstrip("/")) / "bmeet")
+            os.environ["BMEET_RUNTIME_ROOT"] = "/tmp/bm-tests"
+            self.assertEqual(mac.runtime(), Path("/tmp/bm-tests/bmeet"))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
 @unittest.skipUnless(sys.platform == "darwin", "macOS only")
 class CtlToApp(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
-        os.environ.update(XDG_RUNTIME_DIR=str(self.tmp), XDG_CONFIG_HOME=str(self.tmp / "config"))
+        os.environ.update(BMEET_RUNTIME_ROOT=str(self.tmp), XDG_CONFIG_HOME=str(self.tmp / "config"))
         os.environ.pop("BMEET_PLATFORM", None)
         (self.tmp / "config/bmeet").mkdir(parents=True)
         (self.tmp / "config/bmeet/languages").write_text("en ru\n")
@@ -334,7 +543,7 @@ class CtlToApp(unittest.TestCase):
     def tearDown(self) -> None:
         self.server.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
-        for k in ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"):
+        for k in ("BMEET_RUNTIME_ROOT", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"):
             os.environ.pop(k, None)
 
     def test_commands(self) -> None:

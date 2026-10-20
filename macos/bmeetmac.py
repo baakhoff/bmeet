@@ -3,8 +3,11 @@
 BMeet's programs were written for Linux, where per-user runtime files go to $XDG_RUNTIME_DIR (a
 tmpfs). macOS has no such variable; setup() points it at your user's temp folder (getconf
 DARWIN_USER_TEMP_DIR, the same for every process of yours), so `$XDG_RUNTIME_DIR/bmeet/...`
-means the same folder for BMeet.app, the app window, npu-transcribe and bmeet-ctl. Meeting audio
-is the exception: it stays in RAM, on the RAM disk that BMeet.app mounts on
+means the same folder for BMeet.app, the app window, npu-transcribe and bmeet-ctl. It does so
+even when your shell exports XDG_RUNTIME_DIR (BMeet.app never sees that one); tests set
+BMEET_RUNTIME_ROOT instead, which stands for the temp folder (BMeet's folder is
+$BMEET_RUNTIME_ROOT/bmeet), here and in BMeet.app, bmeet-record and bmeet-whisper alike.
+Meeting audio is the exception: it stays in RAM, on the RAM disk that BMeet.app mounts on
 `$XDG_RUNTIME_DIR/bmeet/meeting-audio` (audio_in_ram()).
 
 Also here: where the native helpers are (bmeet-whisper, bmeet-record), the client of the
@@ -14,6 +17,7 @@ and notifications.
 from __future__ import annotations
 
 import ctypes
+import functools
 import json
 import os
 import shutil
@@ -43,12 +47,30 @@ def temp_dir() -> Path:
 def setup() -> None:
     """Give BMeet's Linux-shaped code its runtime folder (see the module doc), and Homebrew's
     programs (ffmpeg): apps started from the Dock or at login get only /usr/bin:/bin in PATH."""
-    os.environ.setdefault("XDG_RUNTIME_DIR", str(temp_dir()).rstrip("/"))
+    if os.environ.get("BMEET_RUNTIME_ROOT"):   # (tests)
+        os.environ["XDG_RUNTIME_DIR"] = os.environ["BMEET_RUNTIME_ROOT"]
+    elif sys.platform == "darwin":
+        os.environ["XDG_RUNTIME_DIR"] = str(temp_dir()).rstrip("/")
+    else:   # (Linux: bmeet-meeting with stand-ins, in tests)
+        os.environ.setdefault("XDG_RUNTIME_DIR", str(temp_dir()).rstrip("/"))
     path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin").split(":")
-    for brew in ("/opt/homebrew/bin", "/usr/local/bin"):
+    for brew in brew_bins():
         if brew not in path and os.path.isdir(brew):
             path.append(brew)
     os.environ["PATH"] = ":".join(path)
+
+
+@functools.lru_cache(maxsize=None)
+def brew_bins() -> tuple[str, ...]:
+    """Homebrew's bin folders: the usual two, and the one of the Homebrew that BMeet's Python
+    comes from (the installer makes the venv with Homebrew's python@3.13), wherever it is."""
+    bins = ["/opt/homebrew/bin", "/usr/local/bin"]
+    for parent in Path(sys.base_prefix).resolve().parents:
+        if (parent / "bin/brew").is_file():
+            if str(parent / "bin") not in bins:
+                bins.append(str(parent / "bin"))
+            break
+    return tuple(bins)
 
 
 def runtime() -> Path:
@@ -62,9 +84,9 @@ def audio_root() -> Path:
 
 def audio_in_ram(path: Path | None = None) -> bool:
     """Is meeting audio (audio_root(), or a recording in it) on BMeet.app's RAM disk?"""
-    root = audio_root()
+    root = audio_root().resolve()   # (/var is a link to /private/var)
     return os.path.ismount(root) and (path is None or root in Path(path).resolve().parents
-                                      or Path(path).resolve() == root.resolve())
+                                      or Path(path).resolve() == root)
 
 
 # --------------------------------------------------------------------------- native helpers
@@ -104,6 +126,16 @@ def start_whisper() -> None:
     subprocess.Popen([str(exe), "serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                      start_new_session=True, close_fds=True)
     log.close()
+
+
+def whisper_up() -> None:
+    """Start the Whisper server now if it is not running (without waiting for it): before niced
+    work that uses it (a meeting's live transcript, the speaker pass). A server that work starts
+    keeps its nice level, and would serve dictation with it too."""
+    try:
+        _connect(whisper_socket(), 1).close()
+    except OSError:
+        start_whisper()
 
 
 def _connect(path: Path, timeout: float | None) -> socket.socket:
@@ -179,7 +211,9 @@ def notify(summary: str, body: str = "", ok: bool = True) -> None:
     if agent({"op": "notify", "title": summary, "body": body, "ok": ok}) is not None:
         return
     if shutil.which("osascript"):
-        script = f"display notification {json.dumps(body[:500])} with title {json.dumps(summary)}"
+        # (ensure_ascii=False: AppleScript strings have no \u escapes; quotes and backslashes are escaped)
+        script = (f"display notification {json.dumps(body[:500], ensure_ascii=False)} "
+                  f"with title {json.dumps(summary, ensure_ascii=False)}")
         subprocess.run(["osascript", "-e", script], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

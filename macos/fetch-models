@@ -55,11 +55,14 @@ def fetch(url: str, path: Path, size: int, expected: str) -> None:
             cmd.insert(1, "-s")
         else:
             cmd.insert(1, "--progress-bar")
-        if subprocess.run(cmd).returncode != 0 and attempt == 2:
-            sys.exit(f"fetch-models: could not download {url}")
+        failed = subprocess.run(cmd).returncode != 0
         if matches(part, size, expected):
             part.replace(path)
             return
+        if failed:   # (cut off: the .part stays, and the next attempt or run goes on from there)
+            if attempt == 2:
+                sys.exit(f"fetch-models: could not download {url}")
+            continue
         part.unlink(missing_ok=True)   # wrong bytes (a changed file, a cut-off resume): start over
     sys.exit(f"fetch-models: {url} does not have the expected size/hash")
 

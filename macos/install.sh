@@ -32,9 +32,14 @@ main() {
 
     local src
     src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    # On the way out: a BMeet.app that step 4 quit is opened again if a later step failed
+    # (BMEET_REOPEN), and the release that install.sh downloaded is deleted
+    BMEET_REOPEN=""
+    local clean=":"
     if [ -n "${BMEET_TMP:-}" ] && [ "$src" = "$(cd "$BMEET_TMP" && pwd)" ]; then
-        trap 'rm -rf "$BMEET_TMP"' EXIT   # the release that install.sh downloaded
+        clean='rm -rf "$BMEET_TMP"'
     fi
+    trap '[ $? -eq 0 ] || [ -z "$BMEET_REOPEN" ] || open -g "$BMEET_REOPEN" >/dev/null 2>&1 || true; '"$clean" EXIT
     local VERSION
     VERSION="$(cat "$src/VERSION")"
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -88,6 +93,10 @@ main() {
         if [ -n "$tty" ]; then
             "$@" >> "$LOG" 2>&1 &
             local pid=$! i=0
+            # Ctrl-C: a step started like this ignores it (a script has no job control), so it is
+            # stopped here, with what it started, before the installer ends
+            trap 'pkill -TERM -P "$pid" 2>/dev/null || true; kill -TERM "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true; printf "\r\033[K\n"; exit 130' INT TERM
             local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
             while kill -0 "$pid" 2>/dev/null; do
                 printf '\r      %s%s%s %s %s%s%s' "$C" "${frames[i % 10]}" "$N" "$what" "$D" "$(took $((SECONDS - t0)))" "$N"
@@ -96,6 +105,7 @@ main() {
             done
             local code=0
             wait "$pid" || code=$?
+            trap - INT TERM
             printf '\r\033[K'
             [ "$code" -eq 0 ] || { tail -n 12 "$LOG" | sed 's/^/        /' >&2; return "$code"; }
         else
@@ -104,9 +114,24 @@ main() {
         ok "$what $D($(took $((SECONDS - t0))))$N"
     }
 
+    # Meeting transcripts go to ~/Documents/Meetings. With iCloud Drive's "Desktop & Documents
+    # Folders" on, iCloud syncs ~/Documents, and the transcripts with it. Finder keeps that
+    # setting; where it does not, a Documents folder in iCloud Drive tells (the option makes it,
+    # and it stays when the option is turned off again)
+    local icloud_docs=""
+    case "$(defaults read com.apple.finder FXICloudDriveDocuments 2>/dev/null || true)" in
+        1) icloud_docs=1 ;;
+        0) ;;
+        *) [ ! -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Documents" ] || icloud_docs=1 ;;
+    esac
+
     printf '\n  %sBMeet %s for macOS%s\n' "$B" "$VERSION" "$N"
     printf '  %sDictation, meeting transcripts and file transcription on the Neural Engine.%s\n' "$D" "$N"
-    printf '  %sNothing you say leaves this Mac.%s\n' "$D" "$N"
+    if [ -n "$icloud_docs" ]; then
+        printf '  %sWhat you say is transcribed on this Mac, but iCloud syncs the meeting transcripts (see below).%s\n' "$D" "$N"
+    else
+        printf '  %sNothing you say leaves this Mac.%s\n' "$D" "$N"
+    fi
 
     # --- 1. this Mac ---------------------------------------------------------------------
     step "Checking this Mac"
@@ -131,6 +156,18 @@ main() {
     case "$(head -n1 "$run_dir/meeting_state" 2>/dev/null || echo idle)" in
         recording|paused) die "a meeting is being recorded - stop it first (⌃⌥M), then run this again" ;;
     esac
+    if [ -n "$icloud_docs" ]; then
+        warn "iCloud syncs your Documents folder: the meeting transcripts in ~/Documents/Meetings go to iCloud too"
+        note "(System Settings -> your name -> iCloud -> iCloud Drive -> Desktop & Documents Folders)"
+    fi
+    # A signing identity of your own (BMEET_SIGN_IDENTITY): checked now, before step 4 quits BMeet.app
+    local identity="${BMEET_SIGN_IDENTITY:--}"
+    if [ "$identity" != - ]; then
+        case "$(security find-identity -p codesigning 2>/dev/null | tr 'A-Z' 'a-z' || true)" in
+            *"$(printf '%s' "$identity" | tr 'A-Z' 'a-z')"*) ;;
+            *) die "no code signing identity \"$identity\" in your keychain (BMEET_SIGN_IDENTITY; security find-identity -p codesigning lists yours)" ;;
+        esac
+    fi
     # Apple's Command Line Tools (the compilers BMeet's Swift parts need; not Xcode)
     if ! xcode-select -p >/dev/null 2>&1; then
         [ -n "$tty" ] || die "the Command Line Tools are missing: run  xcode-select --install  and then this again"
@@ -152,10 +189,12 @@ main() {
         ""|5.[0-9]) die "Swift ${swift_v:-?} is too old (5.10 or later): update the Command Line Tools in System Settings -> General -> Software Update" ;;
     esac
     ok "Command Line Tools, Swift $swift_v"
-    # Homebrew (for Python and ffmpeg)
-    local brew
-    brew="$(command -v brew || true)"
-    [ -n "$brew" ] || for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && { brew=$b; break; }; done
+    # Homebrew (for Python and ffmpeg): the one for Apple silicon first, as a Mac moved over from
+    # an Intel one may still have the Intel Homebrew in /usr/local, and first in PATH
+    local brew=""
+    for b in /opt/homebrew/bin/brew "$(command -v brew || true)" /usr/local/bin/brew; do
+        [ -n "$b" ] && [ -x "$b" ] && { brew=$b; break; }
+    done
     if [ -z "$brew" ]; then
         [ -n "$tty" ] && [ -n "$system" ] || die "Homebrew is needed for Python and ffmpeg: install it from https://brew.sh, then run this again"
         warn "Homebrew (https://brew.sh) is needed for Python and ffmpeg"
@@ -166,6 +205,7 @@ main() {
             || die "Homebrew's installer did not finish"
         brew=/opt/homebrew/bin/brew
         [ -x "$brew" ] || die "Homebrew is not in /opt/homebrew after its installer"
+        note "Homebrew's own analytics are on (BMeet's installs here send none); to turn them off: brew analytics off"
     fi
     ok "Homebrew $("$brew" --version 2>/dev/null | head -n1 | awk '{print $2}')"
     mkdir -p "$CACHE/downloads"
@@ -180,18 +220,27 @@ main() {
         [ -x "$py" ] || want+=(python@3.13)
         [ -x "$brew_prefix/bin/ffmpeg" ] || command -v ffmpeg >/dev/null || want+=(ffmpeg)
         if [ ${#want[@]} -gt 0 ]; then
-            run "brew install ${want[*]}" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 "$brew" install "${want[@]}" \
-                || die "Homebrew could not install ${want[*]}"
+            local intel=""   # (an Intel Homebrew refuses to install on Apple silicon)
+            [ "$brew_prefix" = /opt/homebrew ] \
+                || intel=" (is the Homebrew in $brew_prefix the one for Intel Macs? BMeet needs Homebrew for Apple silicon, in /opt/homebrew)"
+            run "brew install ${want[*]}" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ANALYTICS=1 \
+                "$brew" install "${want[@]}" \
+                || die "Homebrew could not install ${want[*]}$intel"
         fi
     fi
     [ -x "$py" ] || die "python@3.13 is missing (brew install python@3.13)"
+    [ "$("$py" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ] \
+        || die "$py is not for Apple silicon: install Homebrew for Apple silicon, in /opt/homebrew (https://brew.sh), then run this again"
     local brew_bin="$brew_prefix/bin"
     [ -x "$brew_bin/ffmpeg" ] || command -v ffmpeg >/dev/null || die "ffmpeg is missing (brew install ffmpeg)"
     ok "Python $("$py" -c 'import platform; print(platform.python_version())'), ffmpeg $("$brew_bin/ffmpeg" -version 2>/dev/null | head -n1 | awk '{print $3}')"
 
     # --- 3. program files and the Python environment ---------------------------------------
     step "Program files and Python packages"
-    mkdir -p "$ROOT/bin"
+    mkdir -p "$ROOT/bin" "$HOME/.local/share/npu-transcribe"
+    # Only you: other accounts on this Mac may look into your home folder (unlike its Documents or
+    # Library), and these hold meeting titles, voices and the transcription history
+    chmod 700 "$ROOT" "$HOME/.local/share/npu-transcribe"
     local stage="$ROOT/.src.new"
     rm -rf "$stage"
     mkdir -p "$stage"
@@ -206,7 +255,8 @@ main() {
     src="$ROOT/src"
     ok "BMeet $VERSION in ${ROOT/#$HOME/~}"
     local venv="$ROOT/venv"
-    if ! "$venv/bin/python" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 13))' 2>/dev/null; then
+    if ! "$venv/bin/python" -c 'import platform, sys; sys.exit(sys.version_info[:2] != (3, 13) or platform.machine() != "arm64")' \
+        2>/dev/null; then
         rm -rf "$venv"
         "$py" -m venv "$venv" >> "$LOG" 2>&1 || die "could not make a Python environment"
     fi
@@ -247,6 +297,7 @@ main() {
         for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -qf "$APP/Contents/MacOS/BMeet" || break; sleep 0.3; done
         pkill -KILL -f "$APP/Contents/MacOS/BMeet" 2>/dev/null || true
         note "quit the running BMeet.app (it starts again at the end)"
+        [ -z "$start" ] || BMEET_REOPEN="$APP"   # (or on the way out, should a later step fail)
     fi
     [ -z "$new_whisper" ] || pkill -f "$ROOT/bin/bmeet-whisper serve" 2>/dev/null || true   # (the next request starts the new one)
     local stage_app="$CACHE/BMeet.app"
@@ -274,8 +325,7 @@ main() {
     { swiftc -O "$src/macos/tools/make-symbols.swift" -o "$CACHE/make-symbols" && "$CACHE/make-symbols" "$src/macos/icons"; } \
         >> "$LOG" 2>&1 || warn "the window keeps Qt's own icons (drawing the SF Symbols failed)"
     printf 'APPL????' > "$stage_app/Contents/PkgInfo"
-    local identity="${BMEET_SIGN_IDENTITY:--}"
-    codesign --force --sign "$identity" "$window" >> "$LOG" 2>&1
+    codesign --force --sign "$identity" "$window" >> "$LOG" 2>&1 || die "signing the BMeet window failed"
     codesign --force --sign "$identity" --identifier io.github.baakhoff.bmeet "$stage_app" >> "$LOG" 2>&1 \
         || die "signing BMeet.app failed"
     codesign --force --sign "$identity" "$ROOT/bin/bmeet-record" >> "$LOG" 2>&1 || true
@@ -304,7 +354,10 @@ main() {
     fetch() {  # file url sha256: download into the cache once, check it every time
         if ! echo "$3  $dl/$1" | shasum -a 256 -c --status >/dev/null 2>&1; then
             printf '      %s%s%s\n' "$D" "$1" "$N"
-            curl -fL --retry 3 --progress-bar -o "$dl/$1.part" "$2" && mv "$dl/$1.part" "$dl/$1"
+            # (-C -: a download cut off goes on from its .part, now or the next time)
+            curl -fL --retry 3 -C - --progress-bar -o "$dl/$1.part" "$2" \
+                || die "downloading $1 failed - run the installer again to go on where it stopped"
+            mv "$dl/$1.part" "$dl/$1"
             echo "$3  $dl/$1" | shasum -a 256 -c --status \
                 || { rm -f "$dl/$1"; die "checksum mismatch for $1 - run the installer again"; }
         fi
@@ -346,6 +399,7 @@ main() {
 
     # Speaker models: Nemotron 3 Diarization and TitaNet-small (as on Linux), for the Neural Engine
     mkdir -p "$config"
+    chmod 700 "$config"
     if [ -n "$speakers" ]; then
         local sd="$MODELS_DIR/speaker-diarization"
         mkdir -p "$sd"
@@ -355,7 +409,7 @@ main() {
         if [ ! -d "$sd/titanet.mlmodelc" ] || [ "$(cat "$sd/.titanet-prepared" 2>/dev/null)" != "$emb_stamp" ]; then
             fetch "$emb" "$rel/speaker-recongition-models/$emb" "$emb_sha"   # (sic: upstream's tag)
             run "Building TitaNet (voice fingerprints) for the Neural Engine" "${prep[@]}" titanet "$dl/$emb" "$sd" \
-                || die "building TitaNet for the Neural Engine failed"
+                || die "building TitaNet for the Neural Engine failed (--no-speakers installs without it)"
             echo "$emb_stamp" > "$sd/.titanet-prepared"
         else
             ok "TitaNet (voice fingerprints)"
@@ -466,6 +520,9 @@ EOF
   ${D}Check: bash ${src/#$HOME/~}/macos/verify.sh   Uninstall: bash ${src/#$HOME/~}/uninstall.sh
   Log:   ${LOG/#$HOME/~}${N}
 EOF
+    if [ -n "$icloud_docs" ]; then
+        printf '  %s!%s iCloud syncs your Documents folder, and with it the meeting transcripts in ~/Documents/Meetings.\n' "$Y" "$N"
+    fi
     if [ -n "$path_note" ]; then
         printf '  %sTo use npu-transcribe and bmeet in Terminal, add ~/.local/bin to your PATH:%s\n' "$D" "$N"
         printf '    echo '"'"'export PATH="$HOME/.local/bin:$PATH"'"'"' >> ~/.zshrc\n'

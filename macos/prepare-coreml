@@ -42,6 +42,10 @@ TRANSCRIBE = HERE.parent / "transcribe"
 GIGAAM_FRAMES = 2999                  # 30 s of features (npu-transcribe's GigaAM.FRAMES)
 TITANET_BATCH, TITANET_FRAMES = 16, 401   # npu-transcribe's SpeakerModels.EMB_BATCH, 4 s of frames
 TITANET_SCALE = 64.0                  # see titanet_fp16_safe
+# The least the checks against the CPU must give, or the build fails (see must_agree): the share
+# of GigaAM's output frames or Nemotron's voice decisions that agree (measured on an M1: 100 %),
+# and how alike TitaNet's fingerprints and Nemotron's embeddings are (cosine; M1: 0.9998)
+LEAST_AGREE, LEAST_ALIKE = 0.98, 0.99
 
 
 def load_script(name: str):
@@ -486,7 +490,11 @@ def plan(compiled: Path) -> collections.Counter:
 
 
 def report_plan(compiled: Path) -> float:
-    counts = plan(compiled)
+    try:
+        counts = plan(compiled)
+    except (RuntimeError, ImportError, AttributeError) as exc:   # (MLComputePlan: macOS 14.4 and later)
+        print(f"  compute plan: not available on this macOS ({exc})")
+        return 0.0
     total = sum(counts.values()) or 1
     ane = counts.get("NeuralEngine", 0)
     print(f"  compute plan: {ane}/{total} ops on the Neural Engine"
@@ -510,6 +518,19 @@ def timed(model, feed: dict, runs: int = 3) -> tuple[dict, float]:
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     a, b = a.astype(np.float64).ravel(), b.astype(np.float64).ravel()
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+
+def must_agree(what: str, value: float, least: float, *built: Path) -> None:
+    """A check against the CPU that gave less than `least` (or NaN): the Neural Engine build
+    computes something else, as float16 broke GigaAM and TitaNet on the Intel NPU before their
+    fixes. Its files are removed, so that nothing loads it, and the build fails: the installer
+    stops there and writes no stamp."""
+    if value >= least:
+        return
+    for p in built:
+        shutil.rmtree(p, ignore_errors=True)
+    sys.exit(f"prepare-coreml: {what}: {value:.4f}, less than {least}: the Neural Engine build does not match "
+             "the CPU, so it is not kept")
 
 
 # --------------------------------------------------------------------------- the models
@@ -552,6 +573,7 @@ def prepare_gigaam(src: Path, out: Path) -> None:
         print(f"  {out}/model.mlmodelc ready: {secs * 1000:.0f} ms per 30 s, "
               f"{same * 100:.2f} % of the output frames agree with the CPU")
         report_plan(compiled)
+        must_agree("GigaAM, output frames that agree with the CPU", same, LEAST_AGREE, compiled)
 
 
 def titanet_fp16_safe(model, scale: float = TITANET_SCALE) -> None:
@@ -620,6 +642,7 @@ def prepare_titanet(src: Path, out: Path) -> None:
         print(f"  {out}/titanet.mlmodelc ready: {secs * 1000:.0f} ms per {TITANET_BATCH} fingerprints, "
               f"{min(sims):.4f} alike to the CPU's at worst")
         report_plan(compiled)
+        must_agree("TitaNet, fingerprints alike to the CPU's at worst", min(sims), LEAST_ALIKE, compiled)
 
 
 # --------------------------------------------------------------------------- Nemotron
@@ -736,8 +759,15 @@ def prepare_nemotron(weights: Path, out: Path) -> None:
 
 
 def check_nemotron(w: dict, out: Path) -> None:
-    """The encoder on random embeddings (a full step, half of it masked) vs. numpy in float32."""
+    """The embedder on random features, and the encoder on random embeddings (a full step, half
+    of it masked), vs. numpy in float32."""
     diar = load_script("prepare-diarization")
+    built = (out / "encoder.mlmodelc", out / "embedder.mlmodelc")
+    feats = np.random.default_rng(3).standard_normal(diar.graph_inputs("embedder")["features"]).astype(np.float32)
+    ref = diar.build_graph(NumpyOps(), w, "embedder", {"features": feats})["embeds"]
+    alike = cosine(load(out / "embedder.mlmodelc").predict({"features": feats})["embeds"], ref)
+    print(f"  embedder: {alike:.4f} alike to float32 numpy")
+    must_agree("Nemotron's embedder, alike to float32 numpy", alike, LEAST_ALIKE, *built)
     shapes = diar.graph_inputs("encoder")
     rng = np.random.default_rng(2)
     x = (rng.standard_normal(shapes["embeds"]) * 0.5).astype(np.float32)
@@ -750,6 +780,7 @@ def check_nemotron(w: dict, out: Path) -> None:
     agree = float(((got[0, :valid] > 0.5) == (ref[0, :valid] > 0.5)).mean())
     print(f"  encoder: {secs * 1000:.0f} ms per step, {agree * 100:.2f} % of the 10 ms voice decisions "
           f"agree with float32 numpy, largest difference {np.abs(got[0, :valid] - ref[0, :valid]).max():.3f}")
+    must_agree("Nemotron, voice decisions that agree with float32 numpy", agree, LEAST_AGREE, *built)
 
 
 class NumpyOps:

@@ -20,9 +20,12 @@ skip without it: swift build -c release --package-path macos)
 - bmeet-whisper itself (built, no models): its runtime folder, and it removes only its own socket
   and pid file when it ends.
 - bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket.
+- fetch-models (any system): a download that is cut off goes on from its .part, with a stand-in
+  for curl.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -683,6 +686,72 @@ class CtlToApp(unittest.TestCase):
         st = self.ctl.status()
         self.assertEqual((st["daemon"], st["dictation"], st["meeting"], st["device"]), ("active", "recording", "idle", "ANE"))
         self.assertEqual(st["languages"], ["en", "ru"])
+
+
+# curl for fetch-models: serves SOURCE, and cuts off as many calls as CUTS says (half of what is
+# left, then exit 56). Every call is logged with the size its .part had.
+FAKE_CURL = '''#!{py} -I
+import os, sys
+from pathlib import Path
+here = Path(__file__).resolve().parent
+out = Path(sys.argv[sys.argv.index("-o") + 1])
+data = (here / "source").read_bytes()
+have = out.stat().st_size if out.exists() else 0
+with open(here / "calls", "a") as log:
+    log.write(f"{{have}}\\n")
+cuts = int((here / "cuts").read_text())
+with open(out, "ab") as f:
+    if cuts > 0:
+        (here / "cuts").write_text(str(cuts - 1))
+        f.write(data[have:have + (len(data) - have) // 2])
+        sys.exit(56)
+    f.write(data[have:])
+'''
+
+
+class FetchModels(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.data = os.urandom(200_000)
+        (self.bin / "source").write_bytes(self.data)
+        (self.bin / "curl").write_text(FAKE_CURL.format(py=PY))
+        (self.bin / "curl").chmod(0o755)
+        self.file = "var1/AudioEncoder.mlmodelc/weights/weight.bin"
+        (self.tmp / "m.tsv").write_text(f"revision\tabcdef0123\n{self.file}\t{len(self.data)}\t"
+                                        f"{hashlib.sha256(self.data).hexdigest()}\n")
+        self.env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fetch(self, cuts: int) -> subprocess.CompletedProcess:
+        (self.bin / "cuts").write_text(str(cuts))
+        return subprocess.run([PY, "-I", str(MACOS / "fetch-models"), str(self.tmp / "m.tsv"), str(self.tmp / "dest"),
+                               "var1"], env=self.env, capture_output=True, text=True, timeout=60)
+
+    def calls(self) -> list[int]:
+        return [int(v) for v in (self.bin / "calls").read_text().split()]
+
+    def test_a_cut_off_download_goes_on(self) -> None:
+        r = self.fetch(cuts=1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.tmp / "dest" / self.file).read_bytes(), self.data)
+        self.assertEqual(self.calls(), [0, len(self.data) // 2])   # (the second attempt resumed)
+
+    def test_the_next_run_goes_on_too(self) -> None:
+        r = self.fetch(cuts=2)
+        self.assertNotEqual(r.returncode, 0)
+        part = self.tmp / "dest" / (self.file + ".part")
+        self.assertTrue(part.is_file())
+        kept = part.stat().st_size
+        self.assertGreater(kept, 0)
+        r = self.fetch(cuts=0)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.tmp / "dest" / self.file).read_bytes(), self.data)
+        self.assertEqual(self.calls()[-1], kept)
+        self.assertFalse(part.exists())
 
 
 if __name__ == "__main__":

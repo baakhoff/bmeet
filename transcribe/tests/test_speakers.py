@@ -815,6 +815,24 @@ class Live(unittest.TestCase):
         self.assertAlmostEqual(got[2][1], 35.3, delta=0.11)
         self.assertIsNone(t.start)
 
+    def test_phrases_end_at_pauses_in_a_loud_room(self):
+        """A steady background at -30 dBFS (a loud café, a fan next to the microphone) is no
+        sound: three phrases at -16 dBFS, 1.5 s apart, stay three. (With LIVE_SPEECH_DBFS as a
+        cap on the threshold, the background was sound: one phrase, cut only at LIVE_LONGEST.)"""
+        x = noise(16, 10 ** (-30 / 20), 60)
+        starts = (1.0, 4.5, 8.0)
+        for k, start in enumerate(starts):
+            self.burst(x, start, start + 2.0, 10 ** (-16 / 20), 61 + k)
+        t = nt.LiveTrack("mic", "You")
+        for i in range(0, x.size, RATE // 2):
+            t.append(x[i:i + RATE // 2], 0)
+            t.listen(0)
+        got = [(a / RATE, b / RATE) for a, b in t.ended]
+        self.assertEqual(len(got), 3, got)
+        for (a, b), start in zip(got, starts):
+            self.assertAlmostEqual(a, start - nt.LIVE_PAD, delta=0.11)
+            self.assertAlmostEqual(b, start + 2.0 + nt.LIVE_PAD, delta=0.11)
+
     def record(self, parts: list[dict[str, np.ndarray]], engine, in_person=False, calls=(), ticks=None) -> nt.LiveMeeting:
         """Writes the parts as bmeet-meeting-audio would, 0.5 s at a time, and has a
         LiveMeeting follow them; returns it once the recording ended."""
@@ -901,6 +919,23 @@ class Live(unittest.TestCase):
                         ticks=lambda m, at: when.append(at) if m.mic.final and not when else None)
         self.assertLessEqual(when[0], 9.0)
         self.assertEqual([s.text for s in m.mic.final], ["Echo foxtrot golf."])
+
+    def test_yours_while_their_track_does_not_grow(self):
+        """On a Mac the system audio has a recorder of its own (bmeet-record's tap), which can fail
+        while your microphone goes on: their file stays a header. Your phrases are then not held
+        back for theirs until the meeting stops."""
+        mic = noise(12, 0.001, 70)
+        self.burst(mic, 2.0, 4.0, 0.03, 71)
+        when = []
+        mac, nt.MAC = nt.MAC, True
+        try:
+            m = self.record([{"remote": np.zeros(0, np.float32), "mic": mic}], FakeEngine(self.SCRIPT),
+                            ticks=lambda m, at: when.append(at) if m.mic.final and not when else None)
+        finally:
+            nt.MAC = mac
+        self.assertTrue(when and when[0] <= 6.0, when)
+        self.assertEqual([s.text for s in m.mic.final], ["Echo foxtrot golf."])
+        self.assertEqual(m.remote.final, [])
 
     def test_parts_and_in_person(self):
         a, b = noise(4, 0.001, 20), noise(3, 0.001, 21)

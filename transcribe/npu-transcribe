@@ -2741,10 +2741,11 @@ LIVE_TICK = 0.5           # seconds between looks at the recording
 LIVE_FRAME = SAMPLE_RATE // 10  # sound is measured per 100 ms (as in echo_gain)
 LIVE_NOISE = 300          # a track's background noise: the quietest tenth of its last 300 frames
 LIVE_SNR = 12.0           # sound: this many dB above that noise (and above SILENCE_DBFS) ...
-# ... and anything this loud is sound whatever the noise seems to be: in the first seconds of a
-# dictation or a phrase there may be no quiet to measure the noise in, and then the quietest tenth
-# is speech. Clean speech (-13..-17 dBFS) then fell under that "noise" + 12 dB (-12.7 dBFS), a
-# pause was heard in the middle of a sentence, and its words were lost (macOS, 2026-10-20).
+# ... but a "noise" louder than this is speech: in the first seconds of a dictation or a phrase
+# there may be no quiet to measure the noise in. Clean speech (-13..-17 dBFS) then fell under that
+# "noise" + 12 dB (-12.7 dBFS), a pause was heard in the middle of a sentence, and its words were
+# lost (macOS, 2026-10-20). Then anything this loud is sound (live_threshold), and only then: in a
+# room whose background is this loud, everything would be sound, with no pauses in it.
 LIVE_SPEECH_DBFS = -30.0
 LIVE_PAUSE = 0.8          # a phrase ends after this much quiet ...
 LIVE_LONGEST = 20.0       # ... or is cut at its quietest moment when it gets this long
@@ -2755,6 +2756,11 @@ LIVE_DETECT = 8.0         # the language is detected (by Whisper) once this much
 LIVE_START = 30.0         # give up when no recording shows up in this long
 LIVE_STILL = 3.0          # nothing recorded for this long (paused): the phrases being said end
 LIVE_KEEP = 30.0          # audio no phrase needs any more is let go of in steps this long
+
+
+def live_threshold(noise: float) -> float:
+    """The level (dBFS) from which a frame is sound, given a track's noise (LIVE_SNR)."""
+    return max(SILENCE_DBFS, LIVE_SPEECH_DBFS if noise > LIVE_SPEECH_DBFS else noise + LIVE_SNR)
 
 
 def wav_data(path: Path) -> int | None:
@@ -2864,7 +2870,7 @@ class LiveTrack:
         self.rms = np.concatenate([self.rms, frame_rms(self.audio(base, first * LIVE_FRAME, n * LIVE_FRAME),
                                                        LIVE_FRAME)])
         level = 20 * np.log10(np.maximum(self.rms[max(0, n - LIVE_NOISE):], 1e-10))
-        threshold = max(SILENCE_DBFS, min(float(np.percentile(level, 10)) + LIVE_SNR, LIVE_SPEECH_DBFS))
+        threshold = live_threshold(float(np.percentile(level, 10)))
         pad, pause = int(LIVE_PAD * SAMPLE_RATE), int(LIVE_PAUSE * SAMPLE_RATE)
         loud = lambda i: (20 * math.log10(max(self.rms[i], 1e-10)) >= threshold
                           and (echo is None or i >= echo.size or self.rms[i] >= echo[i]))
@@ -3022,8 +3028,11 @@ class LiveMeeting:
         if self.remote:
             changed |= self.finish(self.remote, list(self.remote.ended))
         # Yours waits while the other side says something at the same time (your phrase's
-        # padding may reach into theirs: only its sound counts).
-        settled = self.remote.settled() + int(LIVE_PAD * SAMPLE_RATE) if self.remote and not over else math.inf
+        # padding may reach into theirs: only its sound counts). On a Mac their track has a
+        # recorder of its own, which can fail while yours goes on: then yours does not wait for
+        # theirs once it stopped growing (as in listen()).
+        waits = self.remote and not over and (not MAC or self.remote.length + 2 * SAMPLE_RATE >= self.mic.length)
+        settled = self.remote.settled() + int(LIVE_PAD * SAMPLE_RATE) if waits else math.inf
         changed |= self.finish(self.mic, [p for p in self.mic.ended if p[1] <= settled])
         if isinstance(self.engine, GigaAM) and not over:
             for t in self.tracks:
@@ -3293,8 +3302,7 @@ class Dictation:
         if n == 0:
             return
         level = 20 * np.log10(np.maximum(self.rms, 1e-10))
-        threshold = max(SILENCE_DBFS, min(float(np.percentile(level[-LIVE_NOISE:], 10)) + LIVE_SNR,
-                                          LIVE_SPEECH_DBFS))
+        threshold = live_threshold(float(np.percentile(level[-LIVE_NOISE:], 10)))
         start = self.frozen // LIVE_FRAME
         loud = np.flatnonzero(level[start:] >= threshold)
         self.sound = max(self.frozen, (start + int(loud[-1]) + 1) * LIVE_FRAME) if loud.size else self.frozen

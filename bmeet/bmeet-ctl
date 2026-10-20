@@ -130,6 +130,14 @@ def dictation_state() -> str:
 
 
 def daemon_running() -> bool:
+    if MAC and not pid_running():
+        # (macOS deletes the files in your temp folder that were not opened for 3 days, and
+        # BMeet.app writes its pid file once, at launch: then ask BMeet.app itself)
+        return bmeetmac.agent_running()
+    return pid_running()
+
+
+def pid_running() -> bool:
     try:
         pid = int(read_first_line(RUN / "pid", "0"))
     except ValueError:
@@ -374,6 +382,55 @@ def set_mac_language(target: str) -> int:
     return 0
 
 
+WINDOW_PAGES = ("meetings", "files", "transcribe")   # the window's pages (PAGES in bmeet/app/bmeet)
+
+
+def window_args(args: list[str]) -> list[str] | None:
+    """macOS `open`: the window's arguments with its files made absolute here, read the way the
+    window reads them (parse_cli() in bmeet/app/bmeet). BMeet.app starts the window in /, not in
+    the folder you ran `bmeet` in. None (and why, on stderr) when the window would not take them."""
+    out, rest, page, files, only_files = [], list(args), False, False, False
+
+    def here(f: str) -> str:   # (file: URLs are absolute; the window turns them into paths)
+        return f if not f or f.startswith("file:") else os.path.abspath(os.path.expanduser(f))
+    while rest:
+        a = rest.pop(0)
+        if only_files:
+            out.append(here(a))
+        elif a == "--":
+            out.append(a)
+            only_files = True
+        elif a == "--id" and rest:
+            out += [a, rest.pop(0)]
+        elif a.startswith("--id="):
+            out.append(a)
+        elif a == "--file" and rest:
+            out += [a, here(rest.pop(0))]
+            files = True
+        elif a.startswith("--file="):
+            out.append("--file=" + here(a[7:]))
+            files = True
+        elif a in WINDOW_PAGES and not page and not files:
+            out.append(a)
+            page = True
+        elif a.startswith("-") and a != "-":
+            print(f"bmeet: unknown option or missing value: {a}\n\n{window_usage()}", file=sys.stderr)
+            return None
+        else:
+            out.append(here(a))
+            files = True
+    return out
+
+
+def window_usage() -> str:
+    """The window's --help (its docstring), for macOS, where the window has no terminal."""
+    import ast
+    try:
+        return (ast.get_docstring(ast.parse(APP.read_text(encoding="utf-8"))) or "").strip()
+    except (OSError, SyntaxError, ValueError):
+        return "usage: bmeet [meetings|files|transcribe] [--id MEETING_ID] [--file PATH]... [FILE...]"
+
+
 def mac_main(cmd: str, args: list[str]) -> int | None:
     """The actions on macOS (None: not one of them; status, recent, version are shared)."""
     if cmd == "dictate":
@@ -395,8 +452,16 @@ def mac_main(cmd: str, args: list[str]) -> int | None:
             print("usage: bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]", file=sys.stderr)
             return 2
         return 0 if to_app({"op": "meeting", "action": action, "in_person": bool(extra)}) else 1
-    if cmd == "open":
-        return 0 if to_app({"op": "open", "args": args}) else 1
+    if cmd == "open":   # (`bmeet`: what the window would print, and its files, are done here)
+        if any(a in ("-h", "--help") for a in args):
+            print(window_usage())
+            return 0
+        if "--version" in args:
+            print(f"bmeet {__version__}")
+            return 0
+        if (window := window_args(args)) is None:
+            return 2
+        return 0 if to_app({"op": "open", "args": window}) else 1
     return None
 
 

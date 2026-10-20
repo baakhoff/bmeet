@@ -35,25 +35,28 @@ WORD, GAP = 0.3, 0.1          # a word: this long, this much quiet after it
 
 class Speech:
     """Made-up speech: each word is a tone of its own pitch (VOCAB), so the fake model knows it;
-    WORD + GAP per word, the pause after a sentence as given."""
+    WORD + GAP per word, the pause after a sentence as given. level: the tones' amplitude;
+    background: the RMS of the noise under everything."""
 
-    def __init__(self) -> None:
-        self.x = quiet(0.5, 0)
+    def __init__(self, level: float = 0.05, background: float = 0.0005) -> None:
+        self.level, self.background = level, background
+        self.x = quiet(0.5, 0, background)
         self.words: list[tuple[str, float, float]] = []
 
     def say(self, sentence: str, pause: float = 1.2) -> "Speech":
         t = np.arange(int(WORD * RATE)) / RATE
         for w in sentence.split():
             start = self.x.size / RATE
-            tone = (0.05 * np.sin(2 * np.pi * VOCAB.pitch(w) * t)).astype(np.float32)
-            self.x = np.concatenate([self.x, tone + quiet(WORD, len(self.words)), quiet(GAP, len(self.words))])
+            tone = (self.level * np.sin(2 * np.pi * VOCAB.pitch(w) * t)).astype(np.float32)
+            self.x = np.concatenate([self.x, tone + quiet(WORD, len(self.words), self.background),
+                                     quiet(GAP, len(self.words), self.background)])
             self.words.append((w, start, start + WORD))
-        self.x = np.concatenate([self.x, quiet(pause, len(self.words))])
+        self.x = np.concatenate([self.x, quiet(pause, len(self.words), self.background)])
         return self
 
 
-def quiet(seconds: float, seed: int) -> np.ndarray:
-    return np.random.default_rng(seed).normal(0, 0.0005, int(seconds * RATE)).astype(np.float32)
+def quiet(seconds: float, seed: int, level: float = 0.0005) -> np.ndarray:
+    return np.random.default_rng(seed).normal(0, level, int(seconds * RATE)).astype(np.float32)
 
 
 class Vocab:
@@ -74,6 +77,7 @@ VOCAB = Vocab()
 
 class FakeGigaAM(nt.GigaAM):
     """GigaAM's words(): the tones in the block, each the word of its pitch."""
+    LOUD = 0.008   # a word is louder than this (RMS per 20 ms)
 
     def __init__(self) -> None:  # (no model)
         self.device, self.calls = "NPU", 0
@@ -81,7 +85,7 @@ class FakeGigaAM(nt.GigaAM):
     def words(self, block: np.ndarray) -> list:
         self.calls += 1
         hop = RATE // 50
-        loud = nt.frame_rms(block, hop) > 0.008
+        loud = nt.frame_rms(block, hop) > self.LOUD
         out, i = [], 0
         while i < loud.size:
             if not loud[i]:
@@ -167,6 +171,26 @@ class Drafts(unittest.TestCase):
         d.append(x)
         d.listen()
         self.assertGreaterEqual(d.sound, x.size - nt.LIVE_FRAME)
+
+    def test_sentence_final_after_a_pause_in_a_loud_room(self):
+        """A steady background at -30 dBFS (a loud café, a fan next to the microphone) under speech
+        at -15 dBFS: the background is no sound, so the pause after a sentence is still heard and
+        the sentence is final there. (With LIVE_SPEECH_DBFS as a cap on the threshold, the
+        background was sound, and nothing became final before the end.)"""
+        class Loud(FakeGigaAM):
+            LOUD = 0.08   # (it hears the words, not the room)
+        s = Speech(level=0.25, background=10 ** (-30 / 20)).say("Alpha bravo charlie.", pause=1.5) \
+            .say("Delta echo foxtrot golf.")
+        events, d = dictate(s, Loud())
+        final_at = next(t for t, final, _ in events if final == "Alpha bravo charlie.")
+        self.assertLess(final_at - s.words[2][2], nt.DICTATE_PAUSE + 0.6)
+        self.assertLess(final_at, s.words[3][1] + 0.5)
+        self.assertEqual(d.final, ["Alpha bravo charlie.", "Delta echo foxtrot golf."])
+        # each phrase's sound ends with its last word, not in the room's noise after it
+        d = nt.Dictation(Loud(), {})
+        d.append(s.x[:int(s.words[3][1] * RATE)])
+        d.listen()
+        self.assertAlmostEqual(d.sound / RATE, s.words[2][2], delta=0.11)
 
     def test_no_sentence_end_no_freeze(self):
         s = Speech().say("Alpha bravo charlie", pause=1.2).say("delta echo.")

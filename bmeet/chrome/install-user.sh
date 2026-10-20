@@ -45,7 +45,9 @@ mkdir -p "$bin_dir"
 found=() blocked=()
 for b in "${browsers[@]}"; do
     [[ -d $config/$b ]] || continue
-    if ! install -d -m 0755 "$config/$b/NativeMessagingHosts" 2>/dev/null; then
+    if [[ -z $mac ]]; then
+        install -d -m 0755 "$config/$b/NativeMessagingHosts"   # (stops here when it cannot)
+    elif ! install -d -m 0755 "$config/$b/NativeMessagingHosts" 2>/dev/null; then
         blocked+=("$b")   # (macOS may keep other programs out of a browser's folder)
         continue
     fi

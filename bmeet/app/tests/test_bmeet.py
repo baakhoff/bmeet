@@ -488,6 +488,43 @@ class A_DataTests(unittest.TestCase):
         (run / "meeting_state").write_text("idle\n")
         self.assertEqual(vn.ctl.status()["meeting_id"], None)
 
+    def test_ctl_on_a_mac(self):
+        """bmeet-ctl's macOS side, with BMeet.app faked. macOS deletes BMeet.app's pid file from the
+        temp folder after 3 days: BMeet.app is then asked. `bmeet FILE` (bmeet-ctl open) makes FILE
+        absolute before BMeet.app starts the window, in /, and answers --version and --help itself."""
+        import contextlib
+        import io
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        ctl, sent, running = vn.ctl, [], [True]
+        fake = NS(agent=lambda command, timeout=5.0: sent.append(command) or {"ok": True},
+                  agent_running=lambda: running[0])
+        with mock.patch.object(ctl, "MAC", True), mock.patch.object(ctl, "bmeetmac", fake, create=True), \
+                mock.patch.object(ctl, "RUN", WORK / "run-mac"):   # (no pid file there)
+            self.assertTrue(ctl.daemon_running())
+            running[0] = False
+            self.assertFalse(ctl.daemon_running())
+            ctl.RUN = WORK / "run"   # (a pid file of a running process: no need to ask)
+            self.assertTrue(ctl.daemon_running())
+            here = os.getcwd()
+            for args in (["talk.m4a"], ["meetings", "--id", "x y"], ["files", "--file", "a.md", "--file=b.md", "~/c.ogg"],
+                         ["--id=1", "transcribe", "meetings", "--", "--x", "files"], ["file:///m/a%20b.ogg", "-"]):
+                sent.clear()
+                self.assertEqual(ctl.main(["open", *args]), 0)
+                self.assertEqual(sent[0]["op"], "open")
+                self.assertEqual(vn.parse_cli(sent[0]["args"], cwd="/"), vn.parse_cli(args, cwd=here), args)
+            self.assertEqual(sent[0]["args"], ["file:///m/a%20b.ogg", os.path.join(here, "-")])
+            sent.clear()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(ctl.main(["open", "--version"]), 0)
+                self.assertEqual(ctl.main(["open", "meetings", "--help"]), 0)
+                self.assertEqual(ctl.main(["open", "--nope"]), 2)
+                self.assertEqual(ctl.main(["open", "--id"]), 2)
+            self.assertEqual(sent, [])
+            self.assertTrue(out.getvalue().startswith(f"bmeet {ctl.__version__}\nBMeet - "), out.getvalue()[:80])
+            self.assertIn("unknown option or missing value: --nope", err.getvalue())
+
     SPEAKER_MD = ("# Meeting\n\n## Meeting Info\n\n- **Speakers:** You, Person 1, Person 2, Person 3\n\n"
                   "## Transcript\n\n### Person 1\n\n*[00:00]* Hello, Person 2 here is late.\n\n"
                   "### You\n\n*[00:04]* Hi.\n\n### Person 2\n\n*[00:06]* Sorry.\n\n"

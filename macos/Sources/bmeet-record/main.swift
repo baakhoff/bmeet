@@ -18,8 +18,10 @@
 // hardware timestamp, so the echo of the call in your microphone lines up with the call.
 // The system audio comes from a Core Audio process tap (macOS 14.2+) of all processes. The
 // first use asks for permission ("System Audio Recording"), for the app that started this
-// (BMeet.app): without it the tap delivers silence. WAV headers are written at the start with
-// open sizes (npu-transcribe --live reads the files while they grow) and fixed at the end.
+// (BMeet.app): without it the tap delivers silence. Both follow the devices (headphones, AirPods,
+// another sample rate): the microphone starts again, the tap is built again, and what fails is
+// tried again and logged. WAV headers are written at the start with open sizes (npu-transcribe
+// --live reads the files while they grow) and fixed at the end.
 
 import AVFoundation
 import CoreAudio
@@ -99,7 +101,8 @@ final class Sink: @unchecked Sendable {
 
     /// Samples whose first one was heard at host time `host`: placed at their time (silence
     /// before them if the stream started late or dropped out; overlap with what is already
-    /// written is cut off).
+    /// written is cut off, so a device clock that runs fast does not drift ahead of the other
+    /// track: the microphone and the system audio follow two devices' clocks).
     func append(_ samples: [Int16], host: UInt64?) {
         var samples = samples
         if let host {
@@ -107,7 +110,7 @@ final class Sink: @unchecked Sendable {
             if at > nextSample + Int64(rate / 50) {          // a gap of more than 20 ms: fill it
                 let gap = min(at - nextSample, Int64(rate * 5))
                 samples = [Int16](repeating: 0, count: Int(gap)) + samples
-            } else if at < nextSample - Int64(rate / 50), nextSample == 0 {
+            } else if at < nextSample - Int64(rate / 50) {   // more than 20 ms ahead of its time: cut
                 let skip = Int(min(Int64(samples.count), nextSample - at))
                 samples.removeFirst(skip)
             }
@@ -185,25 +188,33 @@ final class Converter {
     }
 }
 
-func mixToMono(_ list: UnsafeMutableAudioBufferListPointer, frames: Int, interleavedChannels: Int) -> [Float] {
+/// Float32 buffers -> the average of all their channels. Each buffer says how many channels it
+/// holds (interleaved, or one buffer per channel) and how many bytes: the frames are counted from
+/// that, not from a format read earlier.
+func mixToMono(_ list: UnsafeMutableAudioBufferListPointer) -> [Float] {
+    var frames = Int.max, channels = 0
+    for b in list where b.mNumberChannels > 0 && b.mData != nil {
+        frames = min(frames, Int(b.mDataByteSize) / (4 * Int(b.mNumberChannels)))
+        channels += Int(b.mNumberChannels)
+    }
+    guard channels > 0, frames > 0 else { return [] }
     var out = [Float](repeating: 0, count: frames)
-    if list.count == 1 && interleavedChannels > 1 {             // interleaved
-        guard let p = list[0].mData?.assumingMemoryBound(to: Float.self) else { return out }
+    for b in list where b.mNumberChannels > 0 {
+        guard let p = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+        let n = Int(b.mNumberChannels)
         for i in 0..<frames {
             var s: Float = 0
-            for c in 0..<interleavedChannels { s += p[i * interleavedChannels + c] }
-            out[i] = s / Float(interleavedChannels)
-        }
-    } else {                                                    // one buffer per channel
-        let n = Float(max(1, list.count))
-        for b in list {
-            guard let p = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
-            let count = min(frames, Int(b.mDataByteSize) / 4)
-            for i in 0..<count { out[i] += p[i] / n }
+            for c in 0..<n { s += p[i * n + c] }
+            out[i] += s
         }
     }
+    let scale = 1 / Float(channels)
+    for i in 0..<frames { out[i] *= scale }
     return out
 }
+
+/// A flag a callback can set (one per tap device: its first odd buffer is reported once).
+final class Flag { var on = false }
 
 // MARK: - the microphone (AVAudioEngine)
 
@@ -212,10 +223,31 @@ final class Microphone {
     private let converter = Converter()
     private let onAudio: ([Int16], UInt64?) -> Void
     private var observer: NSObjectProtocol?
+    private var stopped = false
+    private var restarts = 0      // (a newer device change cancels the retries of an older one)
 
     init(onAudio: @escaping ([Int16], UInt64?) -> Void) { self.onAudio = onAudio }
 
+    deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+
+    /// The default input device. start(), stop() and the restarts after a device change run on
+    /// the main thread.
     func start() throws {
+        // A new input device (AirPods connected, ...): start over on it. Added once, not on every
+        // start: one more observer on each restart would double the restarts with every change.
+        if observer == nil {
+            observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                              object: engine, queue: .main) { [weak self] _ in
+                guard let self, !self.stopped else { return }
+                log("the input device changed: following it")
+                self.restarts += 1
+                self.restart(self.restarts, tries: 0)
+            }
+        }
+        try startEngine()
+    }
+
+    private func startEngine() throws {
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -233,19 +265,30 @@ final class Microphone {
             self.onAudio(self.converter.convert(mono, sampleRate: buf.format.sampleRate), host)
         }
         engine.prepare()
-        try engine.start()
-        // A new input device (AirPods connected, ...): start over on it.
-        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                                          object: engine, queue: nil) { [weak self] _ in
-            guard let self else { return }
-            log("the input device changed: following it")
-            self.engine.inputNode.removeTap(onBus: 0)
-            self.engine.stop()
-            try? self.start()
+        do { try engine.start() } catch { input.removeTap(onBus: 0); throw error }
+    }
+
+    /// After a device change: the engine again, on the new device. Mid-switch that device may not
+    /// be ready yet (0 Hz, or the start fails): then again 0.5 s later, 6 tries in all.
+    private func restart(_ id: Int, tries: Int) {
+        guard !stopped, id == restarts else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        do {
+            try startEngine()
+            if tries > 0 { log("the microphone is back") }
+        } catch {
+            if tries < 5 {
+                if tries == 0 { log("microphone: \(error.localizedDescription); trying again") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.restart(id, tries: tries + 1) }
+            } else {
+                log("microphone: \(error.localizedDescription); it stays off until the input device changes again")
+            }
         }
     }
 
     func stop() {
+        stopped = true
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
         engine.inputNode.removeTap(onBus: 0)
@@ -258,23 +301,21 @@ final class Microphone {
 func audioProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ value: inout T) -> OSStatus {
     var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
                                              mElement: kAudioObjectPropertyElementMain)
-    var size = UInt32(MemoryLayout<T>.size)   // (plain values only: an AudioObjectID, a stream format)
+    var size = UInt32(MemoryLayout<T>.size)   // (plain values only: an AudioObjectID, a rate, a stream format)
     return withUnsafeMutableBytes(of: &value) { AudioObjectGetPropertyData(object, &address, 0, nil, &size, $0.baseAddress!) }
 }
 
-func defaultOutputUID() -> String? {
+func defaultOutputDevice() -> AudioObjectID? {
     var device = AudioObjectID(kAudioObjectUnknown)
-    guard audioProperty(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice, &device) == noErr
-    else { return nil }
-    // (a CFString comes back retained: read it as Unmanaged, not into a Swift object)
-    var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal,
-                                             mElement: kAudioObjectPropertyElementMain)
-    var uid: Unmanaged<CFString>?
-    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &uid) == noErr, let uid else { return nil }
-    return uid.takeRetainedValue() as String
+    guard audioProperty(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice, &device) == noErr,
+          device != kAudioObjectUnknown else { return nil }
+    return device
 }
 
+/// The system audio: a process tap of everything the Mac plays, alone in a private aggregate
+/// device. start(), stop() and every rebuild run on the main thread (Meeting's). The IO block has
+/// a queue of its own and the property listeners another, and those only hand the work to the
+/// main thread: stopping the device on the IO block's queue would wait for that queue itself.
 @available(macOS 14.2, *)
 final class SystemAudio {
     private var tap = AudioObjectID(kAudioObjectUnknown)
@@ -282,23 +323,154 @@ final class SystemAudio {
     private var proc: AudioDeviceIOProcID?
     private let converter = Converter()
     private let onAudio: ([Int16], UInt64?) -> Void
-    private let queue = DispatchQueue(label: "bmeet-record.tap")
-    private var listener: AudioObjectPropertyListenerBlock?
+    private let queue = DispatchQueue(label: "bmeet-record.tap")           // the IO block's, nothing else
+    private let events = DispatchQueue(label: "bmeet-record.tap-events")   // the property listeners'
+    private var outputListener: Listener?
+    private var listeners: [Listener] = []
+    private var setup: Setup?         // what the running tap was built for
+    private var stopped = false
+    private var rebuilds = 0          // (a newer change cancels the retries of an older one)
+    private var builds = 0
+    private var layoutRebuilds = 0
+
+    private struct Listener {
+        let object: AudioObjectID
+        let address: AudioObjectPropertyAddress
+        let block: AudioObjectPropertyListenerBlock
+    }
+
+    /// What the IO block was made for: the default output device and its sample rate, the tap
+    /// device's sample rate, the tap's format.
+    private struct Setup: Equatable {
+        var output: AudioObjectID
+        var outputRate: Float64
+        var rate: Float64
+        var tapRate: Float64
+        var channels: UInt32
+    }
 
     init(onAudio: @escaping ([Int16], UInt64?) -> Void) { self.onAudio = onAudio }
 
-    func start() throws {
+    deinit {
+        if let outputListener { remove(outputListener) }
+        teardown()
+    }
+
+    /// Tap the system audio, and keep following it: another default output device (headphones,
+    /// AirPods) or a new sample rate or channel count (AirPods switching to their call profile,
+    /// Audio MIDI Setup) builds it all again. What fails is logged and tried again.
+    func start() {
+        // (until stop(): a tap that could not be built gets another chance with the next device)
+        outputListener = listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice,
+                                "the output device changed")
+        rebuilds += 1
+        rebuild(rebuilds, why: nil, tries: 0)
+    }
+
+    func stop() {
+        stopped = true
+        if let outputListener { remove(outputListener) }
+        outputListener = nil
+        teardown()
+    }
+
+    /// Tell changed() on the main thread when `selector` of `object` changes.
+    private func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ why: String) -> Listener? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            DispatchQueue.main.async { self.changed(why) }
+        }
+        guard AudioObjectAddPropertyListenerBlock(object, &address, events, block) == noErr else { return nil }
+        return Listener(object: object, address: address, block: block)
+    }
+
+    private func remove(_ listener: Listener) {
+        var address = listener.address
+        AudioObjectRemovePropertyListenerBlock(listener.object, &address, events, listener.block)
+    }
+
+    /// The setup as it is now (zeros for a tap that is not there).
+    private func current() -> Setup {
+        let output = defaultOutputDevice() ?? AudioObjectID(kAudioObjectUnknown)
+        var outputRate: Float64 = 0, rate: Float64 = 0
+        var format = AudioStreamBasicDescription()
+        if output != kAudioObjectUnknown { _ = audioProperty(output, kAudioDevicePropertyNominalSampleRate, &outputRate) }
+        if aggregate != kAudioObjectUnknown { _ = audioProperty(aggregate, kAudioDevicePropertyNominalSampleRate, &rate) }
+        if tap != kAudioObjectUnknown { _ = audioProperty(tap, kAudioTapPropertyFormat, &format) }
+        return Setup(output: output, outputRate: outputRate, rate: rate, tapRate: format.mSampleRate,
+                     channels: format.mChannelsPerFrame)
+    }
+
+    /// A listener fired: build it all again if something the IO block depends on changed (not for
+    /// an event that changed none of that, our own start's say).
+    private func changed(_ why: String) {
+        guard !stopped else { return }
+        if let setup, setup == current() { return }
+        later(why)
+    }
+
+    /// The IO block got another channel count than the tap's format says (that just changed, or
+    /// another stream is in): build it again, which reads the format anew; after 3 times, the
+    /// buffers are taken as they come.
+    private func oddBuffers(_ build: Int, _ channels: Int, _ expected: Int) {
+        guard !stopped, build == builds else { return }
+        layoutRebuilds += 1
+        let then = layoutRebuilds < 3 ? "" : " (from now on taken as they come)"
+        later("\(channels) channels of system audio where the tap has \(expected)\(then)")
+    }
+
+    /// A rebuild a moment later: one change often brings several events.
+    private func later(_ why: String) {
+        rebuilds += 1
+        let id = rebuilds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.rebuild(id, why: why, tries: 0) }
+    }
+
+    /// Build the tap (again: what there is of it goes first). When that fails, again a little
+    /// later, 8 tries in all; after that the next output device tries again.
+    private func rebuild(_ id: Int, why: String?, tries: Int) {
+        guard !stopped, id == rebuilds else { return }
+        if let why { log("\(why): tapping the system audio again") }
+        teardown()
+        do {
+            try build()
+            if tries > 0 { log("system audio: tapped") }
+        } catch {
+            teardown()
+            if tries < 7 {
+                log("system audio: \(error.localizedDescription); trying again")
+                let delay = min(0.5 * Double(1 << tries), 8)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.rebuild(id, why: nil, tries: tries + 1)
+                }
+            } else {
+                log("system audio: \(error.localizedDescription); giving up until the output device changes")
+            }
+        }
+    }
+
+    /// The tap, its aggregate device, the IO block, and the listeners for what would change them.
+    private func build() throws {
+        func failure(_ what: String, _ status: OSStatus) -> NSError {
+            NSError(domain: "bmeet-record", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "\(what) (\(status))"])
+        }
         let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
         description.uuid = UUID()
         description.name = "BMeet system audio"
         description.isPrivate = true
         description.muteBehavior = .unmuted
         var status = AudioHardwareCreateProcessTap(description, &tap)
-        guard status == noErr else { throw NSError(domain: "bmeet-record", code: Int(status),
-                                                   userInfo: [NSLocalizedDescriptionKey: "cannot tap the system audio (\(status))"]) }
+        guard status == noErr else {
+            tap = AudioObjectID(kAudioObjectUnknown)
+            throw failure("cannot tap the system audio", status)
+        }
         var format = AudioStreamBasicDescription()
         _ = audioProperty(tap, kAudioTapPropertyFormat, &format)
-        var config: [String: Any] = [
+        // The tap alone, no sub-device: with the output device in it, the IO block would also get
+        // that device's microphone (a USB headset; AirPods, which would switch to their call profile).
+        let config: [String: Any] = [
             kAudioAggregateDeviceNameKey: "BMeet system audio",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
             kAudioAggregateDeviceIsPrivateKey: true,
@@ -307,51 +479,50 @@ final class SystemAudio {
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: description.uuid.uuidString,
                                                kAudioSubTapDriftCompensationKey: true]],
         ]
-        if let output = defaultOutputUID() {       // the output device as the clock
-            config[kAudioAggregateDeviceMainSubDeviceKey] = output
-            config[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: output]]
-        }
         status = AudioHardwareCreateAggregateDevice(config as CFDictionary, &aggregate)
-        guard status == noErr else { stop(); throw NSError(domain: "bmeet-record", code: Int(status),
-                                                           userInfo: [NSLocalizedDescriptionKey: "cannot create the tap device (\(status))"]) }
-        let sampleRate = format.mSampleRate > 0 ? format.mSampleRate : 48_000
-        let interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
-        let channels = Int(max(1, format.mChannelsPerFrame))
+        guard status == noErr else {
+            aggregate = AudioObjectID(kAudioObjectUnknown)
+            throw failure("cannot create the tap device", status)
+        }
+        var nominal: Float64 = 0      // (the rate the IO block's buffers come at)
+        _ = audioProperty(aggregate, kAudioDevicePropertyNominalSampleRate, &nominal)
+        let sampleRate = nominal > 0 ? nominal : format.mSampleRate > 0 ? format.mSampleRate : 48_000
+        let expected = layoutRebuilds < 3 ? Int(format.mChannelsPerFrame) : 0    // (0: take what comes)
+        builds += 1
+        let id = builds, odd = Flag()
         status = AudioDeviceCreateIOProcIDWithBlock(&proc, aggregate, queue) { [weak self] _, input, inputTime, _, _ in
             guard let self else { return }
             let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-            guard list.count > 0 else { return }
-            let bytesPerFrame = interleaved ? 4 * channels : 4
-            let frames = Int(list[0].mDataByteSize) / bytesPerFrame
-            let mono = mixToMono(list, frames: frames, interleavedChannels: interleaved ? channels : 1)
-            let host: UInt64? = (inputTime.pointee.mFlags.contains(.hostTimeValid)) ? inputTime.pointee.mHostTime : nil
+            let channels = list.reduce(0) { $0 + Int($1.mNumberChannels) }
+            if expected > 0 && channels != expected {       // (skipped: the main thread builds it again)
+                if !odd.on { odd.on = true; DispatchQueue.main.async { self.oddBuffers(id, channels, expected) } }
+                return
+            }
+            let mono = mixToMono(list)
+            if mono.isEmpty { return }
+            let host: UInt64? = inputTime.pointee.mFlags.contains(.hostTimeValid) ? inputTime.pointee.mHostTime : nil
             self.onAudio(self.converter.convert(mono, sampleRate: sampleRate), host)
         }
-        guard status == noErr, let proc else { stop(); throw NSError(domain: "bmeet-record", code: Int(status),
-                                                                     userInfo: [NSLocalizedDescriptionKey: "no tap callback (\(status))"]) }
+        guard status == noErr, let proc else { throw failure("no tap callback", status) }
         status = AudioDeviceStart(aggregate, proc)
-        guard status == noErr else { stop(); throw NSError(domain: "bmeet-record", code: Int(status),
-                                                           userInfo: [NSLocalizedDescriptionKey: "the tap does not start (\(status))"]) }
-        // Another output device (headphones): the aggregate's clock is gone; build it again.
-        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            guard let self else { return }
-            log("the output device changed: tapping again")
-            self.stop()
-            try? self.start()
+        guard status == noErr else { throw failure("the tap does not start", status) }
+        // A new sample rate or format, on the tap device, the tap or the output device (on macOS 14
+        // the tap device may not tell): build it again.
+        let now = current()
+        listeners = [listen(aggregate, kAudioDevicePropertyNominalSampleRate, "the sample rate changed"),
+                     listen(tap, kAudioTapPropertyFormat, "the system audio's format changed")].compactMap { $0 }
+        if now.output != kAudioObjectUnknown,
+           let l = listen(now.output, kAudioDevicePropertyNominalSampleRate, "the output device's sample rate changed") {
+            listeners.append(l)
         }
-        listener = block
-        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+        setup = now
     }
 
-    func stop() {
-        if let listener {
-            var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                                                     mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, listener)
-        }
-        listener = nil
+    /// Stop and destroy the IO block, the tap device and the tap, and drop their listeners.
+    private func teardown() {
+        for l in listeners { remove(l) }
+        listeners = []
+        setup = nil
         if let proc, aggregate != kAudioObjectUnknown {
             AudioDeviceStop(aggregate, proc)
             AudioDeviceDestroyIOProcID(aggregate, proc)
@@ -369,6 +540,8 @@ final class SystemAudio {
 /// BMEET_RECORD_MIC_FILE / BMEET_RECORD_SYSTEM_FILE (tests): that audio file, in real time (or
 /// BMEET_RECORD_SPEED times faster), instead of the microphone / the system audio. Nothing asks
 /// for a permission then, so the recorder's own logic runs anywhere (CI, a Mac without them).
+/// BMEET_RECORD_SYSTEM_CLOCK (tests): the system audio's file as from a device whose clock runs
+/// that many times fast, so more samples come than their host times allow.
 final class FileSource {
     private let url: URL
     private let onAudio: ([Int16], UInt64?) -> Void
@@ -376,9 +549,11 @@ final class FileSource {
     private var samples: [Int16] = []
     private var pos = 0
     private let speed = Double(ProcessInfo.processInfo.environment["BMEET_RECORD_SPEED"] ?? "") ?? 1
+    private let clock: Double
 
-    init(path: String, onAudio: @escaping ([Int16], UInt64?) -> Void) {
+    init(path: String, clock: Double = 1, onAudio: @escaping ([Int16], UInt64?) -> Void) {
         url = URL(fileURLWithPath: path)
+        self.clock = clock > 0 ? clock : 1
         self.onAudio = onAudio
     }
 
@@ -397,9 +572,10 @@ final class FileSource {
         timer.schedule(deadline: .now(), repeating: .milliseconds(50))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let due = min(self.samples.count, Int((hostSeconds(nowHost()) - started) * rate * self.speed))
+            let due = min(self.samples.count, Int((hostSeconds(nowHost()) - started) * rate * self.speed * self.clock))
             if due > self.pos {
-                let host = t0 + UInt64(Double(self.pos) / rate / self.speed * 1e9 * Double(timebase.denom) / Double(timebase.numer))
+                let seconds = Double(self.pos) / rate / self.speed / self.clock
+                let host = t0 + UInt64(seconds * 1e9 * Double(timebase.denom) / Double(timebase.numer))
                 self.onAudio(Array(self.samples[self.pos..<due]), self.speed == 1 ? host : nil)
                 self.pos = due
             }
@@ -496,12 +672,13 @@ final class Meeting {
             guard let rs = Sink.open("\(dir)/part-\(part)-remote.wav", origin: origin) else { log("cannot write in \(dir)"); exit(1) }
             remoteSink = rs
             if let path = env["BMEET_RECORD_SYSTEM_FILE"] {
-                let f = FileSource(path: path) { samples, host in rs.append(samples, host: host) }
+                let clock = Double(env["BMEET_RECORD_SYSTEM_CLOCK"] ?? "") ?? 1
+                let f = FileSource(path: path, clock: clock) { samples, host in rs.append(samples, host: host) }
                 do { try f.start() } catch { log("system audio file: \(error.localizedDescription)") }
                 files.append(f)
             } else if #available(macOS 14.2, *) {
                 let s = SystemAudio { samples, host in rs.append(samples, host: host) }
-                do { try s.start() } catch { log("system audio: \(error.localizedDescription)") }
+                s.start()      // (it logs what fails, and tries again)
                 system = s
             } else {
                 log("system audio needs macOS 14.2 or later: the remote track stays silent")
@@ -555,12 +732,15 @@ final class Meeting {
 }
 
 func runtimeDir() -> String {
-    // $XDG_RUNTIME_DIR/bmeet, as BMeet's Python programs see it (macos/bmeetmac.py: your temp folder)
-    if let x = ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"], !x.isEmpty { return x + "/bmeet" }
-    var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-    let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
-    let tmp = n > 0 ? String(cString: buf) : NSTemporaryDirectory()
-    return (tmp.hasSuffix("/") ? tmp : tmp + "/") + "bmeet"
+    // BMeet's folder in your temp folder, as BMeet's Python programs see it (macos/bmeetmac.py), or
+    // in $BMEET_RUNTIME_ROOT (tests). Not $XDG_RUNTIME_DIR: a shell may export one, BMeet.app has none.
+    var root = ProcessInfo.processInfo.environment["BMEET_RUNTIME_ROOT"] ?? ""
+    if root.isEmpty {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
+        root = n > 0 ? String(cString: buf) : NSTemporaryDirectory()
+    }
+    return (root.hasSuffix("/") ? root : root + "/") + "bmeet"
 }
 
 func usage() -> Never {

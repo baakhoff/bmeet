@@ -10,7 +10,7 @@ skip without it: swift build -c release --package-path macos)
   stand-in server on a socket of a private runtime folder.
 - bmeet-record meeting: two files played instead of the devices (BMEET_RECORD_MIC_FILE /
   BMEET_RECORD_SYSTEM_FILE), following the state file through a pause: parts, start times,
-  finished WAV headers, the pointer file.
+  finished WAV headers, the pointer file; a device clock that runs fast; its runtime folder.
 - bmeet-meeting start / pause / resume / stop: with that recorder, a stand-in for npu-transcribe
   and no RAM disk: the units, the state, the index, the Markdown copy, the speaker pass, cleanup.
 - bmeet-meeting with a stand-in recorder too: what goes wrong (a recorder that dies, a live
@@ -207,6 +207,56 @@ class Recorder(unittest.TestCase):
             a, b = (wav_info(folder / f"part-1-{t}.wav")[2] for t in ("mic", "remote"))
             self.assertLess(abs(a - b) / 32000, 0.3)
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_fast_device_clock_does_not_drift_ahead(self) -> None:
+        # The system audio from a device whose clock runs 25% fast (more samples than their host
+        # times allow): its track is cut back to its time, so it stays as long as the microphone's.
+        tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        try:
+            tone_wav(tmp / "mic.wav", 20, 440)
+            tone_wav(tmp / "remote.wav", 20, 660)
+            state, folder = tmp / "state", tmp / "rec"
+            state.write_text("recording\n")
+            env = dict(os.environ, BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"),
+                       BMEET_RECORD_SYSTEM_FILE=str(tmp / "remote.wav"), BMEET_RECORD_SYSTEM_CLOCK="1.25")
+            p = subprocess.Popen([str(recorder()), "meeting", str(folder), "--state", str(state),
+                                  "--pointer", str(tmp / "recording")], env=env, stderr=subprocess.PIPE, text=True)
+            time.sleep(4.0)
+            state.write_text("idle\n")
+            self.assertEqual(p.wait(timeout=10), 0, p.stderr.read())
+            mic, remote = (wav_info(folder / f"part-1-{t}.wav")[2] / 32000 for t in ("mic", "remote"))
+            self.assertGreater(mic, 3)
+            self.assertLess(abs(remote - mic), 0.3, (mic, remote))      # (not cut: 1 s longer)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_runtime_folder_of_bmeetmac(self) -> None:
+        # Without --state and --pointer: BMeet's runtime folder as bmeetmac sees it
+        # ($BMEET_RUNTIME_ROOT/bmeet here), not the XDG_RUNTIME_DIR a shell exports.
+        tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        p = None
+        try:
+            tone_wav(tmp / "mic.wav", 5)
+            run = tmp / "run/bmeet"
+            run.mkdir(parents=True)
+            (run / "meeting_state").write_text("recording\n")
+            env = {k: v for k, v in os.environ.items() if k not in ("BMEET_STATE_FILE", "BMEET_RECORDING_FILE")}
+            env.update(BMEET_RUNTIME_ROOT=str(tmp / "run"), XDG_RUNTIME_DIR=str(tmp / "shell"),
+                       BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"))
+            p = subprocess.Popen([str(recorder()), "meeting", str(tmp / "rec"), "--mic-only"], env=env,
+                                 stderr=subprocess.PIPE, text=True)
+            deadline = time.time() + 5
+            while not (run / "recording").exists() and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertEqual((run / "recording").read_text().strip(), str(tmp / "rec"))
+            (run / "meeting_state").write_text("idle\n")
+            self.assertEqual(p.wait(timeout=10), 0, p.stderr.read())
+            self.assertFalse((run / "recording").exists())
+            self.assertFalse((tmp / "shell").exists())
+        finally:
+            if p and p.poll() is None:
+                p.kill()
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_raw_microphone_to_stdout(self) -> None:

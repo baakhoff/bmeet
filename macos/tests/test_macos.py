@@ -17,6 +17,8 @@ skip without it: swift build -c release --package-path macos)
   transcript that fails, no access to the Meetings folder, a speaker pass ending while the next
   meeting stops), and its units.
 - bmeetmac's runtime folder.
+- bmeet-whisper itself (built, no models): its runtime folder, and it removes only its own socket
+  and pid file when it ends.
 - bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket.
 """
 from __future__ import annotations
@@ -576,6 +578,68 @@ class RuntimeFolder(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(saved)
+
+
+def whisper_server() -> Path | None:
+    p = MACOS / ".build/release/bmeet-whisper"
+    return p if os.access(p, os.X_OK) else None
+
+
+@unittest.skipUnless(sys.platform == "darwin" and whisper_server(), "macOS with bmeet-whisper built")
+class WhisperServer(unittest.TestCase):
+    """The real bmeet-whisper, without models (its status needs none)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "shell"))
+        self.procs: list[subprocess.Popen] = []
+
+    def tearDown(self) -> None:
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def serve(self, *extra: str) -> subprocess.Popen:
+        p = subprocess.Popen([str(whisper_server()), "serve", "--models", str(self.tmp / "models"), *extra],
+                             env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.append(p)
+        return p
+
+    def wait_for(self, path: Path) -> None:
+        deadline = time.time() + 15
+        while not path.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(path.exists(), path)
+
+    def status(self, sock: Path) -> dict:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(str(sock))
+            s.sendall(b'{"op": "status"}\n')
+            return json.loads(s.makefile("rb").readline())
+
+    def test_its_runtime_folder_and_only_its_own_files_go_when_it_ends(self) -> None:
+        run = self.tmp / "run/bmeet"
+        main = self.serve()
+        self.wait_for(run / "whisper.pid")
+        self.assertEqual(self.status(run / "whisper.sock")["pid"], main.pid)
+        self.assertFalse((self.tmp / "shell").exists())    # (not the XDG_RUNTIME_DIR a shell exports)
+        # another server on another socket: when it ends, the first one's socket and pid file stay
+        other = self.serve("--socket", str(self.tmp / "o/x.sock"))
+        self.wait_for(self.tmp / "o/whisper.pid")
+        self.assertEqual(self.status(self.tmp / "o/x.sock")["pid"], other.pid)   # (it answers: all set up)
+        other.terminate()
+        self.assertEqual(other.wait(timeout=10), 0)
+        self.assertFalse((self.tmp / "o/x.sock").exists())
+        self.assertFalse((self.tmp / "o/whisper.pid").exists())
+        self.assertEqual((run / "whisper.pid").read_text().strip(), str(main.pid))
+        self.assertEqual(self.status(run / "whisper.sock")["pid"], main.pid)
+        main.terminate()
+        self.assertEqual(main.wait(timeout=10), 0)
+        self.assertFalse((run / "whisper.sock").exists())
+        self.assertFalse((run / "whisper.pid").exists())
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS only")

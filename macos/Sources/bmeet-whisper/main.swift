@@ -39,19 +39,16 @@ let variants: [String: (folder: String, tokenizer: String)] = [
     "small": ("openai_whisper-small_216MB", "openai/whisper-small"),
 ]
 
-/// $XDG_RUNTIME_DIR/bmeet, as BMeet's Python programs see it (macos/bmeetmac.py: your temp folder).
+/// $XDG_RUNTIME_DIR/bmeet, as BMeet's Python programs see it (macos/bmeetmac.py: your temp folder),
+/// or $BMEET_RUNTIME_ROOT/bmeet (tests). Not $XDG_RUNTIME_DIR: a shell may export one, BMeet.app has none.
 func runtimeDir() -> URL {
-    let env = ProcessInfo.processInfo.environment
-    if let dir = env["BMEET_RUNTIME_DIR"], !dir.isEmpty {
-        return URL(fileURLWithPath: dir)
+    var root = ProcessInfo.processInfo.environment["BMEET_RUNTIME_ROOT"] ?? ""
+    if root.isEmpty {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
+        root = n > 0 ? String(cString: buf) : NSTemporaryDirectory()
     }
-    if let dir = env["XDG_RUNTIME_DIR"], !dir.isEmpty {
-        return URL(fileURLWithPath: dir).appendingPathComponent("bmeet")
-    }
-    var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-    let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
-    let tmp = n > 0 ? String(cString: buf) : NSTemporaryDirectory()
-    return URL(fileURLWithPath: tmp).appendingPathComponent("bmeet")
+    return URL(fileURLWithPath: root).appendingPathComponent("bmeet")
 }
 
 func defaultModels() -> URL {
@@ -109,17 +106,28 @@ actor Gate {
 
 // MARK: - the models
 
+// (pipes, lastUse, keep and current change only inside the gate; devices also under the lock,
+// for status, which does not wait for the gate)
 final class Engine: @unchecked Sendable {
     let options: Options
     private var pipes: [String: WhisperKit] = [:]
     private var devices: [String: String] = [:]
     private var lastUse: [String: Date] = [:]
+    /// The model that stays loaded: the one the last transcription (not a translation) used, at
+    /// first the install's own (turbo, or small when turbo is not installed).
+    private var keep: String
+    private var current = ""     // the model of the request in the gate
     let gate = Gate()
     private(set) var lastRequest = Date()
     private(set) var active = 0
     private let lock = NSLock()
 
-    init(options: Options) { self.options = options }
+    init(options: Options) {
+        self.options = options
+        let turbo = options.models.appendingPathComponent(variants["turbo"]!.folder)
+            .appendingPathComponent("AudioEncoder.mlmodelc")
+        keep = (FileManager.default.fileExists(atPath: turbo.path) ? "turbo/" : "small/") + options.compute
+    }
 
     func touch(_ delta: Int) {
         lock.lock()
@@ -148,9 +156,12 @@ final class Engine: @unchecked Sendable {
 
     /// The loaded model (loading it first): `model` on `computeName` ("ane", "cpu", "gpu"; the
     /// server's --compute when empty). Each pair is loaded once; "ane" falls back to the CPU.
-    func pipe(_ model: String, compute computeName: String = "") async throws -> (WhisperKit, String) {
+    /// `transcribing`: for a transcription (not a translation), so this model stays loaded.
+    func pipe(_ model: String, compute computeName: String = "", transcribing: Bool = false) async throws -> (WhisperKit, String) {
         let first = computeName.isEmpty ? options.compute : computeName
         let key = "\(model)/\(first)"
+        current = key
+        if transcribing { keep = key }
         if let p = pipes[key] {
             lastUse[key] = Date()
             return (p, devices[key] ?? "?")
@@ -175,7 +186,9 @@ final class Engine: @unchecked Sendable {
                 let p = try await WhisperKit(config)
                 let device = c == "ane" ? "ANE" : c.uppercased()
                 pipes[key] = p
+                lock.lock()
                 devices[key] = device
+                lock.unlock()
                 lastUse[key] = Date()
                 log(String(format: "%@ ready on %@ in %.1f s", v.folder, device, Date().timeIntervalSince(t0)))
                 return (p, device)
@@ -187,8 +200,14 @@ final class Engine: @unchecked Sendable {
         throw lastError ?? WhisperError.modelsUnavailable("could not load \(model)")
     }
 
-    /// The translation model is needed rarely: let it go after a few idle minutes.
-    func unloadIdle(except keep: String = "turbo/ane", after seconds: Double = 180) async {
+    /// The request in the gate is over: its model counts as used now (a long one is not idle).
+    func used() {
+        if pipes[current] != nil { lastUse[current] = Date() }
+    }
+
+    /// The translation model is needed rarely: let it go after a few idle minutes. (Run it inside
+    /// the gate: not while a request uses the models.)
+    func unloadIdle(after seconds: Double = 180) async {
         for (model, t) in lastUse where model != keep && Date().timeIntervalSince(t) > seconds {
             if let p = pipes.removeValue(forKey: model) {
                 await p.unloadModels()
@@ -199,7 +218,9 @@ final class Engine: @unchecked Sendable {
     }
 
     func status() -> [String: Any] {
-        ["ok": true, "pid": Int(getpid()), "models": devices, "compute": options.compute]
+        lock.lock()
+        defer { lock.unlock() }
+        return ["ok": true, "pid": Int(getpid()), "models": devices, "compute": options.compute]
     }
 }
 
@@ -215,9 +236,14 @@ func handle(_ req: [String: Any], audio: [Float], engine: Engine) async -> [Stri
     let priority = req["priority"] as? Int ?? 0
     await engine.gate.enter(priority: priority)
     let t0 = Date()
-    defer { Task { await engine.gate.leave() } }
+    defer {
+        engine.used()
+        Task { await engine.gate.leave() }
+    }
     do {
-        let (pipe, device) = try await engine.pipe(model, compute: req["compute"] as? String ?? "")
+        let transcribing = op == "transcribe" && (req["task"] as? String) != "translate"
+        let (pipe, device) = try await engine.pipe(model, compute: req["compute"] as? String ?? "",
+                                                   transcribing: transcribing)
         switch op {
         case "load":
             return ["ok": true, "device": device, "seconds": Date().timeIntervalSince(t0)]
@@ -277,6 +303,24 @@ func handle(_ req: [String: Any], audio: [Float], engine: Engine) async -> [Stri
 }
 
 // MARK: - socket
+
+/// The socket and pid file this server made, for atexit (a C function: it cannot capture them).
+/// They are removed only while they are still these files: not another server's.
+enum Owned {
+    static var files: [(path: String, dev: Int64, ino: UInt64)] = []
+
+    static func add(_ path: String) {
+        var st = stat()
+        if stat(path, &st) == 0 { files.append((path: path, dev: Int64(st.st_dev), ino: UInt64(st.st_ino))) }
+    }
+
+    static func remove() {
+        for f in files {
+            var st = stat()
+            if stat(f.path, &st) == 0, Int64(st.st_dev) == f.dev, UInt64(st.st_ino) == f.ino { unlink(f.path) }
+        }
+    }
+}
 
 func readExactly(_ fd: Int32, _ count: Int) -> Data? {
     var data = Data(count: count)
@@ -354,8 +398,10 @@ func serve(_ options: Options) -> Never {
     }
     umask(old)
     guard bound == 0, listen(fd, 16) == 0 else { log("cannot listen on \(path): \(String(cString: strerror(errno)))"); exit(1) }
+    Owned.add(path)
     let pidFile = dir.appendingPathComponent("whisper.pid")
     try? "\(getpid())\n".write(to: pidFile, atomically: true, encoding: .utf8)
+    Owned.add(pidFile.path)
     log("listening on \(path) (models in \(options.models.path), \(options.compute))")
 
     let engine = Engine(options: options)
@@ -363,12 +409,8 @@ func serve(_ options: Options) -> Never {
     for sig in [SIGTERM, SIGINT] {
         signal(sig) { _ in exit(0) }
     }
-    atexit {
-        let dir = runtimeDir()
-        unlink(dir.appendingPathComponent("whisper.sock").path)
-        unlink(dir.appendingPathComponent("whisper.pid").path)
-    }
-    // idle exit (and dropping the translation model)
+    atexit { Owned.remove() }
+    // idle exit (and dropping the translation model, when no request runs or waits)
     Thread.detachNewThread {
         while true {
             sleep(15)
@@ -377,7 +419,12 @@ func serve(_ options: Options) -> Never {
                 exit(0)
             }
             let sem = DispatchSemaphore(value: 0)
-            Task { await engine.unloadIdle(); sem.signal() }
+            Task {
+                await engine.gate.enter(priority: Int.min)
+                await engine.unloadIdle()
+                await engine.gate.leave()
+                sem.signal()
+            }
             sem.wait()
         }
     }

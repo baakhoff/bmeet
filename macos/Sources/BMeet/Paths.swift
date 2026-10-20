@@ -24,12 +24,16 @@ enum Paths {
         Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/BMeet Window.app")
     }
 
-    /// $XDG_RUNTIME_DIR/bmeet as BMeet's Python programs see it: your temp folder (macos/bmeetmac.py).
+    /// $XDG_RUNTIME_DIR/bmeet as BMeet's Python programs see it: your temp folder (macos/bmeetmac.py),
+    /// or $BMEET_RUNTIME_ROOT/bmeet (tests). Not $XDG_RUNTIME_DIR: a shell may export one, BMeet.app has none.
     static var runtime: URL {
-        if let x = env["XDG_RUNTIME_DIR"], !x.isEmpty { return URL(fileURLWithPath: x).appendingPathComponent("bmeet") }
-        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
-        return URL(fileURLWithPath: n > 0 ? String(cString: buf) : NSTemporaryDirectory()).appendingPathComponent("bmeet")
+        var root = env["BMEET_RUNTIME_ROOT"] ?? ""
+        if root.isEmpty {
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+            let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
+            root = n > 0 ? String(cString: buf) : NSTemporaryDirectory()
+        }
+        return URL(fileURLWithPath: root).appendingPathComponent("bmeet")
     }
 
     static var logs: URL { home.appendingPathComponent("Library/Logs/BMeet") }

@@ -55,6 +55,9 @@ final class ControlServer {
         defer { close(client) }
         var tv = timeval(tv_sec: 5, tv_usec: 0)
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        // (a client that has gone away before the answer: an error, not SIGPIPE, which would end BMeet)
+        var one: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         var bytes: [UInt8] = []
         var c: UInt8 = 0
         while bytes.count < 1 << 16, read(client, &c, 1) == 1, c != 10 { bytes.append(c) }

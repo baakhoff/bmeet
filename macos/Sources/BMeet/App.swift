@@ -17,7 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var server: ControlServer!
     private var status: [String: Any] = [:]
     private var recent: [[String: Any]] = []
+    private weak var recentMenu: NSMenu?    // the Recent Transcripts submenu of the menu last shown
     private var timer: Timer?
+    private var pidWritten = Date.distantPast
+    /// Quit without asking about a meeting: SIGTERM (main.swift), logging out, a second BMeet.app.
+    var quitWithoutAsking = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let runtime = Paths.runtime
@@ -25,10 +29,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                                  attributes: [.posixPermissions: 0o700])
         // One BMeet.app at a time: a second one hands over to the first and quits.
         if let answer = sendToRunning(["op": "open", "args": []]), answer["ok"] as? Bool == true {
+            quitWithoutAsking = true
             NSApp.terminate(nil)
             return
         }
-        Paths.write("\(getpid())", to: runtime.appendingPathComponent("pid"))
+        writePid()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil,
+                                                          queue: .main) { [weak self] _ in
+            self?.quitWithoutAsking = true
+        }
         server = ControlServer(path: runtime.appendingPathComponent("agent.sock"), handler: { [weak self] req in
             self?.control(req) ?? ["ok": false]
         })
@@ -54,6 +63,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
         schedulePoll()
         poll()
+        loadRecent()
+    }
+
+    /// Quitting BMeet does not stop a meeting: its recorder would go on, without the menu bar
+    /// icon that shows it. So BMeet asks first, and stops the meeting (its transcript is saved;
+    /// the speaker pass goes on by itself) before it quits.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let meeting = Paths.read(Paths.runtime.appendingPathComponent("meeting_state"), default: "idle")
+        guard !quitWithoutAsking, meeting == "recording" || meeting == "paused" else { return .terminateNow }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Stop the meeting and quit?"
+        alert.informativeText = "BMeet is recording a meeting. Quitting BMeet would not stop the recording."
+        alert.addButton(withTitle: "Stop Meeting and Quit")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        run(Paths.python, ["-I", Paths.meeting.path, "stop"], log: "meetings.log") { _ in
+            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        // (a stop that hangs does not keep BMeet from quitting)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { NSApp.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ note: Notification) {
@@ -88,6 +119,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func meeting(_ action: String, inPerson: Bool) {
+        // Without the microphone macOS records silence: say so when a meeting starts. In person
+        // there would be nothing at all to record.
+        let idle = Paths.read(Paths.runtime.appendingPathComponent("meeting_state"), default: "idle") == "idle"
+        if idle, action == "start" || action == "toggle", Microphone.denied {
+            post(inPerson ? "Meeting not started: BMeet cannot use the microphone" : "BMeet cannot hear your microphone",
+                 (inPerson ? "" : "Only the other side of the call is recorded. ")
+                 + "Allow BMeet in System Settings → Privacy & Security → Microphone.")
+            if inPerson { return }
+        }
         // (bmeet-meeting takes one start or stop at a time itself)
         run(Paths.python, ["-I", Paths.meeting.path, action] + (inPerson ? ["--in-person"] : []), log: "meetings.log") {
             [weak self] _ in
@@ -198,13 +238,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func poll() {
+        writePid()
         run(Paths.python, ["-I", Paths.ctl.path, "status"], capture: true) { [weak self] out in
             guard let self, let data = out?.data(using: .utf8),
                   let s = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+            // (a meeting or a speaker pass ended: Recent Transcripts has a new one)
+            let meetingChanged = (s["meeting"] as? String) != (self.status["meeting"] as? String)
+            let passes: Int? = (s["speakers_pending"] as? [Any])?.count
+            let passesChanged = passes != (self.status["speakers_pending"] as? [Any])?.count
+            let ended = !self.status.isEmpty && (meetingChanged || passesChanged)
             self.status = s
             self.refresh()
             self.schedulePoll()
+            if ended { self.loadRecent() }
         }
+    }
+
+    /// RUN/pid, which bmeet-ctl and the BMeet window look for. macOS deletes what nothing has
+    /// touched for 3 days from the temp folder, and BMeet runs for weeks: so it writes the file
+    /// anew (a new file) every hour, and at once when it is gone.
+    private func writePid() {
+        let pid = Paths.runtime.appendingPathComponent("pid")
+        guard Date().timeIntervalSince(pidWritten) > 3600 || Paths.read(pid) != "\(getpid())" else { return }
+        Paths.write("\(getpid())", to: pid)
+        pidWritten = Date()
     }
 
     private func refresh() {
@@ -310,18 +367,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         langItem.submenu = sub
         let recentItem = add("Recent Transcripts", "clock", nil, nil)
         let rsub = NSMenu()
-        for r in recent.prefix(8) {
-            guard let path = r["path"] as? String else { continue }
-            let i = NSMenuItem(title: r["title"] as? String ?? URL(fileURLWithPath: path).lastPathComponent,
-                               action: #selector(menuOpenFile(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = path
-            i.image = NSImage(systemSymbolName: (r["kind"] as? String) == "meeting" ? "person.2" : "doc.text",
-                              accessibilityDescription: nil)
-            rsub.addItem(i)
-        }
-        if rsub.items.isEmpty { rsub.addItem(withTitle: "Nothing yet", action: nil, keyEquivalent: "").isEnabled = false }
+        fillRecent(rsub)
         recentItem.submenu = rsub
+        recentMenu = rsub
         menu.addItem(.separator())
         add("Open BMeet…", "macwindow", nil, #selector(menuOpenMeetings))
         add("Transcribe a File…", "waveform.badge.plus", nil, #selector(menuTranscribeFile))
@@ -377,7 +425,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     @objc private func menuAbout() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.orderFrontStandardAboutPanel(options: [
-            .credits: NSAttributedString(string: "Dictation, meeting transcripts and file transcription on this Mac's Neural Engine. Nothing is uploaded.\ngithub.com/baakhoff/bmeet",
+            .credits: NSAttributedString(string: "Dictation, meeting transcripts and file transcription on this Mac's Neural Engine: "
+                                         + "what you say is not uploaded. Meeting transcripts are saved in ~/Documents/Meetings, "
+                                         + "which iCloud Drive uploads when Desktop & Documents sync is on.\ngithub.com/baakhoff/bmeet",
                                          attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]),
         ])
     }
@@ -392,11 +442,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         m.addItem(i)
     }
 
+    private func fillRecent(_ rsub: NSMenu) {
+        rsub.removeAllItems()
+        for r in recent.prefix(8) {
+            guard let path = r["path"] as? String else { continue }
+            let i = NSMenuItem(title: r["title"] as? String ?? URL(fileURLWithPath: path).lastPathComponent,
+                               action: #selector(menuOpenFile(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = path
+            i.image = NSImage(systemSymbolName: (r["kind"] as? String) == "meeting" ? "person.2" : "doc.text",
+                              accessibilityDescription: nil)
+            rsub.addItem(i)
+        }
+        if rsub.items.isEmpty { rsub.addItem(withTitle: "Nothing yet", action: nil, keyEquivalent: "").isEnabled = false }
+    }
+
     private func loadRecent() {
         run(Paths.python, ["-I", Paths.ctl.path, "recent", "--limit", "8"], capture: true) { [weak self] out in
-            guard let data = out?.data(using: .utf8),
+            guard let self, let data = out?.data(using: .utf8),
                   let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
-            self?.recent = list
+            self.recent = list
+            if let m = self.recentMenu { self.fillRecent(m) }   // (the menu may be open: it shows them now)
         }
     }
 
@@ -453,13 +519,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func post(_ title: String, _ body: String) {
+        // (the log gets the title only: a body can hold what you dictated)
         guard inBundle else {    // (notifications need the app's bundle)
-            NSLogLine("notification: \(title) \(body)")
+            NSLogLine("notification: \(title)")
             return
         }
         let center = UNUserNotificationCenter.current()
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { NSLogLine("notification (not allowed): \(title) \(body)"); return }
+            guard granted else { NSLogLine("notification (not allowed): \(title)"); return }
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body

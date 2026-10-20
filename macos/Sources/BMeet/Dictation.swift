@@ -9,11 +9,12 @@
 // While you speak, a small panel at the bottom of the screen shows the words (underlined while
 // they may still change); it never takes the keyboard focus, so the text goes where you were
 // typing. When you stop, the text is pasted there (the clipboard, then ⌘V; your clipboard is
-// put back afterwards), or only copied with the clipboard shortcut. Pasting needs the
-// Accessibility permission for BMeet: without it the text stays on the clipboard.
+// put back once the app has read it), or only copied with the clipboard shortcut. Pasting needs
+// the Accessibility permission for BMeet: without it the text stays on the clipboard.
 
 import AppKit
 import ApplicationServices
+import AVFoundation
 import Foundation
 
 let ENGINE_IDLE: TimeInterval = 15 * 60
@@ -28,6 +29,11 @@ final class Dictation {
 
     private var engine: Process?
     private var input: FileHandle?
+    private var generation = 0      // which engine's output counts (a new engine: not the last one's)
+    /// Dictations you cancelled whose end has not come yet: the engine ends each with one "done",
+    /// "cancelled" or "error" (a cancel while it transcribes still gets the "done"). Those, and
+    /// the text before them, are not for the dictation that runs now.
+    private var stale = 0
     private var buffer = Data()
     private var clipboardOnly = false
     private var idleTimer: Timer?
@@ -54,11 +60,25 @@ final class Dictation {
 
     func start(clipboard: Bool) {
         guard state == .idle else { return }
+        Microphone.ask { [weak self] allowed in
+            guard let self else { return }
+            guard allowed else {
+                self.notify("Dictation needs the microphone",
+                            "Allow BMeet in System Settings → Privacy & Security → Microphone.")
+                NSWorkspace.shared.open(Microphone.settings)
+                return
+            }
+            self.record(clipboard: clipboard)
+        }
+    }
+
+    private func record(clipboard: Bool) {
+        guard state == .idle else { return }
         clipboardOnly = clipboard
         final = ""
         draft = ""
         let language = Settings.language
-        if engine?.isRunning != true { startEngine() }
+        if engine?.isRunning != true, !startEngine() { return }
         send(["start": ["language": language]])   // (the engine switches models when the language changes)
         state = .recording
         panel.show(final: "", draft: "", status: "Listening…", live: Settings.liveText)
@@ -78,6 +98,7 @@ final class Dictation {
     func cancel() {
         guard state != .idle else { return }
         send(["cancel": [:]])
+        if engine != nil { stale += 1 }
         finish()
     }
 
@@ -96,8 +117,13 @@ final class Dictation {
 
     // MARK: the engine
 
-    private func startEngine() {
+    /// false (and a notification) when npu-transcribe cannot be started.
+    private func startEngine() -> Bool {
         stopEngine()
+        generation += 1
+        let gen = generation
+        buffer = Data()
+        stale = 0
         let p = Process()
         p.executableURL = Paths.python
         // (no --language: the engine then loads the model at the first "start", after it has started
@@ -115,12 +141,22 @@ final class Dictation {
         }
         stdout.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
-            DispatchQueue.main.async { self?.received(data) }
+            if data.isEmpty {   // (the engine has ended: else macOS calls this again and again)
+                h.readabilityHandler = nil
+                try? h.close()
+                return
+            }
+            DispatchQueue.main.async {
+                guard let self, self.generation == gen else { return }
+                self.received(data)
+            }
         }
         p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
                 guard let self, self.engine === proc else { return }
                 self.engine = nil
+                try? self.input?.close()
+                self.input = nil
                 if self.state != .idle {
                     self.notify("Dictation stopped", "The speech engine ended (see ~/Library/Logs/BMeet/dictation.log)")
                     self.finish()
@@ -131,8 +167,12 @@ final class Dictation {
             try p.run()
             engine = p
             input = stdin.fileHandleForWriting
+            return true
         } catch {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            input = nil
             notify("Dictation failed", "Could not start npu-transcribe: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -147,7 +187,7 @@ final class Dictation {
     private func send(_ cmd: [String: Any]) {
         guard var data = try? JSONSerialization.data(withJSONObject: cmd) else { return }
         data.append(10)
-        input?.write(data)
+        try? input?.write(contentsOf: data)   // (an engine that has ended: an error, not a crash)
     }
 
     private func received(_ data: Data) {
@@ -162,10 +202,15 @@ final class Dictation {
     }
 
     private func handle(_ ev: [String: Any]) {
+        if stale > 0 {      // (a dictation you cancelled: its text, then its end)
+            if ev["error"] != nil || ev["done"] != nil || ev["cancelled"] != nil { stale -= 1 }
+            return
+        }
         if let error = ev["error"] as? String {
             notify("Dictation failed", error)
             finish()
         } else if ev["done"] != nil {
+            guard state == .transcribing else { return }   // (nobody waits for this text any more)
             let text = (ev["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             finish()
             if !text.isEmpty { deliver(text) }
@@ -203,7 +248,42 @@ final class Dictation {
     }
 }
 
+/// The Microphone permission, BMeet's (the recorders run as its children). Without it macOS gives
+/// the recorder silence, not an error, so BMeet looks before it records.
+enum Microphone {
+    static let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
+
+    /// Can macOS ask? Only for BMeet.app (its Info.plist says what for), not a bare executable.
+    private static var askable: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil
+    }
+
+    /// You said no, or a profile forbids it. (Never asked is not denied: macOS asks then.)
+    static var denied: Bool {
+        guard askable else { return false }
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        return status == .denied || status == .restricted
+    }
+
+    /// done(allowed) on the main thread, asking you first if you were never asked.
+    static func ask(_ done: @escaping (Bool) -> Void) {
+        guard askable, AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else {
+            done(!denied)
+            return
+        }
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            DispatchQueue.main.async { done(ok) }
+        }
+    }
+}
+
 enum Paste {
+    /// Clipboard managers leave items with these alone (nspasteboard.org): the text only passes through.
+    static let markers = [NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
+                          NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")]
+    /// The text of the last paste, until the next one (the pasteboard asks it for the text).
+    private static var current: PasteText?
+
     /// Put `text` on the clipboard, press ⌘V in the front app, then give the clipboard back.
     static func paste(_ text: String) {
         let board = NSPasteboard.general
@@ -212,8 +292,15 @@ enum Paste {
             for type in item.types { if let d = item.data(forType: type) { copy.setData(d, forType: type) } }
             return copy
         }
-        board.clearContents()
-        board.setString(text, forType: .string)
+        // The text goes to the app when it reads it (so BMeet knows when that was), on this Mac
+        // only (not to your other devices by Universal Clipboard), marked for clipboard managers.
+        let provider = PasteText(text)
+        Paste.current = provider
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.string])
+        for m in markers { item.setData(Data(), forType: m) }
+        _ = board.prepareForNewContents(with: .currentHostOnly)
+        board.writeObjects([item])
         let ours = board.changeCount
         let source = CGEventSource(stateID: .combinedSessionState)
         let v: CGKeyCode = 0x09
@@ -223,13 +310,41 @@ enum Paste {
         up?.flags = .maskCommand
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
-        // (give the app time to read it; then the clipboard is yours again, unless something
-        // else changed it meanwhile)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            guard board.changeCount == ours, !saved.isEmpty else { return }
-            board.clearContents()
-            board.writeObjects(saved)
+        restore(saved, unless: ours, read: provider, since: Date())
+    }
+
+    /// The clipboard is yours again 0.5 s after the app has read the text (1 s after ⌘V at the
+    /// earliest; a busy app may take longer), or after 5 s if it never does (it took no paste),
+    /// unless something else changed it meanwhile.
+    private static func restore(_ saved: [NSPasteboardItem], unless ours: Int, read provider: PasteText, since posted: Date) {
+        let now = Date()
+        let read = provider.read.map { now.timeIntervalSince($0) >= 0.5 } ?? false
+        guard now.timeIntervalSince(posted) >= 5 || (read && now.timeIntervalSince(posted) >= 1) else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                Paste.restore(saved, unless: ours, read: provider, since: posted)
+            }
+            return
         }
+        let board = NSPasteboard.general
+        guard board.changeCount == ours, !saved.isEmpty else { return }
+        board.clearContents()
+        board.writeObjects(saved)
+    }
+}
+
+/// The dictated text, handed to the pasteboard when an app reads it (and when that was).
+final class PasteText: NSObject, NSPasteboardItemDataProvider {
+    let text: String
+    private(set) var read: Date?
+
+    init(_ text: String) {
+        self.text = text
+        super.init()
+    }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        item.setString(text, forType: type)
+        if read == nil { read = Date() }
     }
 }
 

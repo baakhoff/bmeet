@@ -258,17 +258,21 @@ final class Microphone {
 func audioProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ value: inout T) -> OSStatus {
     var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
                                              mElement: kAudioObjectPropertyElementMain)
-    var size = UInt32(MemoryLayout<T>.size)
-    return AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+    var size = UInt32(MemoryLayout<T>.size)   // (plain values only: an AudioObjectID, a stream format)
+    return withUnsafeMutableBytes(of: &value) { AudioObjectGetPropertyData(object, &address, 0, nil, &size, $0.baseAddress!) }
 }
 
 func defaultOutputUID() -> String? {
     var device = AudioObjectID(kAudioObjectUnknown)
     guard audioProperty(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice, &device) == noErr
     else { return nil }
-    var uid: CFString = "" as CFString
-    guard audioProperty(device, kAudioDevicePropertyDeviceUID, &uid) == noErr else { return nil }
-    return uid as String
+    // (a CFString comes back retained: read it as Unmanaged, not into a Swift object)
+    var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal,
+                                             mElement: kAudioObjectPropertyElementMain)
+    var uid: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &uid) == noErr, let uid else { return nil }
+    return uid.takeRetainedValue() as String
 }
 
 @available(macOS 14.2, *)

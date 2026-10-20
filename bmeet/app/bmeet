@@ -91,6 +91,19 @@ ENGINE = "BMeet" if MAC else "voxtype"   # who records, in messages
 ENGINE_TITLE = "BMeet" if MAC else "Voxtype"   # ... at the start of a sentence
 COLORS = {"red": "#da4453", "orange": "#f67400", "green": "#27ae60", "blue": "#3daee9",
           "gray": "#7f8c8d"}
+# On a Mac: the shortcuts are BMeet.app's (Linux's Meta is ⌃⌥ there), ⌘ for Ctrl, and Finder
+# for Dolphin (mac_words), and the window is dressed as a Mac app (apply_mac_look).
+MAC_WORDS = (("Meta+Alt+Shift+M", "⌃⌥⇧M"), ("Meta+Alt+M", "⌃⌥M"), ("Meta+Alt+H", "⌃⌥⌘H"),
+             ("Meta+Shift+H", "⌃⌥⇧H"), ("Meta+H", "⌃⌥H"), ("Ctrl+V", "⌘V"), ("Ctrl+F", "⌘F"),
+             ("in Dolphin → Transcribe (NPU)", "in Finder → Quick Actions → Transcribe with BMeet"),
+             ("the file manager", "Finder"))
+
+
+def mac_words(text: str) -> str:
+    if MAC:
+        for linux, mac in MAC_WORDS:
+            text = text.replace(linux, mac)
+    return text
 KEY_ROLE = Qt.ItemDataRole.UserRole
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 MEDIA_FILTER = ("Audio and video files (*.mp3 *.m4a *.aac *.ogg *.oga *.opus *.wav *.flac *.wma"
@@ -1005,6 +1018,8 @@ if MAC:
     _from_theme = QIcon.fromTheme
 
     def _theme_or_standard(name: str, *rest) -> QIcon:
+        if (symbol := mac_icon(name)) is not None:   # (BMeet's own choice of SF Symbol first)
+            return symbol
         found = _from_theme(name, *rest)
         if found.isNull() and name in THEME_FALLBACKS and QApplication.instance() is not None:
             return QApplication.style().standardIcon(getattr(QStyle.StandardPixmap, THEME_FALLBACKS[name]))
@@ -1175,6 +1190,8 @@ class MarkdownView(QTextBrowser):
     def show_markdown(self, text: str) -> None:
         self._paragraphs = None
         self.setMarkdown(text)
+        if MAC:
+            mac_typography(self.document())
         self._highlight()
 
     def show_plain(self, text: str) -> None:
@@ -1216,6 +1233,8 @@ class MarkdownView(QTextBrowser):
         cur.insertFragment(QTextDocumentFragment(rest))
         # (the first one took the format of the block it went into)
         QTextCursor(doc.findBlockByNumber(k)).setBlockFormat(rest.firstBlock().blockFormat())
+        if MAC:
+            mac_typography(doc, k)
         self._paragraphs = paragraphs if doc.blockCount() == len(paragraphs) else None
 
     def set_terms(self, terms: list[str]) -> None:
@@ -1573,7 +1592,7 @@ class VoicesDialog(QDialog):
 
 class MeetingsPage(ListDetailPage):
     COLUMNS = ("Title", "Date", "Duration", "Status")
-    EMPTY = ("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
+    EMPTY = mac_words("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
              "microphone and the system audio. The transcript shows up here as people talk.")
 
     def __init__(self, main: MainWindow) -> None:
@@ -1999,8 +2018,8 @@ class MeetingsPage(ListDetailPage):
 
 class FilesPage(ListDetailPage):
     COLUMNS = ("Name", "Date", "Duration", "Model", "Status")
-    EMPTY = ("No transcribed files yet.\n\nUse “Transcribe a file”, or right-click a recording "
-             "in Dolphin → Transcribe (NPU).")
+    EMPTY = mac_words("No transcribed files yet.\n\nUse “Transcribe a file”, or right-click a recording "
+                      "in Dolphin → Transcribe (NPU).")
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__(main)
@@ -2751,8 +2770,11 @@ class MainWindow(QMainWindow):
                            (QKeySequence.StandardKey.Quit, self.close),
                            (QKeySequence.StandardKey.Refresh, self.reload_all),
                            (QKeySequence.StandardKey.Open, self.open_files)):
-            QShortcut(QKeySequence(keys), self, activated=slot)
+            if not MAC:   # (on a Mac the menus have them: apply_mac_look)
+                QShortcut(QKeySequence(keys), self, activated=slot)
 
+        if MAC:
+            apply_mac_look(self, side)
         self._restore_settings()
         self.reload_all()
         self.poll()
@@ -2867,11 +2889,11 @@ class MainWindow(QMainWindow):
         self.act_dictate.setChecked(recording)
         self.act_dictate.setText("Stop dictation" if recording else "Dictate to clipboard")
         self.act_dictate.setIcon(icon("media-playback-stop" if recording else "audio-input-microphone"))
-        self.act_dictate.setToolTip(
+        self.act_dictate.setToolTip(mac_words(
             "Stop listening; the text is transcribed and copied to the clipboard" if recording else
             "Listen until you click again, then copy the text to the clipboard (paste with Ctrl+V).\n"
             "To type straight into another app at its cursor, press Meta+H in that app "
-            "(Meta+Alt+H dictates to the clipboard from anywhere).")
+            "(Meta+Alt+H dictates to the clipboard from anywhere)."))
         self.act_cancel.setVisible(daemon_on and dictation in ("recording", "transcribing"))
         self.act_cancel.setEnabled(True)
 
@@ -3097,6 +3119,7 @@ class MainWindow(QMainWindow):
         self.nav.item(2).setText(PAGE_TITLES["transcribe"] + (f" ({pending})" if pending else ""))
 
     def message(self, text: str, ms: int = 8000) -> None:
+        text = mac_words(text)
         debug("message:", text)
         self.statusBar().showMessage(text, ms)
 
@@ -3335,6 +3358,170 @@ class SingleInstance(QObject):
 
 # ============================================================================ main
 
+# ============================================================================ macOS
+
+def mac_typography(doc: QTextDocument, first: int = 0) -> None:
+    """A transcript in the type of macOS: the title a size up, the sections ("Meeting Info",
+    "Transcript") as small gray capitals, the speakers in semibold accent blue, the [mm:ss]
+    times in the secondary gray. From block `first` on (a live transcript only grows at its end)."""
+    from PyQt6.QtGui import QFont, QTextFormat
+    secondary = QApplication.palette().color(QPalette.ColorRole.PlaceholderText)
+    block = doc.findBlockByNumber(first)
+    while block.isValid():
+        level = block.blockFormat().headingLevel()
+        cur = QTextCursor(block)
+        if level:
+            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setProperty(QTextFormat.Property.FontSizeAdjustment, 0)   # (Qt's heading steps, on top of the size)
+            bf = block.blockFormat()
+            if level == 1:   # (one step up: the header above shows the title too)
+                fmt.setProperty(QTextFormat.Property.FontSizeAdjustment, 1)
+                fmt.setFontWeight(QFont.Weight.Bold)
+                bf.setBottomMargin(6)
+            elif level == 2:
+                fmt.setFontPointSize(11)
+                fmt.setFontWeight(QFont.Weight.DemiBold)
+                fmt.setFontCapitalization(QFont.Capitalization.AllUppercase)
+                fmt.setFontLetterSpacing(106)
+                fmt.setForeground(secondary)
+                bf.setTopMargin(16)
+                bf.setBottomMargin(4)
+            else:
+                fmt.setFontPointSize(13)
+                fmt.setFontWeight(QFont.Weight.DemiBold)
+                fmt.setForeground(QColor(COLORS["blue"]))
+                bf.setTopMargin(10)
+                bf.setBottomMargin(1)
+            cur.mergeCharFormat(fmt)
+            cur.setBlockFormat(bf)
+        else:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().fontItalic() and frag.text().startswith("["):
+                    c = QTextCursor(doc)
+                    c.setPosition(frag.position())
+                    c.setPosition(frag.position() + frag.length(), QTextCursor.MoveMode.KeepAnchor)
+                    fmt = QTextCharFormat()
+                    fmt.setForeground(secondary)
+                    fmt.setFontItalic(False)
+                    c.mergeCharFormat(fmt)
+                it += 1
+        block = block.next()
+
+
+MAC_ICONS = APP_FILE.parents[2] / "macos/icons"   # SF Symbols, drawn at install (macos/tools/make-symbols.swift)
+
+
+def dark_mode() -> bool:
+    app = QApplication.instance()
+    return app is not None and app.palette().window().color().lightness() < 128
+
+
+def mac_icon(name: str) -> QIcon | None:
+    """The SF Symbol drawn for a theme icon name (light or dark mode), if there is one."""
+    path = MAC_ICONS / f"{name}{'-dark' if dark_mode() else ''}.png"
+    if not path.is_file():
+        return None
+    ic = QIcon()
+    ic.addFile(str(path))
+    return ic
+
+
+def setup_mac(app: QApplication) -> None:
+    """Before the window: Apple's system colors (light or dark) for the states, and the icons."""
+    if dark_mode():
+        COLORS.update(red="#ff453a", orange="#ff9f0a", green="#30d158", blue="#0a84ff", gray="#98989d")
+    else:
+        COLORS.update(red="#ff3b30", orange="#ff9500", green="#34c759", blue="#007aff", gray="#8e8e93")
+
+
+# (only on these widgets: a stylesheet on the whole app would turn off Qt's native macOS drawing)
+MAC_NAV_STYLE = """
+QListWidget { background: transparent; border: none; outline: 0; }
+QListWidget::item { padding: 3px 8px; margin: 1px 8px; border-radius: 6px; }
+QListWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); }
+"""
+MAC_SEARCH_STYLE = "QLineEdit { border: 1px solid palette(mid); border-radius: 7px; padding: 3px 4px; " \
+                   "background: palette(base); }"
+
+
+def apply_mac_look(w: "MainWindow", side: QWidget) -> None:
+    """The window as a Mac app: the toolbar in the title bar, a sidebar, ⌘ shortcuts and the
+    menus a Mac app has, ⌃⌥ and Finder in its texts. (On Linux it keeps KDE's look.)"""
+    w.toolbar.setIconSize(QSize(18, 18))
+    # the sidebar: a shade off the window, as Finder's and Mail's
+    pal = side.palette()
+    base = pal.window().color()
+    pal.setColor(QPalette.ColorRole.Window, base.lighter(112) if dark_mode() else base.darker(104))
+    side.setPalette(pal)
+    side.setAutoFillBackground(True)
+    side.layout().setContentsMargins(8, 10, 0, 8)
+    side.layout().setSpacing(8)
+    w.search.setStyleSheet(MAC_SEARCH_STYLE)
+    w.nav.setStyleSheet(MAC_NAV_STYLE)
+    w.nav.setIconSize(QSize(18, 18))
+    for i in range(w.nav.count()):
+        w.nav.item(i).setSizeHint(QSize(0, 30))
+    w.split.setHandleWidth(1)
+    w.statusBar().setSizeGripEnabled(False)
+    for widget in [w, *w.findChildren(QWidget)]:
+        if widget.toolTip():
+            widget.setToolTip(mac_words(widget.toolTip()))
+    for act in w.findChildren(QAction):
+        if act.toolTip():
+            act.setToolTip(mac_words(act.toolTip()))
+
+    bar = w.menuBar()
+    def menu(title: str, items) -> None:
+        m = bar.addMenu(title)
+        for item in items:
+            if item is None:
+                m.addSeparator()
+                continue
+            text, keys, slot, *role = item
+            a = QAction(text, w)
+            if keys:
+                a.setShortcut(QKeySequence(keys))
+            a.triggered.connect(slot)
+            if role:
+                a.setMenuRole(role[0])
+            m.addAction(a)
+    pages = {name: (lambda _=False, n=name: w.set_page(n)) for name in PAGES}
+    menu("File", [("Transcribe Files…", "Ctrl+O", w.open_files), None,
+                  ("Close Window", "Ctrl+W", w.close),
+                  ("About BMeet", "", lambda: about_mac(w), QAction.MenuRole.AboutRole),
+                  ("Settings…", "Ctrl+,", lambda: open_path(str(CONFIG_DIR)), QAction.MenuRole.PreferencesRole),
+                  ("Quit BMeet Window", "Ctrl+Q", w.close, QAction.MenuRole.QuitRole)])
+    menu("Edit", [("Find", "Ctrl+F", w.focus_search)])
+    menu("View", [("Meetings", "Ctrl+1", pages["meetings"]), ("Transcribed Files", "Ctrl+2", pages["files"]),
+                  ("Transcribe a File", "Ctrl+3", pages["transcribe"]), None,
+                  ("Reload", "Ctrl+R", w.reload_all)])
+    controls = bar.addMenu("Controls")
+    for act in (w.act_dictate, w.act_cancel, None, w.act_meet_start, w.act_meet_room, w.act_meet_pause,
+                w.act_meet_stop):
+        if act is None:
+            controls.addSeparator()
+        else:
+            controls.addAction(act)
+    menu("Window", [("Minimize", "Ctrl+M", w.showMinimized), ("Zoom", "", lambda: w.showNormal()
+                                                                 if w.isMaximized() else w.showMaximized())])
+    menu("Help", [("BMeet on a Mac", "", lambda: open_url(QUrl(
+        "https://github.com/baakhoff/bmeet/blob/main/docs/macos.md"))),
+                  ("BMeet on GitHub", "", lambda: open_url(QUrl("https://github.com/baakhoff/bmeet")))])
+
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet"
+
+
+def about_mac(parent: QWidget) -> None:
+    QMessageBox.about(parent, "About BMeet", f"<h3>BMeet {__version__}</h3>"
+                      "<p>Dictation, meeting transcripts and file transcription, on this Mac's "
+                      "Neural Engine. Nothing is uploaded.</p>"
+                      "<p><a href='https://github.com/baakhoff/bmeet'>github.com/baakhoff/bmeet</a> · MIT</p>")
+
+
 def main(argv: list[str]) -> int:
     if any(a in ("-h", "--help") for a in argv):
         print(__doc__.strip())
@@ -3354,6 +3541,8 @@ def main(argv: list[str]) -> int:
     app.setApplicationName(APP_ID)
     app.setApplicationDisplayName(APP_NAME)
     app.setWindowIcon(QIcon.fromTheme("audio-input-microphone"))
+    if MAC:
+        setup_mac(app)
 
     instance = SingleInstance(socket_path())
     if instance.forward(request):

@@ -257,13 +257,15 @@ final class DictationPanel {
         effect.state = .active
         effect.blendingMode = .behindWindow
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 14
+        effect.layer?.cornerRadius = 16
+        effect.layer?.borderWidth = 0.5
+        effect.layer?.borderColor = NSColor.separatorColor.cgColor
         effect.layer?.masksToBounds = true
         panel.contentView = effect
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor.systemRed.cgColor
         dot.layer?.cornerRadius = 5
-        status.font = .systemFont(ofSize: 11, weight: .medium)
+        status.font = .systemFont(ofSize: 10, weight: .semibold)
         status.textColor = .secondaryLabelColor
         label.font = .systemFont(ofSize: 15)
         label.lineBreakMode = .byTruncatingHead
@@ -290,8 +292,21 @@ final class DictationPanel {
     func show(final: String, draft: String, status text: String, live: Bool) {
         let panel = window ?? make()
         window = panel
-        status.stringValue = text
-        dot.layer?.backgroundColor = (text == "Listening…" ? NSColor.systemRed : NSColor.systemBlue).cgColor
+        let listening = text == "Listening…"
+        status.stringValue = text.uppercased() + "  ·  " + Settings.language.uppercased()
+        dot.layer?.backgroundColor = (listening ? NSColor.systemRed : NSColor.systemOrange).cgColor
+        // (a slow pulse while it listens, as macOS's own recording indicators do)
+        if listening, dot.layer?.animation(forKey: "pulse") == nil {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.35
+            pulse.duration = 0.8
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            dot.layer?.add(pulse, forKey: "pulse")
+        } else if !listening {
+            dot.layer?.removeAnimation(forKey: "pulse")
+        }
         let shown = NSMutableAttributedString()
         if live {
             shown.append(NSAttributedString(string: final, attributes: [.foregroundColor: NSColor.labelColor]))

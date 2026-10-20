@@ -10,12 +10,25 @@ BMeet runs on Macs with Apple silicon (M1 and later) with macOS 14.2 or later. O
 
 The transcription engine (`transcribe/npu-transcribe`), the app and the Chrome extension are shared with Linux. The Mac-only parts live in `macos/`.
 
+![The BMeet window on a Mac](macos-window.png)
+
 ## Install
 
 The installer is the same one line as on Linux. On a Mac `install.sh` hands over to `macos/install.sh`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
+```
+
+It goes through nine numbered steps, each with a ✓ and how long it took, a spinner for the long ones and their details in `~/Library/Logs/BMeet/install.log` (on a failure, the last lines of it are shown). Starting from a new Mac:
+
+- **Command Line Tools missing:** macOS shows its own window to install them, and the installer waits.
+- **Homebrew missing:** it offers to run Homebrew's official installer, which asks for your password itself.
+
+To try a branch before it is released, name it twice:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/macos-port/install.sh | BMEET_REF=macos-port bash
 ```
 
 What it needs and what it does:
@@ -66,6 +79,19 @@ BMeet lives in the menu bar: a microphone. It turns red while you dictate or a m
 | Terminal | `npu-transcribe talk.m4a`, `bmeet-ctl status`, `bmeet` (the window), as on Linux |
 
 While you dictate, a small panel at the bottom of the screen shows the words as you say them. It is underlined while a word may still change, and it floats over full-screen apps too. It never takes the keyboard focus, so the text goes where you were typing. When you stop, BMeet puts the text on the clipboard, presses ⌘V, and gives you your clipboard back. `~/.config/bmeet/live-dictation` saying `off` hides the words (the panel then only shows *Listening…*).
+
+### How it looks
+
+- **The window:** the same window as on Linux, dressed as a Mac app.
+  - Its icons are SF Symbols, drawn on your Mac by the installer (`macos/tools/make-symbols.swift`), in light and dark versions.
+  - A Finder-style sidebar, Apple's system colors for the states.
+  - Transcripts in macOS's type: small gray section labels, the speakers in accent blue, the times in gray.
+  - The menus a Mac app has: *View* → Meetings ⌘1, Transcribed Files ⌘2, Transcribe a File ⌘3; ⌘F to search, ⌘O to transcribe files, ⌘, for the settings folder; *Controls* for dictation and meetings.
+  - Its texts name ⌃⌥ and Finder where Linux's name Meta and Dolphin.
+- **The menu bar:** each item has an SF Symbol, and the shortcuts show the Mac way, from the same `hotkeys` file. The first line shows the state with a colored dot.
+- **The dictation panel:** a red dot pulses while BMeet listens, next to the language.
+
+![… and in dark mode](macos-window-dark.png)
 
 ## Settings
 

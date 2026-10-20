@@ -9,3 +9,4 @@ transcribe/tests/.work-speakers/
 transcribe/tests/.work-live/
 # macOS: SwiftPM build output
 macos/.build/
+macos/icons/

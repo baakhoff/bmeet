@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # BMeet installer for macOS on Apple silicon (M1 and later; macOS 14.2 or later).
 #
-# The top-level install.sh hands over to this script on a Mac, so the same one line installs
-# it (curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash).
+# One line (the top-level install.sh hands over to this script on a Mac):
+#   curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
 # From a checkout: ./install.sh (or bash macos/install.sh).
 #
 # Options:
 #   --languages "en ru"  dictation languages that ⌃⌥⇧H cycles through
-#                        (Whisper codes; default: English + your Mac's language)
+#                        (Whisper codes; default: English + your Mac's languages)
 #   --no-turbo           Whisper small instead of large-v3-turbo everywhere (~400 MB less)
 #   --no-speakers        do not tell meeting speakers apart (no speaker models; the meeting
 #                        audio is deleted as soon as the live transcript is done)
@@ -23,7 +23,9 @@
 #   ~/.local/share/npu-models               the models (WhisperKit, Core ML builds), ~1.6 GB
 #   ~/Applications/BMeet.app                the menu bar app (and the BMeet window inside it)
 #   ~/.local/bin                            npu-transcribe, bmeet-ctl, bmeet
-# Nothing needs sudo. Undo: bash ~/.local/share/bmeet/src/uninstall.sh
+#   ~/Library/Logs/BMeet/install.log        everything the steps printed
+# Nothing needs sudo (only Homebrew's own installer does, if you let this one start it).
+# Undo: bash ~/.local/share/bmeet/src/uninstall.sh
 
 main() {
     set -euo pipefail
@@ -42,13 +44,7 @@ main() {
     local MODELS_DIR="${NPU_MODELS_DIR:-$data/npu-models}"
     local APP="$HOME/Applications/BMeet.app"
     local BIN="$HOME/.local/bin"
-
-    if [ -t 1 ]; then
-        say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-    else
-        say() { printf '\n==> %s\n' "$*"; }
-    fi
-    die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+    local LOG="$HOME/Library/Logs/BMeet/install.log"
 
     local languages="" turbo=1 speakers=1 gigaam=1 start=1 system=1
     while [ $# -gt 0 ]; do
@@ -61,105 +57,169 @@ main() {
             --skip-system) system= ;;
             --no-panel|--no-npu-driver|--reset-config|--force) ;;   # (Linux options: nothing to do here)
             --version) echo "BMeet installer $VERSION"; return 0 ;;
-            -h|--help) sed -n '2,28p' "${BASH_SOURCE[0]}"; return 0 ;;
-            *) die "unknown option: $1 (see --help)" ;;
+            -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; return 0 ;;
+            *) printf 'unknown option: %s (see --help)\n' "$1" >&2; return 2 ;;
         esac
         shift
     done
 
-    # --- preflight -------------------------------------------------------------------
-    say "BMeet $VERSION for macOS"
+    # --- how it looks: numbered steps, a spinner for the long ones, details in the log ----
+    mkdir -p "$(dirname "$LOG")"
+    printf 'BMeet %s installer, %s\n' "$VERSION" "$(date)" > "$LOG"
+    local tty="" B="" D="" G="" R="" Y="" C="" N=""
+    if [ -t 1 ]; then
+        tty=1 B=$'\033[1m' D=$'\033[2m' G=$'\033[32m' R=$'\033[31m' Y=$'\033[33m' C=$'\033[36m' N=$'\033[0m'
+    fi
+    local STEP=0 STEPS=9
+    step() { STEP=$((STEP + 1)); printf '\n%s%d/%d%s  %s%s%s\n' "$C" "$STEP" "$STEPS" "$N" "$B" "$*" "$N"; }
+    ok() { printf '      %s✓%s %s\n' "$G" "$N" "$*"; }
+    note() { printf '      %s%s%s\n' "$D" "$*" "$N"; }
+    warn() { printf '      %s!%s %s\n' "$Y" "$N" "$*"; }
+    die() {
+        printf '\n      %s✗ %s%s\n' "$R" "$*" "$N" >&2
+        printf '        %sDetails: %s%s\n' "$D" "$LOG" "$N" >&2
+        exit 1
+    }
+    took() { local s=$1; [ "$s" -ge 60 ] && printf '%dm %02ds' $((s / 60)) $((s % 60)) || printf '%ds' "$s"; }
+    run() {  # run "what" cmd...: the command's output goes to the log, a spinner shows meanwhile
+        local what=$1 t0=$SECONDS
+        shift
+        printf '\n=== %s\n$ %s\n' "$what" "$*" >> "$LOG"
+        if [ -n "$tty" ]; then
+            "$@" >> "$LOG" 2>&1 &
+            local pid=$! i=0
+            local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+            while kill -0 "$pid" 2>/dev/null; do
+                printf '\r      %s%s%s %s %s%s%s' "$C" "${frames[i % 10]}" "$N" "$what" "$D" "$(took $((SECONDS - t0)))" "$N"
+                i=$((i + 1))
+                sleep 0.1
+            done
+            local code=0
+            wait "$pid" || code=$?
+            printf '\r\033[K'
+            [ "$code" -eq 0 ] || { tail -n 12 "$LOG" | sed 's/^/        /' >&2; return "$code"; }
+        else
+            "$@" >> "$LOG" 2>&1 || { tail -n 12 "$LOG" | sed 's/^/        /' >&2; return 1; }
+        fi
+        ok "$what $D($(took $((SECONDS - t0))))$N"
+    }
+
+    printf '\n  %sBMeet %s for macOS%s\n' "$B" "$VERSION" "$N"
+    printf '  %sDictation, meeting transcripts and file transcription on the Neural Engine.%s\n' "$D" "$N"
+    printf '  %sNothing you say leaves this Mac.%s\n' "$D" "$N"
+
+    # --- 1. this Mac ---------------------------------------------------------------------
+    step "Checking this Mac"
     [ "$(uname -s)" = Darwin ] || die "this is the macOS installer"
-    [ "$(id -u)" -ne 0 ] || die "run this as your normal user"
-    local arch os
+    [ "$(id -u)" -ne 0 ] || die "run this as your normal user, without sudo"
+    local arch os chip
     arch="$(uname -m)"
     os="$(sw_vers -productVersion)"
-    echo "  system:  macOS $os, $arch, $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '?'), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+    chip="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '?')"
     [ "$arch" = arm64 ] || die "BMeet needs a Mac with Apple silicon (M1 or later): the models run on its Neural Engine"
     local major minor
     major="${os%%.*}"; minor="$(echo "$os" | cut -d. -f2)"
     if [ "$major" -lt 14 ] || { [ "$major" -eq 14 ] && [ "${minor:-0}" -lt 2 ]; }; then
-        die "BMeet needs macOS 14.2 or later (for recording the system audio); this is $os"
+        die "BMeet needs macOS 14.2 or later (for recording the system audio); this Mac has $os"
     fi
-    xcode-select -p >/dev/null 2>&1 \
-        || die "the Command Line Tools are missing: run  xcode-select --install  and then this installer again"
-    command -v swift >/dev/null || die "swift is missing (Command Line Tools): xcode-select --install"
-    local swift_v
-    swift_v="$(swift --version 2>&1 | grep -oE 'Swift version [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
-    case "$swift_v" in
-        ""|5.[0-9]) die "Swift ${swift_v:-?} is too old (5.10 or later is needed): update the Command Line Tools (System Settings -> General -> Software Update, or xcode-select --install)" ;;
-    esac
-    local brew
-    brew="$(command -v brew || echo /opt/homebrew/bin/brew)"
-    [ -x "$brew" ] || die "Homebrew is needed for Python and ffmpeg: see https://brew.sh, then run this again"
+    ok "$chip, $(( $(sysctl -n hw.memsize) / 1073741824 )) GB, macOS $os"
     local free_gb
     free_gb=$(( $(df -Pk "$HOME" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
-    [ "$free_gb" -ge 5 ] || die "only ${free_gb} GB free in $HOME; about 5 GB are needed"
+    [ "$free_gb" -ge 5 ] || die "only ${free_gb} GB free on this Mac; about 5 GB are needed"
     local run_dir
     run_dir="$(getconf DARWIN_USER_TEMP_DIR)bmeet"
     case "$(head -n1 "$run_dir/meeting_state" 2>/dev/null || echo idle)" in
         recording|paused) die "a meeting is being recorded - stop it first (⌃⌥M), then run this again" ;;
     esac
-    mkdir -p "$CACHE/downloads" "$CACHE/logs"
+    # Apple's Command Line Tools (the compilers BMeet's Swift parts need; not Xcode)
+    if ! xcode-select -p >/dev/null 2>&1; then
+        [ -n "$tty" ] || die "the Command Line Tools are missing: run  xcode-select --install  and then this again"
+        warn "Apple's Command Line Tools are needed: macOS shows a window to install them - click Install"
+        xcode-select --install >/dev/null 2>&1 || true
+        local waited=0
+        until xcode-select -p >/dev/null 2>&1; do
+            sleep 5
+            waited=$((waited + 5))
+            [ "$waited" -lt 3600 ] || die "the Command Line Tools did not get installed"
+            printf '\r      %swaiting for the Command Line Tools… %s%s' "$D" "$(took "$waited")" "$N"
+        done
+        printf '\r\033[K'
+    fi
+    command -v swift >/dev/null || die "swift is missing: reinstall the Command Line Tools (xcode-select --install)"
+    local swift_v
+    swift_v="$(swift --version 2>&1 | grep -oE 'Swift version [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
+    case "$swift_v" in
+        ""|5.[0-9]) die "Swift ${swift_v:-?} is too old (5.10 or later): update the Command Line Tools in System Settings -> General -> Software Update" ;;
+    esac
+    ok "Command Line Tools, Swift $swift_v"
+    # Homebrew (for Python and ffmpeg)
+    local brew
+    brew="$(command -v brew || true)"
+    [ -n "$brew" ] || for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && { brew=$b; break; }; done
+    if [ -z "$brew" ]; then
+        [ -n "$tty" ] && [ -n "$system" ] || die "Homebrew is needed for Python and ffmpeg: install it from https://brew.sh, then run this again"
+        warn "Homebrew (https://brew.sh) is needed for Python and ffmpeg"
+        local answer=""
+        read -r -p "      Install Homebrew now with its official installer? [Y/n] " answer </dev/tty || true
+        case "$answer" in [nN]*) die "install Homebrew from https://brew.sh, then run this again" ;; esac
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty \
+            || die "Homebrew's installer did not finish"
+        brew=/opt/homebrew/bin/brew
+        [ -x "$brew" ] || die "Homebrew is not in /opt/homebrew after its installer"
+    fi
+    ok "Homebrew $("$brew" --version 2>/dev/null | head -n1 | awk '{print $2}')"
+    mkdir -p "$CACHE/downloads"
 
-    # --- 1. Homebrew packages ------------------------------------------------------------
-    local py=/opt/homebrew/opt/python@3.13/bin/python3.13
-    [ -x "$py" ] || py="$("$brew" --prefix)/opt/python@3.13/bin/python3.13"
+    # --- 2. Homebrew packages ----------------------------------------------------------------
+    step "Python and ffmpeg"
+    local brew_prefix
+    brew_prefix="$("$brew" --prefix)"
+    local py="$brew_prefix/opt/python@3.13/bin/python3.13"
     if [ -n "$system" ]; then
-        say "Homebrew packages: python@3.13, ffmpeg"
         local want=()
         [ -x "$py" ] || want+=(python@3.13)
-        command -v ffmpeg >/dev/null || [ -x "$("$brew" --prefix)/bin/ffmpeg" ] || want+=(ffmpeg)
+        [ -x "$brew_prefix/bin/ffmpeg" ] || command -v ffmpeg >/dev/null || want+=(ffmpeg)
         if [ ${#want[@]} -gt 0 ]; then
-            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 "$brew" install "${want[@]}"
-        else
-            echo "  present"
+            run "brew install ${want[*]}" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 "$brew" install "${want[@]}" \
+                || die "Homebrew could not install ${want[*]}"
         fi
     fi
     [ -x "$py" ] || die "python@3.13 is missing (brew install python@3.13)"
-    local brew_bin
-    brew_bin="$("$brew" --prefix)/bin"
+    local brew_bin="$brew_prefix/bin"
     [ -x "$brew_bin/ffmpeg" ] || command -v ffmpeg >/dev/null || die "ffmpeg is missing (brew install ffmpeg)"
+    ok "Python $("$py" -c 'import platform; print(platform.python_version())'), ffmpeg $("$brew_bin/ffmpeg" -version 2>/dev/null | head -n1 | awk '{print $3}')"
 
-    # --- 2. program files ------------------------------------------------------------
-    say "Program files -> $ROOT/src"
+    # --- 3. program files and the Python environment ---------------------------------------
+    step "Program files and Python packages"
     mkdir -p "$ROOT/bin"
     local stage="$ROOT/.src.new"
     rm -rf "$stage"
     mkdir -p "$stage"
     tar -C "$src" --exclude='tests' --exclude='__pycache__' --exclude='.work' --exclude='.build' \
-        -cf - VERSION LICENSE install.sh uninstall.sh voxtype transcribe bmeet macos \
+        --exclude='macos/icons' -cf - VERSION LICENSE install.sh uninstall.sh voxtype transcribe bmeet macos \
         | tar -C "$stage" -xf -
     rm -rf "$ROOT/src.old"
     [ ! -d "$ROOT/src" ] || mv "$ROOT/src" "$ROOT/src.old"
     mv "$stage" "$ROOT/src"
     rm -rf "$ROOT/src.old"
-    local build_src="$src"      # (Swift builds from the source tree; its .build stays a cache)
+    local build_src="$src"      # (Swift builds from the source tree; the build itself goes to the cache)
     src="$ROOT/src"
-    echo "  $VERSION installed"
-
-    # --- 3. Python environment --------------------------------------------------------
+    ok "BMeet $VERSION in ${ROOT/#$HOME/~}"
     local venv="$ROOT/venv"
-    say "Python environment -> $venv"
     if ! "$venv/bin/python" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 13))' 2>/dev/null; then
         rm -rf "$venv"
-        "$py" -m venv "$venv"
+        "$py" -m venv "$venv" >> "$LOG" 2>&1 || die "could not make a Python environment"
     fi
-    echo "  numpy, Core ML tools, ONNX (Runtime), PyQt6 (the first run downloads ~125 MB)"
-    "$venv/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade pip
-    "$venv/bin/python" -m pip install --quiet --disable-pip-version-check -r "$src/macos/requirements.txt"
-    "$venv/bin/python" -I -c 'import numpy, coremltools, onnxruntime, PyQt6.QtWidgets
-print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2>/dev/null
+    run "numpy, Core ML tools, ONNX Runtime, PyQt6" sh -c "'$venv/bin/python' -m pip install --disable-pip-version-check --upgrade pip \
+        && '$venv/bin/python' -m pip install --disable-pip-version-check -r '$src/macos/requirements.txt'" \
+        || die "the Python packages did not install"
 
-    # --- 4. the native parts: Whisper server, recorder, BMeet.app ---------------------------
-    say "BMeet.app and its helpers (Swift; the first build takes a few minutes)"
+    # --- 4. the native parts -------------------------------------------------------------------
+    step "BMeet.app"
     local swift_build="$CACHE/swift-build"
-    swift build -c release --package-path "$build_src/macos" --scratch-path "$swift_build" \
-        --product BMeet 2>&1 | tail -n 1
-    swift build -c release --package-path "$build_src/macos" --scratch-path "$swift_build" \
-        --product bmeet-whisper 2>&1 | tail -n 1
-    swift build -c release --package-path "$build_src/macos" --scratch-path "$swift_build" \
-        --product bmeet-record 2>&1 | tail -n 1
+    run "Building BMeet.app, the Whisper server and the recorder (Swift)" \
+        swift build -c release --package-path "$build_src/macos" --scratch-path "$swift_build" \
+        || die "the Swift build failed"
     local out="$swift_build/release"
     # macOS keeps what it compiled for the Neural Engine per program (~1 GB for Whisper turbo), and
     # a new bmeet-whisper gets a new copy: let the old one go (the warm-up below makes the new one).
@@ -171,48 +231,45 @@ print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2
         install -m 0755 "$out/$f" "$ROOT/bin/$f.new"
         mv -f "$ROOT/bin/$f.new" "$ROOT/bin/$f"
     done
-
-    # The app: quit the running one first (an update), then put the new bundle in place.
+    # An update: quit the running app first (SIGTERM: it quits as from its menu; an AppleScript
+    # "quit" would have macOS ask whether this terminal may control BMeet).
     if pgrep -qf "$APP/Contents/MacOS/BMeet"; then
-        echo "  quitting the running BMeet.app"
-        # (SIGTERM: it quits as from its menu; an AppleScript "quit" would have macOS ask whether
-        # this terminal may control BMeet)
         pkill -TERM -f "$APP/Contents/MacOS/BMeet" 2>/dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -qf "$APP/Contents/MacOS/BMeet" || break; sleep 0.3; done
         pkill -KILL -f "$APP/Contents/MacOS/BMeet" 2>/dev/null || true
+        note "quit the running BMeet.app (it starts again at the end)"
     fi
     pkill -f "$ROOT/bin/bmeet-whisper serve" 2>/dev/null || true   # (the next request starts the new one)
     local stage_app="$CACHE/BMeet.app"
+    local window="$stage_app/Contents/Helpers/BMeet Window.app"
     rm -rf "$stage_app"
-    mkdir -p "$stage_app/Contents/MacOS" "$stage_app/Contents/Resources" \
-        "$stage_app/Contents/Helpers/BMeet Window.app/Contents/MacOS" \
-        "$stage_app/Contents/Helpers/BMeet Window.app/Contents/Resources"
+    mkdir -p "$stage_app/Contents/MacOS" "$stage_app/Contents/Resources" "$window/Contents/MacOS" "$window/Contents/Resources"
     sed "s/@VERSION@/$VERSION/g" "$src/macos/app/Info.plist" > "$stage_app/Contents/Info.plist"
-    sed "s/@VERSION@/$VERSION/g" "$src/macos/app/Window-Info.plist" \
-        > "$stage_app/Contents/Helpers/BMeet Window.app/Contents/Info.plist"
+    sed "s/@VERSION@/$VERSION/g" "$src/macos/app/Window-Info.plist" > "$window/Contents/Info.plist"
     install -m 0755 "$out/BMeet" "$stage_app/Contents/MacOS/BMeet"
-    local cfg="$py"-config
+    local cfg="$py-config"
     [ -x "$cfg" ] || cfg="$(dirname "$py")/python3.13-config"
     # shellcheck disable=SC2046
     clang -O2 -Wall "$src/macos/window/launcher.c" $("$cfg" --embed --cflags) $("$cfg" --embed --ldflags) \
-        -o "$stage_app/Contents/Helpers/BMeet Window.app/Contents/MacOS/BMeet" 2>&1 \
-        | grep -v -E 'unused-command-line-argument|^$' || true
-    [ -x "$stage_app/Contents/Helpers/BMeet Window.app/Contents/MacOS/BMeet" ] || die "building the BMeet window failed"
+        -o "$window/Contents/MacOS/BMeet" >> "$LOG" 2>&1 || die "building the BMeet window failed"
+    # the app icon, and the window's icons (SF Symbols, drawn on this Mac)
     local icon="$CACHE/BMeet.icns"
     if [ ! -s "$icon" ] || [ "$src/macos/tools/make-icon.swift" -nt "$icon" ]; then
-        swiftc -O "$src/macos/tools/make-icon.swift" -o "$CACHE/make-icon" 2>/dev/null && "$CACHE/make-icon" "$icon" \
-            || echo "  (no icon: drawing it failed)"
+        { swiftc -O "$src/macos/tools/make-icon.swift" -o "$CACHE/make-icon" && "$CACHE/make-icon" "$icon"; } >> "$LOG" 2>&1 \
+            || warn "no app icon (drawing it failed)"
     fi
     if [ -s "$icon" ]; then
         cp "$icon" "$stage_app/Contents/Resources/BMeet.icns"
-        cp "$icon" "$stage_app/Contents/Helpers/BMeet Window.app/Contents/Resources/BMeet.icns"
+        cp "$icon" "$window/Contents/Resources/BMeet.icns"
     fi
+    { swiftc -O "$src/macos/tools/make-symbols.swift" -o "$CACHE/make-symbols" && "$CACHE/make-symbols" "$src/macos/icons"; } \
+        >> "$LOG" 2>&1 || warn "the window keeps Qt's own icons (drawing the SF Symbols failed)"
     printf 'APPL????' > "$stage_app/Contents/PkgInfo"
     local identity="${BMEET_SIGN_IDENTITY:--}"
-    codesign --force --sign "$identity" "$stage_app/Contents/Helpers/BMeet Window.app" >/dev/null 2>&1
-    codesign --force --sign "$identity" --identifier io.github.baakhoff.bmeet "$stage_app" >/dev/null 2>&1 \
+    codesign --force --sign "$identity" "$window" >> "$LOG" 2>&1
+    codesign --force --sign "$identity" --identifier io.github.baakhoff.bmeet "$stage_app" >> "$LOG" 2>&1 \
         || die "signing BMeet.app failed"
-    codesign --force --sign "$identity" "$ROOT/bin/bmeet-whisper" "$ROOT/bin/bmeet-record" >/dev/null 2>&1 || true
+    codesign --force --sign "$identity" "$ROOT/bin/bmeet-whisper" "$ROOT/bin/bmeet-record" >> "$LOG" 2>&1 || true
     mkdir -p "$HOME/Applications"
     rm -rf "$APP.old"
     [ ! -d "$APP" ] || mv "$APP" "$APP.old"
@@ -220,24 +277,30 @@ print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2
     rm -rf "$APP.old"
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
         -f "$APP" >/dev/null 2>&1 || true
-    echo "  $APP"
+    ok "${APP/#$HOME/~}"
 
-    # --- 5. models -------------------------------------------------------------------
-    say "Whisper for the Neural Engine (WhisperKit) -> $MODELS_DIR/whisperkit"
+    # --- 5. Whisper --------------------------------------------------------------------------
+    step "Whisper for the Neural Engine"
     local variants=(openai_whisper-small_216MB)
     [ -z "$turbo" ] || variants+=(openai_whisper-large-v3-v20240930_626MB)
+    note "WhisperKit's Core ML models from huggingface.co/argmaxinc, checked against pinned hashes"
     "$venv/bin/python" -I "$src/macos/fetch-models" "$src/macos/models/whisperkit.tsv" "$MODELS_DIR/whisperkit" \
-        "${variants[@]}"
+        "${variants[@]}" | sed -u 's/^/      /' || die "downloading Whisper failed - run this again to go on where it stopped"
+    ok "${variants[*]}"
 
+    # --- 6. GigaAM and the speaker models --------------------------------------------------------
+    step "Russian speech and speaker models for the Neural Engine"
     local dl="$CACHE/downloads" rel=https://github.com/k2-fsa/sherpa-onnx/releases/download
     fetch() {  # file url sha256: download into the cache once, check it every time
         if ! echo "$3  $dl/$1" | shasum -a 256 -c --status >/dev/null 2>&1; then
+            printf '      %s%s%s\n' "$D" "$1" "$N"
             curl -fL --retry 3 --progress-bar -o "$dl/$1.part" "$2" && mv "$dl/$1.part" "$dl/$1"
             echo "$3  $dl/$1" | shasum -a 256 -c --status \
                 || { rm -f "$dl/$1"; die "checksum mismatch for $1 - run the installer again"; }
         fi
     }
-    local prep="$venv/bin/python -I $src/macos/prepare-coreml"
+    # (prepare-coreml's progress bars and warnings go to the log)
+    local prep=(env TQDM_DISABLE=1 PYTHONWARNINGS=ignore "$venv/bin/python" -I "$src/macos/prepare-coreml")
     local prep_hash
     prep_hash="$(cat "$src/macos/prepare-coreml" "$src/transcribe/prepare-models" "$src/transcribe/prepare-diarization" \
         | shasum -a 256 | cut -c1-16)"
@@ -248,42 +311,44 @@ print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2
     local giga_tar_sha=20e41e160efa6f2460a7ef6554cdbbb9e8fffb2b92e6bc708e9406bd8b9256ea
     local giga_onnx_sha=d5fea8df94263c285e54b21e5774b707c707192d3bdbeffd7b1eb07fb6743b35
     if [ -n "$gigaam" ]; then
-        say "Russian speech model (GigaAM v3) for the Neural Engine -> $giga_dir"
         local giga_stamp="coreml $giga_onnx_sha $prep_hash"
         if [ -d "$giga_dir/model.mlmodelc" ] && [ "$(cat "$giga_dir/.prepared" 2>/dev/null)" = "$giga_stamp" ]; then
-            echo "  present"
+            ok "GigaAM v3 (Russian)"
         else
             fetch "$giga_name.tar.bz2" "$rel/asr-models/$giga_name.tar.bz2" "$giga_tar_sha"
             local giga_tmp
             giga_tmp="$(mktemp -d "$CACHE/gigaam.XXXXXX")"
-            mkdir -p "$giga_tmp/src/test_wavs"
             tar -xjf "$dl/$giga_name.tar.bz2" -C "$giga_tmp" "$giga_name/model.int8.onnx" "$giga_name/tokens.txt" \
                 "$giga_name/test_wavs"
             echo "$giga_onnx_sha  $giga_tmp/$giga_name/model.int8.onnx" | shasum -a 256 -c --status \
                 || { rm -rf "$giga_tmp"; die "unexpected model in $giga_name.tar.bz2"; }
             mkdir -p "$giga_dir"
-            if ! $prep gigaam "$giga_tmp/$giga_name" "$giga_dir"; then
+            if ! run "Building GigaAM v3 (Russian) for the Neural Engine" "${prep[@]}" gigaam "$giga_tmp/$giga_name" "$giga_dir"; then
                 rm -rf "$giga_tmp"
                 die "building GigaAM for the Neural Engine failed (--no-gigaam installs without it)"
             fi
             rm -rf "$giga_tmp"
             echo "$giga_stamp" > "$giga_dir/.prepared"
         fi
+    else
+        note "skipped (--no-gigaam): Russian is transcribed with Whisper"
     fi
 
     # Speaker models: Nemotron 3 Diarization and TitaNet-small (as on Linux), for the Neural Engine
     mkdir -p "$config"
     if [ -n "$speakers" ]; then
         local sd="$MODELS_DIR/speaker-diarization"
-        say "Speaker models for the Neural Engine -> $sd"
         mkdir -p "$sd"
         local emb=nemo_en_titanet_small.onnx
         local emb_sha=ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
         local emb_stamp="coreml $emb_sha $prep_hash"
         if [ ! -d "$sd/titanet.mlmodelc" ] || [ "$(cat "$sd/.titanet-prepared" 2>/dev/null)" != "$emb_stamp" ]; then
             fetch "$emb" "$rel/speaker-recongition-models/$emb" "$emb_sha"   # (sic: upstream's tag)
-            $prep titanet "$dl/$emb" "$sd" || die "building TitaNet for the Neural Engine failed"
+            run "Building TitaNet (voice fingerprints) for the Neural Engine" "${prep[@]}" titanet "$dl/$emb" "$sd" \
+                || die "building TitaNet for the Neural Engine failed"
             echo "$emb_stamp" > "$sd/.titanet-prepared"
+        else
+            ok "TitaNet (voice fingerprints)"
         fi
         local nem_dir="$sd/nemotron-3-diarization" nem_file=nemotron-3-diarization.safetensors
         local nem_rev=f667ed73aee57d40cc39428eb768b4fd87a0a29e
@@ -292,18 +357,21 @@ print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2
         if [ ! -d "$nem_dir/encoder.mlmodelc" ] || [ "$(cat "$nem_dir/.prepared" 2>/dev/null)" != "$nem_stamp" ]; then
             fetch "$nem_file" "https://huggingface.co/nvidia/Nemotron-3-Diarization/resolve/$nem_rev/model.safetensors" \
                 "$nem_sha"
-            $prep nemotron "$dl/$nem_file" "$nem_dir" \
+            run "Building Nemotron 3 Diarization (who speaks when) for the Neural Engine" \
+                "${prep[@]}" nemotron "$dl/$nem_file" "$nem_dir" \
                 || die "building Nemotron 3 Diarization for the Neural Engine failed (--no-speakers installs without it)"
             echo "$nem_stamp" > "$nem_dir/.prepared"
+        else
+            ok "Nemotron 3 Diarization (who speaks when)"
         fi
-        echo "  nemotron-3-diarization, ${emb%.onnx}: present"
         [ -s "$config/speakers" ] || echo on > "$config/speakers"   # keeps an "off" you set
     else
         echo off > "$config/speakers"
+        note "skipped (--no-speakers): meetings keep You / Remote"
     fi
 
-    # --- 6. settings, commands -----------------------------------------------------------
-    say "Settings -> $config"
+    # --- 7. settings, commands, the Chrome extension's helper ---------------------------------
+    step "Settings and commands"
     if [ -z "$languages" ] && [ ! -s "$config/languages" ]; then
         # English + the languages of your Mac (System Settings -> General -> Language & Region)
         languages="$( { echo en; defaults read -g AppleLanguages 2>/dev/null | tr -d ' ",()' | cut -c1-2; } \
@@ -317,8 +385,7 @@ print("  coremltools", coremltools.__version__, "- numpy", numpy.__version__)' 2
     else
         echo off > "$config/start-at-login"
     fi
-    echo "  dictation languages: $(cat "$config/languages") (now: $(cat "$config/language"))"
-
+    ok "dictation languages: $(cat "$config/languages") (settings in ${config/#$HOME/~})"
     mkdir -p "$BIN"
     wrapper() {  # name script: a command in ~/.local/bin that runs `script` with BMeet's Python
         local tmp
@@ -340,46 +407,60 @@ EOF
 exec "$BIN/bmeet-ctl" open "\$@"
 EOF
     chmod 755 "$BIN/bmeet"
-    echo "  $BIN: npu-transcribe, bmeet-ctl, bmeet"
-    case ":$PATH:" in
-        *":$BIN:"*) ;;
-        *) echo "  note: $BIN is not in your PATH: add  export PATH=\"\$HOME/.local/bin:\$PATH\"  to ~/.zshrc" ;;
+    ok "npu-transcribe, bmeet-ctl and bmeet in ~/.local/bin"
+    local path_note=""
+    case ":$PATH:" in *":$BIN:"*) ;; *) path_note=1 ;; esac
+    local chrome
+    chrome="$(bash "$src/bmeet/chrome/install-user.sh" 2>&1)" || true
+    printf '%s\n' "$chrome" >> "$LOG"
+    case "$chrome" in
+        *"native host for:"*) ok "the Chrome extension's helper ($(printf '%s' "$chrome" | sed -n 's/.*native host for: //p' | head -n1))" ;;
+        *) note "no Chromium-based browser here: the Chrome extension's helper is skipped" ;;
     esac
 
-    # --- 7. Chrome extension's helper ------------------------------------------------------
-    say "Chrome extension (leaves out what you say while muted in Meet / Slack)"
-    bash "$src/bmeet/chrome/install-user.sh" || echo "  skipped (see above)"
+    # --- 8. warm up: macOS compiles each model for the Neural Engine the first time ----------------
+    step "Preparing the Neural Engine"
+    note "macOS compiles each model for this Mac's Neural Engine once (Whisper: ~2 minutes the first time)"
+    run "Compiling the models" env PATH="$brew_bin:$PATH" "$venv/bin/python" -I "$src/macos/warm-up" \
+        || warn "not now: they are prepared the first time they are used"
 
-    # --- 8. warm up: macOS compiles each model for the Neural Engine the first time ------------
-    say "Preparing the models for the Neural Engine (the first time: a few minutes)"
-    PATH="$brew_bin:$PATH" "$venv/bin/python" -I "$src/macos/warm-up" || echo "  (they are prepared on first use instead)"
-
-    # --- 9. start ------------------------------------------------------------------------
+    # --- 9. start ---------------------------------------------------------------------------------
+    step "Starting BMeet"
     /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true   # (Finder's Services menu)
     if [ -n "$start" ]; then
-        open "$APP"
+        open "$APP" && ok "BMeet is in your menu bar (the microphone)"
+    else
+        note "not started (--no-start): open ${APP/#$HOME/~} when you want it"
     fi
 
-    say "Done - BMeet $VERSION"
+    local L
+    L="$(cat "$config/languages")"
     cat <<EOF
-  BMeet is in your menu bar (a microphone). The first time you use it, macOS asks to allow:
+
+  ${G}${B}✓ BMeet $VERSION is ready.${N}
+
+  ${B}The first time, macOS asks you to allow BMeet:${N}
     Microphone              dictation and meetings
-    System Audio Recording  meetings: the other side of the call
-    Accessibility           pasting the dictated text where you type (System Settings ->
-                            Privacy & Security -> Accessibility -> BMeet)
-  ⌃⌥H        dictate: press, speak, press again -> the text is pasted where you type
-  ⌃⌥⌘H       dictate to the clipboard only
-  ⌃⌥M        start / stop a meeting transcript (microphone + system audio)
-  ⌃⌥⇧M       the same for a meeting in the room (microphone only, split by voice)
-  ⌃⌥⇧H       next dictation language ($(cat "$config/languages"))
-  Finder     right-click an audio/video file -> Quick Actions or Services -> Transcribe with BMeet
+    System Audio Recording  the other side of a call
+    Accessibility           pasting what you dictate where you type
 
-  Chrome     load the extension once: chrome://extensions -> Developer mode -> Load unpacked ->
-             $src/bmeet/chrome/extension
+  ${B}Shortcuts${N}
+    ⌃⌥H    dictate: press, speak, press again        ⌃⌥⌘H   dictate to the clipboard
+    ⌃⌥M    meeting: microphone + system audio        ⌃⌥⇧M   in-person meeting
+    ⌃⌥⇧H   next dictation language (${L})
+    ${D}Finder: right-click a recording -> Quick Actions -> Transcribe with BMeet${N}
 
-  Check the setup:  bash $src/macos/verify.sh
-  Uninstall:        bash $src/uninstall.sh
+  ${B}Chrome${N} ${D}(leaves out what you say while muted in Meet and Slack): load it once at${N}
+    chrome://extensions -> Developer mode -> Load unpacked -> ${src/#$HOME/~}/bmeet/chrome/extension
+
+  ${D}Check: bash ${src/#$HOME/~}/macos/verify.sh   Uninstall: bash ${src/#$HOME/~}/uninstall.sh
+  Log:   ${LOG/#$HOME/~}${N}
 EOF
+    if [ -n "$path_note" ]; then
+        printf '  %sTo use npu-transcribe and bmeet in Terminal, add ~/.local/bin to your PATH:%s\n' "$D" "$N"
+        printf '    echo '"'"'export PATH="$HOME/.local/bin:$PATH"'"'"' >> ~/.zshrc\n'
+    fi
+    echo
 }
 
 main "$@"

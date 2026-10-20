@@ -23,6 +23,14 @@ BMeet on Macs with Apple silicon: everything it does on Linux, with the models o
   - **`bmeet-meeting`:** the meetings voxtype runs on Linux. The meeting audio stays on a RAM disk, never on the disk.
   - **The BMeet window:** the Linux app itself, inside `BMeet.app` (`macos/window/launcher.c` runs its Python in the bundle, so it is *BMeet* in the Dock).
   - **Health check and uninstall:** `macos/verify.sh` checks the install. `uninstall.sh` removes it (`--purge` also deletes the models).
+  - **A Mac look:**
+    - The window has SF Symbols drawn at install time, a Finder-style sidebar, Apple's system colors, transcripts in macOS's type, and the Mac menus (⌘1–3, ⌘F, ⌘O, ⌘,). Its texts say ⌃⌥ and Finder.
+    - The menu bar menu has SF Symbols and native shortcut glyphs.
+    - The dictation panel's dot pulses while BMeet listens.
+  - **The installer on a Mac:**
+    - Nine numbered steps with ✓ and timings, a spinner for the long ones, and the details in `~/Library/Logs/BMeet/install.log`.
+    - It installs the Command Line Tools (Apple's own window) and offers Homebrew when they are missing.
+    - `BMEET_REF=BRANCH` tries a branch with the same one line.
 
 ### Fixed
 - **Words were lost from a dictation, or from a live meeting phrase, in clean speech** (on Linux too):

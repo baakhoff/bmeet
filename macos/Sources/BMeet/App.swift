@@ -246,54 +246,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let meeting = status["meeting"] as? String ?? "idle"
-        let language = status["language"] as? String ?? Settings.language
-        let line: String
+        let language = (status["language"] as? String ?? Settings.language).uppercased()
+        let line: String, dot: NSColor
         switch (dictation.state, meeting) {
-        case (.recording, _): line = "Listening…"
-        case (.transcribing, _): line = "Transcribing…"
-        case (_, "recording"): line = "Recording: \(status["meeting_title"] as? String ?? "meeting")"
-        case (_, "paused"): line = "Paused: \(status["meeting_title"] as? String ?? "meeting")"
-        default: line = "Ready · \(language) · Neural Engine"
+        case (.recording, _): (line, dot) = ("Listening…", .systemRed)
+        case (.transcribing, _): (line, dot) = ("Transcribing…", .systemOrange)
+        case (_, "recording"): (line, dot) = (status["meeting_title"] as? String ?? "Recording a meeting", .systemRed)
+        case (_, "paused"): (line, dot) = ("Paused: " + (status["meeting_title"] as? String ?? "meeting"), .systemOrange)
+        default: (line, dot) = ("Ready", .systemGreen)
         }
-        menu.addItem(withTitle: line, action: nil, keyEquivalent: "").isEnabled = false
+        let header = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+        header.image = AppDelegate.dot(dot)
+        header.attributedTitle = NSAttributedString(string: line, attributes: [.font: NSFont.menuFont(ofSize: 13)])
+        header.isEnabled = false
+        menu.addItem(header)
+        let detail = NSMenuItem(title: "\(language) · on the Neural Engine", action: nil, keyEquivalent: "")
+        detail.attributedTitle = NSAttributedString(string: "\(language) · on the Neural Engine", attributes: [
+            .font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        detail.indentationLevel = 1
+        detail.isEnabled = false
+        menu.addItem(detail)
         if let pending = status["speakers_pending"] as? [Any], !pending.isEmpty {
-            menu.addItem(withTitle: "Telling speakers apart (\(pending.count))…", action: nil, keyEquivalent: "").isEnabled = false
+            let i = add("Telling speakers apart…", "person.2.wave.2", nil, nil)
+            i.isEnabled = false
         }
         menu.addItem(.separator())
-        add(dictation.state == .recording ? "Stop dictation" : "Dictate", "dictate", #selector(menuDictate))
-        add("Dictate to the clipboard", "dictate-clipboard", #selector(menuDictateClipboard))
-        if dictation.state != .idle { add("Cancel dictation", nil, #selector(menuCancel)) }
+        if dictation.state == .recording {
+            add("Stop Dictation", "stop.circle", "dictate", #selector(menuDictate))
+        } else {
+            add("Dictate", "mic", "dictate", #selector(menuDictate))
+        }
+        add("Dictate to Clipboard", "doc.on.clipboard", "dictate-clipboard", #selector(menuDictateClipboard))
+        if dictation.state != .idle { add("Cancel Dictation", "xmark.circle", nil, #selector(menuCancel)) }
         menu.addItem(.separator())
         if meeting == "idle" {
-            add("Start meeting", "meeting", #selector(menuMeeting))
-            add("Start in-person meeting", "meeting-in-person", #selector(menuInPerson))
+            add("Start Meeting", "record.circle", "meeting", #selector(menuMeeting))
+            add("Start In-Person Meeting", "person.3", "meeting-in-person", #selector(menuInPerson))
         } else {
-            add("Stop meeting", "meeting", #selector(menuMeeting))
-            add(meeting == "paused" ? "Resume meeting" : "Pause meeting", nil, #selector(menuPause))
+            add("Stop Meeting", "stop.circle", "meeting", #selector(menuMeeting))
+            add(meeting == "paused" ? "Resume Meeting" : "Pause Meeting", meeting == "paused" ? "play.circle" : "pause.circle",
+                nil, #selector(menuPause))
             if let live = status["meeting_live"] as? String, !live.isEmpty {
-                add("Show live transcript", nil, #selector(menuOpenMeetings))
+                add("Show Live Transcript", "text.bubble", nil, #selector(menuOpenMeetings))
             }
         }
         menu.addItem(.separator())
         let langs = (status["languages"] as? [String]) ?? Settings.languages
-        let langItem = NSMenuItem(title: "Dictation language: \(language)", action: nil, keyEquivalent: "")
+        let langItem = add("Dictation Language", "globe", nil, nil)
         let sub = NSMenu()
         for l in langs {
-            let i = NSMenuItem(title: l, action: #selector(menuLanguage(_:)), keyEquivalent: "")
+            let i = NSMenuItem(title: Locale.current.localizedString(forLanguageCode: l).map { "\($0) (\(l))" } ?? l,
+                               action: #selector(menuLanguage(_:)), keyEquivalent: "")
             i.target = self
-            i.state = l == language ? .on : .off
+            i.state = l.uppercased() == language ? .on : .off
             i.representedObject = l
             sub.addItem(i)
         }
         sub.addItem(.separator())
-        let next = NSMenuItem(title: "Next language", action: #selector(menuNextLanguage), keyEquivalent: "")
+        let next = NSMenuItem(title: "Next Language", action: #selector(menuNextLanguage), keyEquivalent: "")
         next.target = self
-        if let label = hotKeys.labels["language"] { next.title += "  \(label)" }
+        if let k = hotKeys.menuKeys["language"] { next.keyEquivalent = k.key; next.keyEquivalentModifierMask = k.mods }
         sub.addItem(next)
         langItem.submenu = sub
-        menu.addItem(langItem)
-        menu.addItem(.separator())
-        let recentItem = NSMenuItem(title: "Recent", action: nil, keyEquivalent: "")
+        let recentItem = add("Recent Transcripts", "clock", nil, nil)
         let rsub = NSMenu()
         for r in recent.prefix(8) {
             guard let path = r["path"] as? String else { continue }
@@ -301,48 +316,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                action: #selector(menuOpenFile(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = path
+            i.image = NSImage(systemSymbolName: (r["kind"] as? String) == "meeting" ? "person.2" : "doc.text",
+                              accessibilityDescription: nil)
             rsub.addItem(i)
         }
         if rsub.items.isEmpty { rsub.addItem(withTitle: "Nothing yet", action: nil, keyEquivalent: "").isEnabled = false }
         recentItem.submenu = rsub
-        menu.addItem(recentItem)
-        add("Open BMeet…", nil, #selector(menuOpenMeetings))
-        add("Transcribe a file…", nil, #selector(menuTranscribeFile))
         menu.addItem(.separator())
-        let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        add("Open BMeet…", "macwindow", nil, #selector(menuOpenMeetings))
+        add("Transcribe a File…", "waveform.badge.plus", nil, #selector(menuTranscribeFile))
+        let settings = add("Settings", "gearshape", nil, nil)
         let ssub = NSMenu()
-        toggleItem(ssub, "Show the text while you speak", Settings.liveText) { Settings.set("live-dictation", $0 ? "on" : "off") }
-        toggleItem(ssub, "Tell meeting speakers apart", Settings.speakers) { Settings.set("speakers", $0 ? "on" : "off") }
-        toggleItem(ssub, "Start BMeet at login", Settings.startAtLogin) { [weak self] on in
+        toggleItem(ssub, "Show the Words While You Speak", Settings.liveText) { Settings.set("live-dictation", $0 ? "on" : "off") }
+        toggleItem(ssub, "Tell Meeting Speakers Apart", Settings.speakers) { Settings.set("speakers", $0 ? "on" : "off") }
+        toggleItem(ssub, "Start BMeet at Login", Settings.startAtLogin) { [weak self] on in
             Settings.set("start-at-login", on ? "on" : "off")
             self?.loginItem()
         }
         ssub.addItem(.separator())
-        let ax = NSMenuItem(title: AXIsProcessTrusted() ? "Pasting: allowed" : "Allow pasting (Accessibility)…",
+        let ax = NSMenuItem(title: AXIsProcessTrusted() ? "Pasting Allowed" : "Allow Pasting (Accessibility)…",
                             action: AXIsProcessTrusted() ? nil : #selector(menuAccessibility), keyEquivalent: "")
         ax.target = self
+        ax.image = NSImage(systemSymbolName: AXIsProcessTrusted() ? "checkmark.circle" : "hand.raised",
+                           accessibilityDescription: nil)
         ssub.addItem(ax)
-        let folder = NSMenuItem(title: "Open the settings folder", action: #selector(menuSettingsFolder), keyEquivalent: "")
+        let folder = NSMenuItem(title: "Open Settings Folder", action: #selector(menuSettingsFolder), keyEquivalent: "")
         folder.target = self
+        folder.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         ssub.addItem(folder)
         settings.submenu = ssub
-        menu.addItem(settings)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit BMeet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        add("About BMeet", nil, nil, #selector(menuAbout))
+        let quit = NSMenuItem(title: "Quit BMeet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
         loadRecent()
     }
 
-    private func add(_ title: String, _ hotkey: String?, _ action: Selector) {
+    /// A menu item with an SF Symbol, and the global shortcut of `hotkey` shown the Mac way.
+    @discardableResult
+    private func add(_ title: String, _ symbol: String?, _ hotkey: String?, _ action: Selector?) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
         i.target = self
-        if let hotkey, let label = hotKeys.labels[hotkey] {
-            i.title = title
-            i.toolTip = label
-            let attributed = NSMutableAttributedString(string: title)
-            attributed.append(NSAttributedString(string: "    \(label)", attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
-            i.attributedTitle = attributed
+        if let symbol { i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+        if let hotkey, let k = hotKeys.menuKeys[hotkey] {
+            i.keyEquivalent = k.key
+            i.keyEquivalentModifierMask = k.mods
         }
         menu.addItem(i)
+        return i
+    }
+
+    static func dot(_ color: NSColor) -> NSImage {
+        NSImage(size: NSSize(width: 10, height: 10), flipped: false) { r in
+            color.setFill()
+            NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1)).fill()
+            return true
+        }
+    }
+
+    @objc private func menuAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .credits: NSAttributedString(string: "Dictation, meeting transcripts and file transcription on this Mac's Neural Engine. Nothing is uploaded.\ngithub.com/baakhoff/bmeet",
+                                         attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]),
+        ])
     }
 
     private var toggles: [NSMenuItem: (Bool) -> Void] = [:]

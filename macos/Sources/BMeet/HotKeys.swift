@@ -12,6 +12,7 @@
 // (modifiers ctrl, option/alt, cmd, shift; a letter, digit, space, or f1..f12; "none" turns
 // one off). BMeet reads it when it starts.
 
+import AppKit
 import Carbon
 import Foundation
 
@@ -25,7 +26,8 @@ final class HotKeys {
     private var actions: [UInt32: String] = [:]
     private var handler: EventHandlerRef?
     private let onPress: (String) -> Void
-    private(set) var labels: [String: String] = [:]     // action -> "⌃⌥H", for the menu
+    private(set) var labels: [String: String] = [:]     // action -> "⌃⌥H"
+    private(set) var menuKeys: [String: (key: String, mods: NSEvent.ModifierFlags)] = [:]   // for menu items
 
     init(onPress: @escaping (String) -> Void) { self.onPress = onPress }
 
@@ -66,10 +68,32 @@ final class HotKeys {
                 refs.append(ref)
                 actions[n] = action
                 labels[action] = label
+                if let m = HotKeys.menuKey(combo) { menuKeys[action] = m }
             } else {
                 NSLogLine("hotkeys: \(label) for \(action) is taken by another app (\(status))")
             }
         }
+    }
+
+    /// The combo as a menu item's key equivalent (shown in the menu the Mac way: ⌃⌥H).
+    static func menuKey(_ combo: String) -> (key: String, mods: NSEvent.ModifierFlags)? {
+        var mods: NSEvent.ModifierFlags = []
+        var key = ""
+        for part in combo.split(separator: "+").map(String.init) {
+            switch part {
+            case "ctrl", "control": mods.insert(.control)
+            case "option", "alt", "opt": mods.insert(.option)
+            case "cmd", "command": mods.insert(.command)
+            case "shift": mods.insert(.shift)
+            case "space": key = " "
+            default:
+                if part.count == 1 { key = part }
+                else if part.hasPrefix("f"), let n = Int(part.dropFirst()), (1...12).contains(n) {
+                    key = String(Character(UnicodeScalar(NSF1FunctionKey + n - 1)!))
+                } else { return nil }
+            }
+        }
+        return key.isEmpty ? nil : (key, mods)
     }
 
     static func parse(_ combo: String) -> (UInt32, UInt32, String)? {

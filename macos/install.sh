@@ -221,16 +221,25 @@ main() {
         swift build -c release --package-path "$build_src/macos" --scratch-path "$swift_build" \
         || die "the Swift build failed"
     local out="$swift_build/release"
-    # macOS keeps what it compiled for the Neural Engine per program (~1 GB for Whisper turbo), and
-    # a new bmeet-whisper gets a new copy: let the old one go (the warm-up below makes the new one).
-    if [ -x "$ROOT/bin/bmeet-whisper" ] && ! cmp -s "$out/bmeet-whisper" "$ROOT/bin/bmeet-whisper.built" 2>/dev/null; then
+    # What macOS compiled for the Neural Engine (Whisper turbo: ~2 minutes on an M1) belongs to
+    # the very bmeet-whisper file that loaded it: a new file - even the same code built again, or
+    # the old one signed again - compiles it anew. So bmeet-whisper is only replaced (and signed)
+    # when its code changes: its source, WhisperKit's pinned version, Swift. Then the old
+    # compilation is let go (the warm-up below makes the new one).
+    local whisper_stamp
+    whisper_stamp="$(cat "$build_src/macos/Sources/bmeet-whisper/main.swift" "$build_src/macos/Package.swift" \
+        "$build_src/macos/Package.resolved" | shasum -a 256 | cut -c1-16) swift $swift_v"
+    local new_whisper=""
+    if [ ! -x "$ROOT/bin/bmeet-whisper" ] || [ "$(cat "$ROOT/bin/.bmeet-whisper.stamp" 2>/dev/null)" != "$whisper_stamp" ]; then
+        new_whisper=1
         rm -rf "$HOME/Library/Caches/bmeet-whisper/com.apple.e5rt.e5bundlecache"
+        install -m 0755 "$out/bmeet-whisper" "$ROOT/bin/bmeet-whisper.new"
+        mv -f "$ROOT/bin/bmeet-whisper.new" "$ROOT/bin/bmeet-whisper"
+        echo "$whisper_stamp" > "$ROOT/bin/.bmeet-whisper.stamp"
     fi
-    cp "$out/bmeet-whisper" "$ROOT/bin/bmeet-whisper.built"
-    for f in bmeet-whisper bmeet-record; do
-        install -m 0755 "$out/$f" "$ROOT/bin/$f.new"
-        mv -f "$ROOT/bin/$f.new" "$ROOT/bin/$f"
-    done
+    rm -f "$ROOT/bin/bmeet-whisper.built"   # (how 0.9.0's first builds decided it)
+    install -m 0755 "$out/bmeet-record" "$ROOT/bin/bmeet-record.new"
+    mv -f "$ROOT/bin/bmeet-record.new" "$ROOT/bin/bmeet-record"
     # An update: quit the running app first (SIGTERM: it quits as from its menu; an AppleScript
     # "quit" would have macOS ask whether this terminal may control BMeet).
     if pgrep -qf "$APP/Contents/MacOS/BMeet"; then
@@ -239,7 +248,7 @@ main() {
         pkill -KILL -f "$APP/Contents/MacOS/BMeet" 2>/dev/null || true
         note "quit the running BMeet.app (it starts again at the end)"
     fi
-    pkill -f "$ROOT/bin/bmeet-whisper serve" 2>/dev/null || true   # (the next request starts the new one)
+    [ -z "$new_whisper" ] || pkill -f "$ROOT/bin/bmeet-whisper serve" 2>/dev/null || true   # (the next request starts the new one)
     local stage_app="$CACHE/BMeet.app"
     local window="$stage_app/Contents/Helpers/BMeet Window.app"
     rm -rf "$stage_app"
@@ -269,7 +278,8 @@ main() {
     codesign --force --sign "$identity" "$window" >> "$LOG" 2>&1
     codesign --force --sign "$identity" --identifier io.github.baakhoff.bmeet "$stage_app" >> "$LOG" 2>&1 \
         || die "signing BMeet.app failed"
-    codesign --force --sign "$identity" "$ROOT/bin/bmeet-whisper" "$ROOT/bin/bmeet-record" >> "$LOG" 2>&1 || true
+    codesign --force --sign "$identity" "$ROOT/bin/bmeet-record" >> "$LOG" 2>&1 || true
+    [ -z "$new_whisper" ] || codesign --force --sign "$identity" "$ROOT/bin/bmeet-whisper" >> "$LOG" 2>&1 || true
     mkdir -p "$HOME/Applications"
     rm -rf "$APP.old"
     [ ! -d "$APP" ] || mv "$APP" "$APP.old"
@@ -420,7 +430,7 @@ EOF
 
     # --- 8. warm up: macOS compiles each model for the Neural Engine the first time ----------------
     step "Preparing the Neural Engine"
-    note "macOS compiles each model for this Mac's Neural Engine once (Whisper: ~2 minutes the first time)"
+    [ -z "$new_whisper" ] || note "macOS compiles each model for this Mac's Neural Engine once (Whisper: ~2 minutes)"
     run "Compiling the models" env PATH="$brew_bin:$PATH" "$venv/bin/python" -I "$src/macos/warm-up" \
         || warn "not now: they are prepared the first time they are used"
 

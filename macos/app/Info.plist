@@ -21,6 +21,8 @@
 	<string>BMeet records your microphone for dictation and meeting transcripts. The speech is transcribed on this Mac, on its Neural Engine, and never uploaded.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>BMeet records what your Mac plays - the other side of a call - for meeting transcripts. It stays on this Mac, in memory only, until the transcript is done.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>BMeet saves the meeting transcripts in your Documents folder, in Documents/Meetings.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

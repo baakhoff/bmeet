@@ -37,6 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil,
                                                           queue: .main) { [weak self] _ in
             self?.quitWithoutAsking = true
+            // (a logout that goes ahead quits BMeet long before; one that was cancelled asks again)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in self?.quitWithoutAsking = false }
         }
         server = ControlServer(path: runtime.appendingPathComponent("agent.sock"), handler: { [weak self] req in
             self?.control(req) ?? ["ok": false]

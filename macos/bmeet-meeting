@@ -472,17 +472,17 @@ def stop() -> int:
     text = live_text(folder) if folder else ""
     file, why = save_transcript(time.strftime("%Y-%m-%d_%H%M", time.localtime(started)), text)
     saved = file is not None and bool(text)
+    speakers = on("speakers", "on") and folder is not None and file is not None and any(folder.glob("part-*.wav"))
     if row is not None:
-        try:
+        try:   # (md_path also when only the speaker pass writes it: export finds it, in SPARE_DIR too)
             with db() as con:
                 con.execute("UPDATE meetings SET ended_at = ?, duration_secs = ?, status = 'completed', md_path = ? "
                             "WHERE id = ?", (ended, recorded_seconds(folder) or ended - started,
-                                             str(file) if saved else None, row["id"]))
+                                             str(file) if saved or speakers else None, row["id"]))
         except (sqlite3.Error, OSError) as exc:
             log(f"the meeting index was not updated: {exc}")
     STAMP_FILE.unlink(missing_ok=True)
     where = f"\n(not in {OUT_DIR}: {why})" if file is not None and why else ""
-    speakers = on("speakers", "on") and folder is not None and file is not None and any(folder.glob("part-*.wav"))
     if speakers:
         if saved:
             notify("Meeting transcript saved",

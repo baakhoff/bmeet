@@ -444,6 +444,33 @@ class A_DataTests(unittest.TestCase):
         finally:
             vn.ctl.MEETING_MD_DIR = saved
 
+    def test_mac_copy_next_to_the_index(self):
+        """On a Mac, macos/bmeet-meeting saves the copy next to the index when it cannot write in
+        the Meetings folder (no access to Documents): the window and bmeet-ctl recent find it
+        there too. On Linux that folder is voxtype's, and not looked in."""
+        d = WORK / "spare"
+        (d / "Meetings").mkdir(parents=True, exist_ok=True)
+        t0 = epoch(2026, 10, 23, 19, 27, 5)
+        copy = d / f"{minute_stamp(t0)}-meeting.md"
+        copy.write_text("# Meeting 2026-10-23 19:27\n")
+        db = d / "index.db"
+        db.unlink(missing_ok=True)
+        con = sqlite3.connect(db)
+        con.executescript(MEETINGS_SCHEMA)
+        con.execute("INSERT INTO meetings (id, title, started_at, ended_at, duration_secs, status) "
+                    "VALUES ('a', 'Meeting 2026-10-23 19:27', ?, ?, 60, 'completed')", (t0, t0 + 60))
+        con.commit()
+        con.close()
+        saved = vn.MAC, vn.ctl.MAC, vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY
+        vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY = d / "Meetings", db, d / "none.jsonl"
+        try:
+            for mac, want in ((False, None), (True, str(copy))):
+                vn.MAC = vn.ctl.MAC = mac
+                self.assertEqual([m.md_path for m in vn.load_meetings(db, d / "Meetings")], [want], mac)
+                self.assertEqual([i["path"] for i in vn.ctl.recent(5)], [want], mac)
+        finally:
+            vn.MAC, vn.ctl.MAC, vn.ctl.MEETING_MD_DIR, vn.ctl.MEETING_DB, vn.ctl.FILE_HISTORY = saved
+
     def test_history_load_and_remove(self):
         path = WORK / "hist-copy.jsonl"
         shutil.copy(WORK / "history.jsonl", path)

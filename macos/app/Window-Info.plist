@@ -15,5 +15,7 @@
 	<key>LSMinimumSystemVersion</key><string>14.2</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>The BMeet window shows the meeting transcripts in your Documents folder, in Documents/Meetings.</string>
 </dict>
 </plist>

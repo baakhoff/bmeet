@@ -370,24 +370,29 @@ def md_title(path: str) -> str:
 _MD_TITLES: dict[str, tuple[tuple | None, str]] = {}
 
 
-def assign_meeting_mds(meetings: list[Meeting], md_dir: Path) -> None:
+def assign_meeting_mds(meetings: list[Meeting], md_dir: Path, *more_dirs: Path) -> None:
     """Find the Markdown copy voxtype-meeting-toggle wrote for each meeting:
     MD_DIR/YYYY-MM-DD_HHMM-meeting[-EPOCH].md, named after the start minute. The stamp
     is taken just after `voxtype meeting start` returns, and voxtype's own start time
     can fall in the next or the previous minute (a file stamped 1532 for a meeting
     voxtype started at 15:33:00), so a neighbouring minute counts too when the file's
     title is the meeting's. Two meetings started in the same minute each get their own
-    (pick_md: the same rule as bmeet-ctl's pair_mds)."""
+    (pick_md: the same rule as bmeet-ctl's pair_mds). more_dirs: other folders with copies
+    (on a Mac, where macos/bmeet-meeting saves one it cannot write in md_dir)."""
     groups: dict[str, list[str]] = {}
-    try:
-        for entry in os.scandir(md_dir):
-            m = MD_NAME.match(entry.name)
-            if m and entry.is_file():
-                groups.setdefault(m[1], []).append(entry.path)
-    except OSError:
-        return
+    for folder in dict.fromkeys(Path(d) for d in (md_dir, *more_dirs)):
+        found: dict[str, list[str]] = {}
+        try:
+            for entry in os.scandir(folder):
+                m = MD_NAME.match(entry.name)
+                if m and entry.is_file():
+                    found.setdefault(m[1], []).append(entry.path)
+        except OSError:
+            continue
+        for stamp, files in found.items():   # (an X-speakers.md goes with the X.md next to it)
+            groups.setdefault(stamp, []).extend(without_twins(files))
     for stamp, files in groups.items():
-        groups[stamp] = sorted(without_twins(files), key=lambda p: written_order(os.path.basename(p)))
+        groups[stamp] = sorted(files, key=lambda p: written_order(os.path.basename(p)))
     titles = collections.Counter(m.title for m in meetings)
     taken: set[str] = set()
     # exact minute, "the start took a moment", then a minute either side with the title
@@ -449,7 +454,8 @@ def load_meetings(db_path: Path | None = None, md_dir: Path | None = None) -> li
                         started_at=int(r[2] or 0), ended_at=r[3], duration_secs=r[4],
                         status=str(r[5] or ""), chunk_count=int(r[6] or 0), storage_path=r[7],
                         model=r[8]) for r in rows]
-    assign_meeting_mds(meetings, Path(md_dir or MEETING_MD_DIR))
+    # (on a Mac also the index's folder: macos/bmeet-meeting's copies when Documents can't be written)
+    assign_meeting_mds(meetings, Path(md_dir or MEETING_MD_DIR), *([db_path.parent] if MAC else []))
     for m in meetings:
         m.md_sig = stat_sig(m.md_path) if m.md_path else None
     return meetings
@@ -2982,6 +2988,7 @@ class MainWindow(QMainWindow):
         """Reload a list when its source changed (cheap stat calls, every poll)."""
         shown = self.meetings_page.current()
         sigs = {"meetings": (stat_sig(MEETING_DB), stat_sig(f"{MEETING_DB}-wal"), stat_sig(MEETING_MD_DIR),
+                             stat_sig(MEETING_DB.parent) if MAC else None,   # (copies saved there: load_meetings)
                              # the open transcript, also when it is edited in place
                              stat_sig(shown.md_path) if shown and shown.md_path else None),
                 "files": (stat_sig(FILE_HISTORY),)}

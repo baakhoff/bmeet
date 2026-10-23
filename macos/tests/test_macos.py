@@ -22,12 +22,16 @@ skip without it: swift build -c release --package-path macos)
 - bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket.
 - fetch-models (any system): a download that is cut off goes on from its .part, with a stand-in
   for curl.
+- prepare-coreml (any system with numpy): a compute plan that macOS cannot make (14.2, 14.3) is
+  only reported.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -182,6 +186,7 @@ class Recorder(unittest.TestCase):
             tone_wav(tmp / "remote.wav", 20, 660)
             state, pointer, folder = tmp / "state", tmp / "recording", tmp / "rec"
             state.write_text("recording\n")
+            folder.mkdir()   # (bmeet-meeting makes it)
             env = dict(os.environ, BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"),
                        BMEET_RECORD_SYSTEM_FILE=str(tmp / "remote.wav"))
             p = subprocess.Popen([str(recorder()), "meeting", str(folder), "--state", str(state), "--pointer", str(pointer)],
@@ -223,6 +228,7 @@ class Recorder(unittest.TestCase):
             tone_wav(tmp / "remote.wav", 20, 660)
             state, folder = tmp / "state", tmp / "rec"
             state.write_text("recording\n")
+            folder.mkdir()
             env = dict(os.environ, BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"),
                        BMEET_RECORD_SYSTEM_FILE=str(tmp / "remote.wav"), BMEET_RECORD_SYSTEM_CLOCK="1.25")
             p = subprocess.Popen([str(recorder()), "meeting", str(folder), "--state", str(state),
@@ -246,6 +252,7 @@ class Recorder(unittest.TestCase):
             run = tmp / "run/bmeet"
             run.mkdir(parents=True)
             (run / "meeting_state").write_text("recording\n")
+            (tmp / "rec").mkdir()
             env = {k: v for k, v in os.environ.items() if k not in ("BMEET_STATE_FILE", "BMEET_RECORDING_FILE")}
             env.update(BMEET_RUNTIME_ROOT=str(tmp / "run"), XDG_RUNTIME_DIR=str(tmp / "shell"),
                        BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"))
@@ -262,6 +269,24 @@ class Recorder(unittest.TestCase):
         finally:
             if p and p.poll() is None:
                 p.kill()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_missing_folder_is_not_made(self) -> None:
+        # bmeet-meeting makes the folder on its RAM disk: one that is gone (the RAM disk was
+        # detached) is not made again, on the Mac's disk
+        tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        try:
+            tone_wav(tmp / "mic.wav", 5)
+            state, pointer, folder = tmp / "state", tmp / "recording", tmp / "ram/rec"
+            state.write_text("recording\n")
+            env = dict(os.environ, BMEET_RECORD_MIC_FILE=str(tmp / "mic.wav"))
+            r = subprocess.run([str(recorder()), "meeting", str(folder), "--mic-only", "--state", str(state),
+                                "--pointer", str(pointer)], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("is missing", r.stderr)
+            self.assertFalse((tmp / "ram").exists())
+            self.assertFalse(pointer.exists())
+        finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_raw_microphone_to_stdout(self) -> None:
@@ -296,6 +321,9 @@ if "--live" in args:
         if seen and not ours:
             break
         time.sleep(0.2)
+    if os.environ.get("FAKE_LIVE_NONE"):   # (nothing was said)
+        (folder / "live.done").touch()
+        sys.exit(0)
     (folder / "live.md").write_text("# Live\n\n## Meeting Info\n\n- **Speakers:** You\n\n"
                                     "## Transcript\n\n### You\n\nhello\n")
     if os.environ.get("FAKE_LIVE_FAIL"):   # (an error: no live.done)
@@ -451,7 +479,7 @@ class MeetingStandIns(unittest.TestCase):
                         BMEET_MEETING_DB=str(self.tmp / "index.db"), VOXTYPE_MEETING_DIR=str(self.tmp / "Meetings"),
                         BMEET_NO_RAMDISK="1", BMEET_RECORD=str(rec), BMEET_WHISPER="/usr/bin/true",
                         BMEET_TRANSCRIBE=str(self.tmp / "fake-transcribe"))
-        for k in ("BMEET_RUN_DIR", "FAKE_LIVE_FAIL", "FAKE_RECORD_DIE_AFTER"):
+        for k in ("BMEET_RUN_DIR", "FAKE_LIVE_FAIL", "FAKE_LIVE_NONE", "FAKE_RECORD_DIE_AFTER"):
             self.env.pop(k, None)
 
     def tearDown(self) -> None:
@@ -534,6 +562,28 @@ class MeetingStandIns(unittest.TestCase):
         self.assertFalse((self.run_dir / "meeting-toggle.started").exists())
         self.wait_for(lambda: not folder.exists() and "Person 1" in md.read_text())
         self.assertEqual(self.rows(), [("completed", str(md))])
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes anywhere")
+    def test_no_live_text_and_no_meetings_folder(self) -> None:
+        # Only the speaker pass writes the transcript, next to the index: the index names it too,
+        # so export finds it (and the window and bmeet-ctl look in that folder on a Mac)
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        self.env.update(VOXTYPE_MEETING_DIR=str(locked / "Meetings"), FAKE_LIVE_NONE="1")
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        r = self.run_cmd("stop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        md = Path(r.stdout.strip())
+        self.assertEqual(md.parent, self.tmp)
+        self.assertEqual(self.rows(), [("completed", str(md))])
+        self.wait_for(lambda: not folder.exists() and md.exists() and "Person 1" in md.read_text())
+        [mid] = [m["id"] for m in json.loads(self.run_cmd("list").stdout)]
+        r = self.run_cmd("export", "--", mid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Person 1", r.stdout)
 
     def test_recorder_that_dies_stops_the_meeting(self) -> None:
         self.env["FAKE_RECORD_DIE_AFTER"] = "1"
@@ -707,6 +757,20 @@ with open(out, "ab") as f:
         sys.exit(56)
     f.write(data[have:])
 '''
+
+
+class ComputePlan(unittest.TestCase):
+    def test_a_plan_that_cannot_be_made_is_only_reported(self) -> None:
+        # (MLComputePlan: macOS 14.4 and later; whatever coremltools raises, the build goes on)
+        prep = load(MACOS / "prepare-coreml", "prepare_coreml_test")
+        for exc in (RuntimeError("x"), ValueError("no compute plan"), Exception("no proxy")):
+            def plan(_compiled, exc=exc):
+                raise exc
+            prep.plan = plan
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(prep.report_plan(Path("model.mlmodelc")), 0.0)
+            self.assertIn("compute plan: not available on this macOS", out.getvalue())
 
 
 class FetchModels(unittest.TestCase):

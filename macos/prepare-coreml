@@ -492,7 +492,7 @@ def plan(compiled: Path) -> collections.Counter:
 def report_plan(compiled: Path) -> float:
     try:
         counts = plan(compiled)
-    except (RuntimeError, ImportError, AttributeError) as exc:   # (MLComputePlan: macOS 14.4 and later)
+    except Exception as exc:   # (MLComputePlan: macOS 14.4 and later; it is only a report)
         print(f"  compute plan: not available on this macOS ({exc})")
         return 0.0
     total = sum(counts.values()) or 1

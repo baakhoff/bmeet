@@ -161,8 +161,10 @@ final class Engine: @unchecked Sendable {
         let first = computeName.isEmpty ? options.compute : computeName
         let key = "\(model)/\(first)"
         current = key
-        if transcribing { keep = key }
+        // (kept only once it is loaded: a model that is missing or fails to load must not leave
+        // the one that is loaded unprotected)
         if let p = pipes[key] {
+            if transcribing { keep = key }
             lastUse[key] = Date()
             return (p, devices[key] ?? "?")
         }
@@ -186,6 +188,7 @@ final class Engine: @unchecked Sendable {
                 let p = try await WhisperKit(config)
                 let device = c == "ane" ? "ANE" : c.uppercased()
                 pipes[key] = p
+                if transcribing { keep = key }
                 lock.lock()
                 devices[key] = device
                 lock.unlock()

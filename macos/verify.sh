@@ -16,7 +16,11 @@ check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1${3:+ - $3}"; 
 
 echo "BMeet $(cat "$src/VERSION" 2>/dev/null || echo '?') on macOS $(sw_vers -productVersion), $(uname -m)"
 check "Python environment" "'$py' -I -c 'import numpy, coremltools, PyQt6.QtWidgets'" "run the installer again"
-check "ffmpeg" "command -v ffmpeg || test -x /opt/homebrew/bin/ffmpeg" "brew install ffmpeg"
+# ffmpeg as BMeet.app's programs find it: they get /usr/bin:/bin, and bmeetmac adds Homebrew's
+# shellcheck disable=SC2034  # (check evals it)
+has_ffmpeg="import shutil, sys; sys.path.insert(0, sys.argv[1]); import bmeetmac; bmeetmac.setup(); sys.exit(not shutil.which('ffmpeg'))"
+check "ffmpeg" "env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME='$HOME' '$py' -I -c \"\$has_ffmpeg\" '$src/macos'" \
+    "brew install ffmpeg (BMeet.app does not see one elsewhere in your PATH)"
 check "BMeet.app" "test -x '$HOME/Applications/BMeet.app/Contents/MacOS/BMeet'"
 check "the BMeet window" "test -x '$HOME/Applications/BMeet.app/Contents/Helpers/BMeet Window.app/Contents/MacOS/BMeet'"
 check "bmeet-whisper, bmeet-record" "test -x '$root/bin/bmeet-whisper' && test -x '$root/bin/bmeet-record'"

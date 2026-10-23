@@ -10,7 +10,9 @@
 //       follows the meeting state file (first line recording|paused|idle): "paused" ends the
 //       part, "recording" starts the next one, "idle" (or SIGINT/SIGTERM) ends the recording.
 //       While it records, the pointer file names DIR (bmeet-chrome-host and npu-transcribe --live
-//       look there). --mic-only: in person, no system audio.
+//       look there). --mic-only: in person, no system audio. DIR must be there (bmeet-meeting
+//       makes it, on its RAM disk); a track that cannot be written (a full RAM disk) ends the
+//       recording, with exit status 1.
 //   bmeet-record check
 //       {"microphone": "authorized"|"denied"|"not determined"|"restricted"} (asks if not determined).
 //
@@ -51,17 +53,20 @@ func nowHost() -> UInt64 { mach_absolute_time() }
 final class Sink: @unchecked Sendable {
     private let fd: Int32
     private let wav: Bool
+    private let path: String
     private var written: UInt64 = 0
     private var queue: [Data] = []
     private let lock = NSCondition()
     private var closed = false
+    private var failedErrno: Int32 = 0   // (a WAV file that could not be written: a full RAM disk, say)
     private var thread: Thread?
     let origin: UInt64          // host time of sample 0 of this sink
     private var nextSample: Int64 = 0
 
-    init(fd: Int32, wav: Bool, origin: UInt64) {
+    init(fd: Int32, wav: Bool, origin: UInt64, path: String = "stdout") {
         self.fd = fd
         self.wav = wav
+        self.path = path
         self.origin = origin
         if wav { writeNow(Sink.header(dataBytes: 0xFFFF_FFFF - 36)) }
         let t = Thread { [unowned self] in self.drain() }
@@ -71,7 +76,7 @@ final class Sink: @unchecked Sendable {
 
     static func open(_ path: String, origin: UInt64) -> Sink? {
         let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
-        return fd < 0 ? nil : Sink(fd: fd, wav: true, origin: origin)
+        return fd < 0 ? nil : Sink(fd: fd, wav: true, origin: origin, path: path)
     }
 
     static func header(dataBytes: UInt32) -> Data {
@@ -91,7 +96,15 @@ final class Sink: @unchecked Sendable {
             while off < buf.count {
                 let n = write(fd, buf.baseAddress!.advanced(by: off), buf.count - off)
                 if n <= 0 {
-                    lock.lock(); closed = true; lock.unlock()   // (stdout closed: the reader went away)
+                    let err = n < 0 ? errno : EIO
+                    // stdout closed: the reader went away. A WAV file: a write error (ENOSPC on a
+                    // full RAM disk), logged once; Meeting stops the recording (failed).
+                    lock.lock()
+                    closed = true
+                    let first = wav && err != EPIPE && failedErrno == 0
+                    if first { failedErrno = err }
+                    lock.unlock()
+                    if first { log("writing \(path) failed: \(String(cString: strerror(err)))") }
                     return
                 }
                 off += n
@@ -125,6 +138,9 @@ final class Sink: @unchecked Sendable {
     }
 
     var isClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed && queue.isEmpty }
+
+    /// The WAV file could not be written (what comes now is lost).
+    var failed: Bool { lock.lock(); defer { lock.unlock() }; return failedErrno != 0 }
 
     private func drain() {
         while true {
@@ -494,6 +510,7 @@ final class SystemAudio {
             guard let self else { return }
             let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
             let channels = list.reduce(0) { $0 + Int($1.mNumberChannels) }
+            if channels == 0 { return }                      // (an empty cycle, as when the tap starts)
             if expected > 0 && channels != expected {       // (skipped: the main thread builds it again)
                 if !odd.on { odd.on = true; DispatchQueue.main.async { self.oddBuffers(id, channels, expected) } }
                 return
@@ -711,7 +728,13 @@ final class Meeting {
 
     func run() -> Never {
         let fm = FileManager.default
-        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // The meeting runner makes DIR, on the RAM disk: one that is missing (the RAM disk went
+        // away) is not made again here, where it would be on the Mac's disk.
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else {
+            log("\(dir) is missing: not recording")
+            exit(1)
+        }
         // The meeting runner writes "recording" right before it starts us; wait for it a moment.
         for _ in 0..<40 where firstLine(stateFile) != "recording" { usleep(250_000) }
         guard firstLine(stateFile) == "recording" else { log("the meeting did not start; not recording"); exit(1) }
@@ -720,6 +743,13 @@ final class Meeting {
         try? "\(dir)\n".write(toFile: pointer, atomically: true, encoding: .utf8)
         onStop { [self] in finish(); exit(0) }
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [self] _ in
+            // A track that cannot be written (the RAM disk is full): end the recording, so the
+            // meeting runner hears it (recorder-ended stops the meeting and says so) and --live ends
+            if micSink?.failed == true || remoteSink?.failed == true {
+                log("cannot write the recording: stopping")
+                finish()
+                exit(1)
+            }
             switch firstLine(stateFile) {
             case "recording": if micSink == nil { startPart() }
             case "paused": stopPart()

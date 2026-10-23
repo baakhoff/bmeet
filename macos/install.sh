@@ -116,18 +116,19 @@ main() {
 
     # Meeting transcripts go to ~/Documents/Meetings. With iCloud Drive's "Desktop & Documents
     # Folders" on, iCloud syncs ~/Documents, and the transcripts with it. Finder keeps that
-    # setting; where it does not, a Documents folder in iCloud Drive tells (the option makes it,
-    # and it stays when the option is turned off again)
+    # setting (one switch for both folders); without it, a note says what to check. (Not a look
+    # into iCloud Drive: macOS would ask whether this terminal may access it.)
     local icloud_docs=""
-    case "$(defaults read com.apple.finder FXICloudDriveDocuments 2>/dev/null || true)" in
+    case "$(defaults read com.apple.finder FXICloudDriveDocuments 2>/dev/null \
+            || defaults read com.apple.finder FXICloudDriveDesktop 2>/dev/null || true)" in
         1) icloud_docs=1 ;;
         0) ;;
-        *) [ ! -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Documents" ] || icloud_docs=1 ;;
+        *) icloud_docs=unknown ;;
     esac
 
     printf '\n  %sBMeet %s for macOS%s\n' "$B" "$VERSION" "$N"
     printf '  %sDictation, meeting transcripts and file transcription on the Neural Engine.%s\n' "$D" "$N"
-    if [ -n "$icloud_docs" ]; then
+    if [ "$icloud_docs" = 1 ]; then
         printf '  %sWhat you say is transcribed on this Mac, but iCloud syncs the meeting transcripts (see below).%s\n' "$D" "$N"
     else
         printf '  %sNothing you say leaves this Mac.%s\n' "$D" "$N"
@@ -156,8 +157,11 @@ main() {
     case "$(head -n1 "$run_dir/meeting_state" 2>/dev/null || echo idle)" in
         recording|paused) die "a meeting is being recorded - stop it first (⌃⌥M), then run this again" ;;
     esac
-    if [ -n "$icloud_docs" ]; then
+    if [ "$icloud_docs" = 1 ]; then
         warn "iCloud syncs your Documents folder: the meeting transcripts in ~/Documents/Meetings go to iCloud too"
+        note "(System Settings -> your name -> iCloud -> iCloud Drive -> Desktop & Documents Folders)"
+    elif [ -n "$icloud_docs" ]; then
+        note "if iCloud Drive's Desktop & Documents Folders is on, iCloud syncs the meeting transcripts in ~/Documents/Meetings too"
         note "(System Settings -> your name -> iCloud -> iCloud Drive -> Desktop & Documents Folders)"
     fi
     # A signing identity of your own (BMEET_SIGN_IDENTITY): checked now, before step 4 quits BMeet.app
@@ -218,7 +222,9 @@ main() {
     if [ -n "$system" ]; then
         local want=()
         [ -x "$py" ] || want+=(python@3.13)
-        [ -x "$brew_prefix/bin/ffmpeg" ] || command -v ffmpeg >/dev/null || want+=(ffmpeg)
+        # (Homebrew's ffmpeg even when another one is in this shell's PATH: BMeet.app's programs
+        # get /usr/bin:/bin and Homebrew's bin folders only, see macos/bmeetmac.py)
+        [ -x "$brew_prefix/bin/ffmpeg" ] || want+=(ffmpeg)
         if [ ${#want[@]} -gt 0 ]; then
             local intel=""   # (an Intel Homebrew refuses to install on Apple silicon)
             [ "$brew_prefix" = /opt/homebrew ] \
@@ -232,7 +238,7 @@ main() {
     [ "$("$py" -c 'import platform; print(platform.machine())' 2>/dev/null)" = arm64 ] \
         || die "$py is not for Apple silicon: install Homebrew for Apple silicon, in /opt/homebrew (https://brew.sh), then run this again"
     local brew_bin="$brew_prefix/bin"
-    [ -x "$brew_bin/ffmpeg" ] || command -v ffmpeg >/dev/null || die "ffmpeg is missing (brew install ffmpeg)"
+    [ -x "$brew_bin/ffmpeg" ] || die "Homebrew's ffmpeg is missing (brew install ffmpeg; BMeet.app does not see one elsewhere in your PATH)"
     ok "Python $("$py" -c 'import platform; print(platform.python_version())'), ffmpeg $("$brew_bin/ffmpeg" -version 2>/dev/null | head -n1 | awk '{print $3}')"
 
     # --- 3. program files and the Python environment ---------------------------------------
@@ -507,6 +513,7 @@ EOF
     Microphone              dictation and meetings
     System Audio Recording  the other side of a call
     Accessibility           pasting what you dictate where you type
+    Documents folder        saving the meeting transcripts in ~/Documents/Meetings
 
   ${B}Shortcuts${N}
     ⌃⌥H    dictate: press, speak, press again        ⌃⌥⌘H   dictate to the clipboard
@@ -520,7 +527,7 @@ EOF
   ${D}Check: bash ${src/#$HOME/~}/macos/verify.sh   Uninstall: bash ${src/#$HOME/~}/uninstall.sh
   Log:   ${LOG/#$HOME/~}${N}
 EOF
-    if [ -n "$icloud_docs" ]; then
+    if [ "$icloud_docs" = 1 ]; then
         printf '  %s!%s iCloud syncs your Documents folder, and with it the meeting transcripts in ~/Documents/Meetings.\n' "$Y" "$N"
     fi
     if [ -n "$path_note" ]; then

@@ -28,7 +28,8 @@ BMEET_DICTATE_START (how to start bmeet-dictate when it is not running).
 On macOS there is no voxtype: BMeet.app (macos/BMeetApp) dictates, and macos/bmeet-meeting
 records meetings. bmeet-ctl reads their state from the same file names in
 $XDG_RUNTIME_DIR/bmeet (your temp folder; see macos/bmeetmac.py), the meetings from
-~/.local/share/bmeet/meetings/index.db (voxtype's columns), the dictation language from
+~/.local/share/bmeet/meetings/index.db (voxtype's columns; Markdown copies that could not go to
+~/Documents/Meetings are in that folder too), the dictation language from
 ~/.config/bmeet/language, and sends its actions to BMeet.app. It runs on BMeet's venv Python there.
 """
 import json
@@ -194,6 +195,13 @@ def meeting_md(started_at: int, title: str = "") -> str | None:
     return pair_mds([(None, started_at, title)]).get(None)
 
 
+def md_dirs() -> list[Path]:
+    """Where the Markdown copies are: MEETING_MD_DIR, and on a Mac also the index's folder, where
+    macos/bmeet-meeting saves a copy it cannot write in MEETING_MD_DIR (no access to Documents)."""
+    spare = MEETING_DB.parent
+    return [MEETING_MD_DIR, spare] if MAC and spare != MEETING_MD_DIR else [MEETING_MD_DIR]
+
+
 def pair_mds(meetings: list[tuple]) -> dict:
     """{key: Markdown copy} for (key, started_at, title[, ended_at]) meetings. voxtype-meeting-toggle
     names the copy after the start minute, YYYY-MM-DD_HHMM-meeting.md (-EPOCH added for a
@@ -214,8 +222,8 @@ def pair_mds(meetings: list[tuple]) -> dict:
             if key in found:
                 continue
             stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(started_at + offset))
-            group = [str(p) for p in sorted(without_twins(MEETING_MD_DIR.glob(f"{stamp}-meeting*.md")),
-                                            key=written_order)]
+            files = [p for d in md_dirs() for p in without_twins(d.glob(f"{stamp}-meeting*.md"))]
+            group = [str(p) for p in sorted(files, key=written_order)]
             named = [p for p in group if md_title(p) == title]
             if len(named) == 1 and named[0] not in taken and titles.count(title) == 1:
                 pick = named[0]

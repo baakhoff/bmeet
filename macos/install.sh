@@ -41,7 +41,7 @@ main() {
     fi
     trap '[ $? -eq 0 ] || [ -z "$BMEET_REOPEN" ] || open -g "$BMEET_REOPEN" >/dev/null 2>&1 || true; '"$clean" EXIT
     local VERSION
-    VERSION="$(cat "$src/VERSION")"
+    VERSION="$(cat "$src/macos/VERSION")"   # BMeet for macOS's own release line (docs/releasing.md)
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local config="${XDG_CONFIG_HOME:-$HOME/.config}/bmeet"
     local ROOT="$data/bmeet"

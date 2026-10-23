@@ -1,56 +1,29 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
+All notable changes to BMeet for Linux are documented here: its releases are the tags
+`vX.Y.Z`. BMeet for macOS is released on its own, with its own versions and changelog:
+[macos/CHANGELOG.md](macos/CHANGELOG.md). Changes to the code both share are in both
+([docs/releasing.md](docs/releasing.md)). The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.9.0] - 2026-10-20
-
-BMeet on Macs with Apple silicon: everything it does on Linux, with the models on the Neural Engine.
+## [Unreleased]
 
 ### Added
-- **macOS (M1 and later, macOS 14.2+):** the same one-line install (`install.sh` hands over to `macos/install.sh`; no sudo). It brings dictation, meeting transcripts with who said what, in-person meetings, file transcription, the BMeet window and the Chrome mute extension. Details, measurements and the differences from Linux are in `docs/macos.md`.
-  - **The models on the Neural Engine,** Apple's NPU, with the CPU as the fallback, as with the Intel NPU on Linux:
-    - **Whisper large-v3-turbo:** WhisperKit's Core ML models in `bmeet-whisper`, one server that every process shares (the model is loaded once on an 8 GB Mac; dictation goes first). A 23 s talk took 3.0 s on an M1.
-    - **GigaAM v3, Nemotron 3 Diarization and TitaNet:** from the same pinned files as on Linux, built into float16 Core ML programs at install time by `macos/prepare-coreml`. GigaAM takes 112 ms per 30 s, the Nemotron encoder 72 ms per step, TitaNet 44 ms per 16 fingerprints; 98–99 % of their ops run on the Neural Engine, and each build is checked against the CPU.
-  - **BMeet.app,** a menu bar app (Swift):
-    - shortcuts: ⌃⌥H dictate, ⌃⌥⌘H to the clipboard, ⌃⌥M meeting, ⌃⌥⇧M in person, ⌃⌥⇧H language;
-    - the menu bar icon and menu (the panel widget's job);
-    - a floating panel with the words while you dictate, then a paste with ⌘V;
-    - Finder's *Transcribe with BMeet* services, notifications, start at login.
-    - Everything that records or pastes runs inside it, so macOS asks for the microphone, the system audio and Accessibility once, for BMeet.
-  - **`bmeet-record`:** the microphone and the system audio (a Core Audio tap), in bmeet-meeting-audio's layout and lined up by hardware time.
-  - **`bmeet-meeting`:** the meetings voxtype runs on Linux. The meeting audio stays on a RAM disk, never on the disk.
-  - **The BMeet window:** the Linux app itself, inside `BMeet.app` (`macos/window/launcher.c` runs its Python in the bundle, so it is *BMeet* in the Dock).
-  - **Health check and uninstall:** `macos/verify.sh` checks the install. `uninstall.sh` removes it (`--purge` also deletes the models).
-  - **A Mac look:**
-    - The window has SF Symbols drawn at install time, a Finder-style sidebar, Apple's system colors, transcripts in macOS's type, and the Mac menus (⌘1–3, ⌘F, ⌘O, ⌘,). Its texts say ⌃⌥ and Finder.
-    - The menu bar menu has SF Symbols and native shortcut glyphs.
-    - The dictation panel's dot pulses while BMeet listens.
-  - **The installer on a Mac:**
-    - Nine numbered steps with ✓ and timings, a spinner for the long ones, and the details in `~/Library/Logs/BMeet/install.log`.
-    - It installs the Command Line Tools (Apple's own window) and offers Homebrew when they are missing.
-    - `BMEET_REF=BRANCH` tries a branch with the same one line.
+- **BMeet for macOS** lives in this repository now (`macos/`), with releases of its own (tags `macos-vX.Y.Z`) and its own changelog, [macos/CHANGELOG.md](macos/CHANGELOG.md). BMeet on Linux works as before.
+- **Releases, one platform at a time:** `release/release` sets a platform's version (`bump`), checks that it is ready, and tags it. GitHub Actions then runs all of CI on the tag and publishes the release, with its changelog section as the notes (`release-linux.yml`, `release-macos.yml`). How it works: [docs/releasing.md](docs/releasing.md).
 
 ### Fixed
-- **Words were lost from a dictation, or from a live meeting phrase, in clean speech** (on Linux too):
+- **Words were lost from a dictation, or from a live meeting phrase, in clean speech:**
   - BMeet tells sound from quiet by the background noise, which it takes from the quietest tenth of the last 30 s. In the first seconds there may be no quiet in that window, and then the "noise" was speech.
   - With clean speech (−13 to −19 dBFS: a close microphone, synthetic speech) the threshold rose to −12.7 dBFS. A pause was heard in the middle of a sentence, the words before it became final too early, and the words after the cut were lost.
-  - Anything louder than −30 dBFS is now sound whatever the noise seems to be (`LIVE_SPEECH_DBFS`).
-  - Found on a Mac, where the slower passes on the Neural Engine made it show; `transcribe/tests/test_dictation.py` has the case now.
+  - A "noise" louder than −30 dBFS is speech, so anything louder than −30 dBFS is then sound (`LIVE_SPEECH_DBFS`). A real background keeps the 12 dB margin as before, so a loud room still has its pauses.
+  - Found on a Mac, where the slower passes on the Neural Engine made it show. `transcribe/tests/test_dictation.py` has the case, and a loud room too.
 
 ### Changed
-- **`transcribe/prepare-diarization`:** Nemotron's graph is now one function (`build_graph`) that takes its ops as an argument. OpenVINO builds the same model with it as before, and macOS builds it with Core ML ops.
-- **npu-transcribe, bmeet-ctl, the app and the Chrome extension's host:** they work on macOS. The Mac code lives in branches and `macos/bmeetmac.py`, and on Linux nothing changes.
-- **The app:** the process check works without `/proc`. The "Voxtype" in its messages names BMeet on a Mac.
-
-### Tests
-- **`macos/tests/test_macos.py`** (CI: a new macOS job on Apple silicon) tests, without models or permissions:
-  - the Whisper server protocol;
-  - bmeet-record, playing files instead of the devices;
-  - a whole meeting through bmeet-meeting, with a stand-in transcriber;
-  - bmeet-ctl's commands to BMeet.app.
-- **The app's tests on a Mac:** they run there too (`BMEET_PLATFORM=linux` runs the Linux window with its fake voxtype), and keep their files out of your own Trash.
+- **`transcribe/prepare-diarization`:** Nemotron's graph is now one function (`build_graph`) that takes its ops as an argument, so macOS builds the same model with Core ML ops. The OpenVINO model it builds is byte for byte the one 0.8.1 built. Because the script changed, the next update rebuilds it once (about 20 s; nothing is downloaded).
+- **npu-transcribe, bmeet-ctl, the app and the Chrome extension's host also run on macOS.** The Mac code lives in `sys.platform == "darwin"` branches and `macos/bmeetmac.py`; on Linux they behave as before. The app's process check works without `/proc` there.
+- **CI** also runs on a Mac with Apple silicon (the `macos` job), because the code both platforms share runs there too.
 
 ## [0.8.1] - 2026-10-15
 
@@ -261,6 +234,7 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
+[Unreleased]: https://github.com/baakhoff/bmeet/compare/v0.8.1...main
 [0.8.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.1
 [0.8.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.0
 [0.7.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.1

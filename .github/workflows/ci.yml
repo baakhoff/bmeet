@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
+  # the release workflows run all of CI on a release tag first (release-linux.yml,
+  # release-macos.yml)
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,7 +21,8 @@ jobs:
           shellcheck --version
           shellcheck -S warning install.sh uninstall.sh system/*.sh voxtype/*.sh voxtype/bin/* \
             transcribe/*.sh transcribe/tests/*.sh bmeet/app/*.sh bmeet/app/tests/*.sh \
-            bmeet/plasmoid/*.sh bmeet/chrome/*.sh bmeet/dictate/tests/*.sh macos/*.sh
+            bmeet/plasmoid/*.sh bmeet/chrome/*.sh bmeet/dictate/tests/*.sh macos/*.sh \
+            release/check-versions release/notes release/publish release/release release/platforms.sh
       - name: Python syntax
         run: |
           for f in transcribe/npu-transcribe transcribe/prepare-models transcribe/prepare-diarization \
@@ -46,18 +49,16 @@ jobs:
           done
       - name: Version is consistent
         run: |
-          v=$(cat VERSION)
-          grep -q "local VERSION=$v\$" install.sh
-          grep -q "__version__ = \"$v\"" transcribe/npu-transcribe
-          grep -q "__version__ = \"$v\"" bmeet/bmeet-ctl
-          grep -q "__version__ = \"$v\"" bmeet/app/bmeet
-          grep -q "__version__ = \"$v\"" bmeet/dictate/bmeet-dictate
-          grep -q "\"Version\": \"$v\"" bmeet/plasmoid/io.github.baakhoff.bmeet/metadata.json
-          grep -q "\"version\": \"$v\"" bmeet/chrome/extension/manifest.json
-          grep -q "^## \[$v\]" CHANGELOG.md
+          # each platform's version everywhere it is written, and its changelog section; on a
+          # release tag, also that the tag is its platform's version (release/platforms.sh)
+          if [[ $GITHUB_REF == refs/tags/* ]]; then release/check-versions "$GITHUB_REF_NAME"
+          else release/check-versions; fi
           plutil() { python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$1"; }
           plutil macos/app/Info.plist && plutil macos/app/Window-Info.plist
-          if [[ $GITHUB_REF == refs/tags/v* ]]; then test "${GITHUB_REF#refs/tags/v}" = "$v"; fi
+      - name: Release notes and the release script
+        run: |
+          for p in linux macos; do release/notes "$p" >/dev/null; done
+          release/release status
 
   app-tests:
     runs-on: ubuntu-24.04

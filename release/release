@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# BMeet's release process. Each platform is a release line of its own, with its own version,
+# changelog and tags (docs/releasing.md):
+#   linux   VERSION         CHANGELOG.md         tags v0.8.2, ...
+#   macos   macos/VERSION   macos/CHANGELOG.md   tags macos-v0.9.0, ...
+#
+#   release/release status
+#       each platform's version, its last release and the commits since
+#   release/release bump PLATFORM VERSION
+#       write VERSION everywhere the platform carries it, date the changelog's
+#       "## [Unreleased]" section and add its link; you commit it (with the change, or alone)
+#   release/release PLATFORM [--title TEXT] [--yes]
+#       release the platform's version from main: checks that main is clean and pushed, the
+#       versions agree, the changelog has the notes and CI passed for the commit; then tags
+#       it and pushes the tag. GitHub Actions (release-PLATFORM.yml) runs CI on the tag and
+#       publishes the release. --title: the release's name after "BMeet for macOS 0.9.0: ".
+set -euo pipefail
+cd "$(dirname "$0")/.."
+. release/platforms.sh
+
+die() { echo "release: $*" >&2; exit 1; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+semver() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# replace_end FILE OLD NEW: in the lines of FILE that end with OLD, put NEW instead
+replace_end() {
+    local tmp
+    tmp="$(mktemp)"
+    awk -v old="$2" -v new="$3" '{
+            n = length($0) - length(old)
+            if (n >= 0 && substr($0, n + 1) == old) { $0 = substr($0, 1, n) new; hits++ }
+            print
+        } END { exit !hits }' "$1" > "$tmp" || { rm -f "$tmp"; die "$1: no line ends with '$2'"; }
+    cat "$tmp" > "$1"   # (keeps the file's mode)
+    rm -f "$tmp"
+}
+
+cmd_status() {
+    local p v last since
+    for p in $PLATFORMS; do
+        platform_info "$p"
+        v="$(platform_version "$p")"
+        last="$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}[0-9]*" 2>/dev/null || true)"
+        if [ -z "$last" ]; then
+            printf '%-6s %-8s never released\n' "$p" "$v"
+            continue
+        fi
+        since="$(git rev-list --count "$last..HEAD")"
+        if [ "$last" = "$TAG_PREFIX$v" ]; then
+            printf '%-6s %-8s released as %s (commits since: %s)\n' "$p" "$v" "$last" "$since"
+        else
+            printf '%-6s %-8s not released yet (the last release: %s; commits since: %s)\n' "$p" "$v" "$last" "$since"
+        fi
+    done
+}
+
+cmd_bump() {
+    local p="${1:-}" new="${2:-}" old today
+    [ -n "$p" ] && [ -n "$new" ] || usage
+    platform_info "$p"
+    semver "$new" || die "not a version: $new (X.Y.Z)"
+    old="$(platform_version "$p")"
+    [ "$new" != "$old" ] || die "$p is $old already"
+    printf '%s\n' "$new" > "$VERSION_FILE"
+    while IFS="$(printf '\t')" read -r file text; do
+        replace_end "$file" "${text//@V@/$old}" "${text//@V@/$new}"
+    done <<EOF
+$(version_lines "$p")
+EOF
+    today="$(date +%Y-%m-%d)"
+    if grep -q '^## \[Unreleased\]' "$CHANGELOG"; then
+        replace_end "$CHANGELOG" '## [Unreleased]' "## [$new] - $today"
+        note="its \"## [Unreleased]\" section is now $new's"
+    elif grep -qF "## [$new]" "$CHANGELOG"; then
+        note="it has a $new section already"
+    else
+        local tmp
+        tmp="$(mktemp)"
+        awk -v head="## [$new] - $today" '!done && index($0, "## [") == 1 {
+                print head; print ""; print "### Changed"; print "- (write what changed)"; print ""; done = 1 }
+            { print }' "$CHANGELOG" > "$tmp"
+        cat "$tmp" > "$CHANGELOG"
+        rm -f "$tmp"
+        note="a $new section to fill in"
+    fi
+    if ! grep -qF "[$new]: " "$CHANGELOG"; then   # its link, above the older ones
+        local tmp
+        tmp="$(mktemp)"
+        awk -v link="[$new]: https://github.com/$REPO/releases/tag/$TAG_PREFIX$new" \
+            -v unreleased="[Unreleased]: https://github.com/$REPO/compare/$TAG_PREFIX$new...main" '
+                /^\[Unreleased\]: / { print unreleased; next }
+                !done && /^\[[0-9]+\.[0-9]+\.[0-9]+\]: / { print link; done = 1 }
+                { print }
+                END { if (!done) print link }' "$CHANGELOG" > "$tmp"
+        cat "$tmp" > "$CHANGELOG"
+        rm -f "$tmp"
+    fi
+    release/check-versions >/dev/null
+    echo "$NAME: $old -> $new. $CHANGELOG: $note."
+    git --no-pager diff --stat
+}
+
+cmd_release() {
+    local p="${1:-}" title_text="" yes=""
+    [ -n "$p" ] || usage
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --title) title_text="${2:?--title needs a text}"; shift ;;
+            --yes) yes=1 ;;
+            *) usage ;;
+        esac
+        shift
+    done
+    platform_info "$p"
+    local v tag title sha ci
+    v="$(platform_version "$p")"
+    tag="$TAG_PREFIX$v"
+    title="$NAME $v${title_text:+: $title_text}"
+
+    [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "releases are made from main"
+    [ -z "$(git status --porcelain)" ] || die "there are uncommitted changes"
+    git fetch -q origin main
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+        || die "main is not the same as GitHub's: push or pull first"
+    release/check-versions >/dev/null || die "the versions do not agree (release/check-versions)"
+    local date_re='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+    awk -v head="## [$v] - " -v re="$date_re" 'index($0, head) == 1 && substr($0, length(head) + 1) ~ re { dated = 1 }
+            END { exit !dated }' "$CHANGELOG" \
+        || die "$CHANGELOG: the $v section needs its date (## [$v] - YYYY-MM-DD)"
+    release/notes "$p" "$v" >/dev/null
+    ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "the tag $tag exists already"
+    ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null \
+        || die "the tag $tag exists on GitHub already"
+
+    command -v gh >/dev/null || die "gh (GitHub CLI) is needed to check CI"
+    sha="$(git rev-parse HEAD)"
+    ci="$(gh run list --workflow ci.yml --commit "$sha" --limit 1 --json status,conclusion \
+          --jq '.[0] | "\(.status) \(.conclusion)"')"
+    case "$ci" in
+        "completed success") ;;
+        ""|"null null") die "CI has not run for ${sha:0:7} yet" ;;
+        completed*) die "CI did not pass for ${sha:0:7}: ${ci#completed }" ;;
+        *) die "CI is still running for ${sha:0:7}: try again when it is done" ;;
+    esac
+
+    echo "Release:  $title"
+    echo "Tag:      $tag on ${sha:0:7} ($(git log -1 --format=%s))"
+    echo "Notes:    $CHANGELOG, $(release/notes "$p" "$v" | wc -l | tr -d ' ') lines"
+    echo "Then:     .github/workflows/$WORKFLOW runs CI on the tag and publishes the release"
+    if [ -z "$yes" ]; then
+        local answer=""
+        read -r -p "Tag and push? [y/N] " answer </dev/tty || true
+        case "$answer" in y|Y|yes) ;; *) die "nothing done" ;; esac
+    fi
+    git tag -a "$tag" -m "$title"
+    git push -q origin "refs/tags/$tag"
+    echo "Pushed $tag. Progress: https://github.com/$REPO/actions/workflows/$WORKFLOW"
+}
+
+case "${1:-}" in
+    status) cmd_status ;;
+    bump) shift; cmd_bump "$@" ;;
+    ""|-h|--help) usage ;;
+    *) cmd_release "$@" ;;
+esac

@@ -20,15 +20,17 @@ The installer is the same one line as on Linux. On a Mac `install.sh` hands over
 curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
 ```
 
+It installs the latest release of BMeet for macOS. The Mac has a release line of its own, separate from Linux: its version is `macos/VERSION`, its releases are the tags `macos-vX.Y.Z`, and what changed is in [macos/CHANGELOG.md](../macos/CHANGELOG.md). How a release is made: [releasing.md](releasing.md).
+
 It goes through nine numbered steps, each with a ✓ and how long it took, a spinner for the long ones and their details in `~/Library/Logs/BMeet/install.log` (on a failure, the last lines of it are shown). Starting from a new Mac:
 
 - **Command Line Tools missing:** macOS shows its own window to install them, and the installer waits.
 - **Homebrew missing:** it offers to run Homebrew's official installer, which asks for your password itself.
 
-To try a branch before it is released, name it twice:
+To try a branch before it is released, name it (`BRANCH` below; `main` is the code that will be in the next release):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/macos-port/install.sh | BMEET_REF=macos-port bash
+curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | BMEET_REF=BRANCH bash
 ```
 
 What it needs and what it does:
@@ -53,13 +55,16 @@ Options are the Linux ones that apply: `--languages "en ru"`, `--no-turbo`, `--n
 
 ### Permissions
 
-macOS asks once for each, the first time BMeet needs it. All three are for **BMeet**, because everything that records or pastes runs inside BMeet.app.
+macOS asks once for each, the first time BMeet needs it. They are all for **BMeet**, because everything that records, pastes or saves runs inside BMeet.app.
 
 | Permission | When it is asked | Without it |
 |---|---|---|
 | Microphone | the first dictation or meeting | nothing can be recorded |
 | System Audio Recording | the first meeting | the other side of a call is silent: only *You* is transcribed |
 | Accessibility | the first dictation that should be pasted | the text stays on the clipboard (press ⌘V); BMeet says so |
+| Documents folder | the first meeting transcript | it is saved in `~/.local/share/bmeet/meetings` instead, where the window and `bmeet-ctl` find it too; BMeet says so |
+
+**iCloud:** the transcripts go to `~/Documents/Meetings`. If iCloud Drive syncs your Desktop and Documents folders (System Settings → Apple Account → iCloud → iCloud Drive), it uploads them too. The installer tells you when that setting is on. The audio is never saved, so it is never uploaded.
 
 They can be changed later in System Settings → Privacy & Security. BMeet is signed "ad hoc" (no Apple developer certificate), so after an upgrade macOS may ask for them again. To avoid that, sign with an identity of your own: run the installer with `BMEET_SIGN_IDENTITY="Your identity" ./install.sh` (`security find-identity -p codesigning` lists yours).
 

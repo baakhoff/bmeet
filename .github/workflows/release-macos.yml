@@ -1,0 +1,27 @@
+name: Release macOS
+
+# BMeet for macOS has its own release line: macos/VERSION, macos/CHANGELOG.md, tags
+# macos-vX.Y.Z (release/release macos makes and pushes the tag; docs/releasing.md).
+on:
+  push:
+    tags: ["macos-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # all of CI, the macOS job on Apple silicon included: the shared code runs on a Mac too
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the release (notes from macos/CHANGELOG.md)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: release/publish "$GITHUB_REF_NAME"

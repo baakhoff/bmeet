@@ -7,7 +7,8 @@ CPU and GPU are left alone. On a Mac it is a menu bar app with ⌃⌥ shortcuts:
 [docs/macos.md](docs/macos.md).
 
 [![CI](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml/badge.svg)](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/baakhoff/bmeet)](https://github.com/baakhoff/bmeet/releases)
+[![Linux release](https://img.shields.io/github/v/release/baakhoff/bmeet?filter=v*&label=linux)](https://github.com/baakhoff/bmeet/releases/latest)
+[![macOS release](https://img.shields.io/github/v/release/baakhoff/bmeet?filter=macos-v*&label=macOS)](https://github.com/baakhoff/bmeet/releases?q=macos-v&expanded=true)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![BMeet app](docs/screenshot.png)
@@ -70,6 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 ```
 
 On a Mac the same line installs the Mac version, without sudo ([docs/macos.md](docs/macos.md)).
+Linux and macOS are released separately, each with its own version and changelog
+([CHANGELOG.md](CHANGELOG.md), [macos/CHANGELOG.md](macos/CHANGELOG.md),
+[docs/releasing.md](docs/releasing.md)); the line installs the latest release for your system.
 On Linux the installer asks for your sudo password once. It then:
 
 1. **Installs packages:** voxtype 1.1.0, the OpenVINO GenAI SDK, ydotool, ffmpeg and PyQt6, plus Intel's NPU driver if it's missing.
@@ -215,6 +219,7 @@ bash ~/.local/share/bmeet/src/uninstall.sh
 | [`transcribe/`](transcribe) | `npu-transcribe` and its tests |
 | [`bmeet/`](bmeet) | `bmeet-ctl`, the BMeet app, the Plasma widget and the Chrome extension |
 | [`macos/`](macos) | the Mac version: BMeet.app (menu bar, Swift), the Whisper server on the Neural Engine (WhisperKit), the recorder, the meeting runner, the Core ML builds of the models, the installer ([docs/macos.md](docs/macos.md)) |
+| [`release/`](release) | the release process, one platform at a time: `release/release` ([docs/releasing.md](docs/releasing.md)) |
 | [`docs/`](docs) | design notes, benchmarks, troubleshooting |
 
 ## Development

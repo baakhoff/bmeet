@@ -29,6 +29,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]      # the BMeet program files (a checkout or the install)
 HOME = Path.home()
+# BMeet for macOS is released on its own (docs/releasing.md): the programs it shares with Linux
+# carry the Linux version, and report this one on a Mac
+try:
+    VERSION = (ROOT / "macos" / "VERSION").read_text().strip()
+except OSError:
+    VERSION = "?"
 _CS_DARWIN_USER_TEMP_DIR = 65537
 
 

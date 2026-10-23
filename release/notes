@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Print a version's section of a changelog: the release notes.
+#   release/notes PLATFORM [VERSION]    (VERSION: the platform's current one)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+. release/platforms.sh
+
+platform_info "${1:?usage: release/notes PLATFORM [VERSION]}"
+v="${2:-$(platform_version "$1")}"
+# from the line after "## [v]" to the line before the next "## [", without blank lines at
+# either end
+awk -v head="## [$v]" '
+    index($0, "## [") == 1 { if (on) exit; on = (index($0, head) == 1); next }
+    on { lines[++n] = $0 }
+    END {
+        first = 1; while (first <= n && lines[first] ~ /^[[:space:]]*$/) first++
+        last = n;  while (last >= first && lines[last] ~ /^[[:space:]]*$/) last--
+        for (i = first; i <= last; i++) print lines[i]
+        exit (last < first)
+    }' "$CHANGELOG" || { echo "release/notes: $CHANGELOG has no notes for $v" >&2; exit 1; }

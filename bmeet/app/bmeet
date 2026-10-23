@@ -72,7 +72,9 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,  # noqa
                              QStackedWidget, QStyle, QTextBrowser, QTextEdit, QToolBar, QToolButton,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-__version__ = "0.9.0"
+__version__ = "0.8.1"
+if MAC:
+    __version__ = bmeetmac.VERSION   # BMeet for macOS has its own release line (macos/VERSION)
 APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()

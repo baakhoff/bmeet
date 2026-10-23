@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # BMeet installer: voice typing, meeting transcripts and file transcription
 # with Whisper on the Intel NPU, for Ubuntu/Kubuntu 26.04 with KDE Plasma 6 -
-# and on the Neural Engine of a Mac with Apple silicon (macos/install.sh takes over there).
+# and on the Neural Engine of a Mac with Apple silicon (macos/install.sh takes over there,
+# with its own options and its own release line: docs/macos.md).
 #
 # One line (downloads the release, asks for your sudo password once):
 #   curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
@@ -33,7 +34,9 @@
 main() {
     set -euo pipefail
 
-    local VERSION=0.9.0
+    # Each platform is released on its own (docs/releasing.md); release/release bump sets these.
+    local VERSION=0.8.1
+    local MACOS_VERSION=0.9.0
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"
@@ -46,6 +49,33 @@ main() {
         say() { printf '\n==> %s\n' "$*"; }
     fi
     die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+    # --- a Mac: macos/install.sh takes over, options and all, from BMeet for macOS's own
+    # release (macos-vX.Y.Z) ---
+    if [ "$(uname -s)" = Darwin ]; then
+        [ "$(id -u)" -ne 0 ] || die "run this as your normal user"
+        local self="${BASH_SOURCE[0]:-}" ref="${BMEET_REF:-macos-v$MACOS_VERSION}" tmp
+        if [ "$(basename -- "$self")" = install.sh ] && [ -f "$self" ] \
+                && [ -f "$(dirname "$self")/macos/install.sh" ]; then
+            exec bash "$(dirname "$self")/macos/install.sh" ${@+"$@"}   # (a checkout)
+        fi
+        case " $* " in
+            *" --version "*) echo "BMeet installer $MACOS_VERSION"; return 0 ;;
+            *" -h "*|*" --help "*) echo "See https://github.com/$REPO/blob/main/docs/macos.md#install"; return 0 ;;
+        esac
+        say "Downloading BMeet for macOS $ref"
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/bmeet.XXXXXX")"
+        trap 'rm -rf "$tmp"' EXIT   # on failure; macos/install.sh removes it when done
+        curl -fsSL "https://github.com/$REPO/archive/$ref.tar.gz" | tar -xz -C "$tmp" --strip-components=1 \
+            || die "could not download https://github.com/$REPO/archive/$ref.tar.gz"
+        [ -f "$tmp/macos/install.sh" ] || die "the download does not look like BMeet for macOS"
+        export BMEET_TMP="$tmp"
+        trap - EXIT
+        if { : </dev/tty; } 2>/dev/null; then   # (stdin is the pipe from curl)
+            exec bash "$tmp/macos/install.sh" ${@+"$@"} </dev/tty
+        fi
+        exec bash "$tmp/macos/install.sh" ${@+"$@"}
+    fi
 
     # --- options -------------------------------------------------------------------
     local languages="" turbo=1 speakers=1 gigaam=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
@@ -95,10 +125,6 @@ main() {
             exec bash "$tmp/install.sh" ${args[@]+"${args[@]}"} </dev/tty
         fi
         exec bash "$tmp/install.sh" ${args[@]+"${args[@]}"}
-    fi
-    # --- a Mac with Apple silicon: its own installer (the same options, where they apply) ---
-    if [ "$(uname -s)" = Darwin ]; then
-        exec bash "$src/macos/install.sh" ${args[@]+"${args[@]}"}
     fi
     local version
     version="$(cat "$src/VERSION")"

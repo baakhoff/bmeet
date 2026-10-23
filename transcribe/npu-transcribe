@@ -121,7 +121,9 @@ except ImportError:
     sys.exit("npu-transcribe: numpy/openvino-genai are missing - run it through the "
              "installer's wrapper (~/.local/bin/npu-transcribe) or its venv")
 
-__version__ = "0.9.0"
+__version__ = "0.8.1"
+if MAC:
+    __version__ = bmeetmac.VERSION   # BMeet for macOS has its own release line (macos/VERSION)
 MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
                   or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "npu-models")
 MODELS = {

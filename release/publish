@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Publish the GitHub release of a pushed release tag, with its changelog section as the
+# notes. The release workflows run this after CI passed for the tag; GH_TOKEN must allow
+# writing releases.
+#   release/publish TAG
+set -euo pipefail
+cd "$(dirname "$0")/.."
+. release/platforms.sh
+
+tag="${1:?usage: release/publish TAG}"
+p="$(platform_of_tag "$tag")"
+platform_info "$p"
+release/check-versions "$tag" >/dev/null
+v="$(platform_version "$p")"
+
+notes="$(mktemp)"
+trap 'rm -f "$notes"' EXIT
+release/notes "$p" "$v" > "$notes"
+
+# The title: the tag's message (release/release writes "BMeet for macOS 0.9.0: ..."), else
+# the name and version. actions/checkout leaves the tag lightweight: fetch the tag itself.
+git fetch -q --force origin "+refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
+title=""
+if [ "$(git cat-file -t "$tag" 2>/dev/null)" = tag ]; then
+    title="$(git tag -l --format='%(contents:subject)' "$tag")"
+fi
+[ -n "$title" ] || title="$NAME $v"
+
+if gh release view "$tag" >/dev/null 2>&1; then
+    echo "The release $tag exists already: its notes and title are left as they are."
+    exit 0
+fi
+gh release create "$tag" --verify-tag --title "$title" --notes-file "$notes" --latest="$LATEST"
+echo "Published $title: $(gh release view "$tag" --json url --jq .url)"

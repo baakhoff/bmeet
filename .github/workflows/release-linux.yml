@@ -1,0 +1,27 @@
+name: Release Linux
+
+# BMeet for Linux: VERSION, CHANGELOG.md, tags vX.Y.Z (release/release linux makes and
+# pushes the tag; docs/releasing.md). It is the release marked "Latest" on GitHub.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # all of CI, the macOS job included: the shared code runs on a Mac too
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the release (notes from CHANGELOG.md)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: release/publish "$GITHUB_REF_NAME"

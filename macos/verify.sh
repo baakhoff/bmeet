@@ -14,7 +14,7 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fails=$((fails + 1)); }
 note() { printf '  --   %s\n' "$*"; }
 check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1${3:+ - $3}"; fi; }
 
-echo "BMeet $(cat "$src/VERSION" 2>/dev/null || echo '?') on macOS $(sw_vers -productVersion), $(uname -m)"
+echo "BMeet $(cat "$src/macos/VERSION" 2>/dev/null || echo '?') on macOS $(sw_vers -productVersion), $(uname -m)"
 check "Python environment" "'$py' -I -c 'import numpy, coremltools, PyQt6.QtWidgets'" "run the installer again"
 # ffmpeg as BMeet.app's programs find it: they get /usr/bin:/bin, and bmeetmac adds Homebrew's
 # shellcheck disable=SC2034  # (check evals it)

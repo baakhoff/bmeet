@@ -41,13 +41,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.9.0"
+__version__ = "0.8.1"
 
 MAC = sys.platform == "darwin" and os.environ.get("BMEET_PLATFORM") != "linux"   # (tests: Linux on a Mac)
 if MAC:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "macos"))
     import bmeetmac  # noqa: E402
     bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder
+    __version__ = bmeetmac.VERSION   # BMeet for macOS has its own release line (macos/VERSION)
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")

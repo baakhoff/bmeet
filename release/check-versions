@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Check that every place that carries a release line's version agrees with its VERSION file,
+# and that its changelog has that version's section. CI runs this on every push.
+#   release/check-versions          every platform
+#   release/check-versions TAG      also: TAG (v0.8.2, macos-v0.9.0) is its platform's version
+set -euo pipefail
+cd "$(dirname "$0")/.."
+. release/platforms.sh
+
+bad=0
+fail() { echo "check-versions: $*" >&2; bad=1; }
+
+for p in $PLATFORMS; do
+    platform_info "$p"
+    v="$(platform_version "$p")"
+    case "$v" in
+        [0-9]*.[0-9]*.[0-9]*) ;;
+        *) fail "$VERSION_FILE: not a version: '$v'"; continue ;;
+    esac
+    while IFS="$(printf '\t')" read -r file text; do
+        want="${text//@V@/$v}"
+        # the text must end a line of the file
+        if ! awk -v want="$want" 'substr($0, length($0) - length(want) + 1) == want { found = 1 }
+                                  END { exit !found }' "$file"; then
+            fail "$file: no line ends with '$want' ($p $v, from $VERSION_FILE)"
+        fi
+    done <<EOF
+$(version_lines "$p")
+EOF
+    grep -qF "## [$v]" "$CHANGELOG" || fail "$CHANGELOG: no '## [$v]' section"
+    grep -qxF "[$v]: https://github.com/$REPO/releases/tag/$TAG_PREFIX$v" "$CHANGELOG" \
+        || fail "$CHANGELOG: no link for $v ([$v]: https://github.com/$REPO/releases/tag/$TAG_PREFIX$v)"
+    echo "$p $v"
+done
+
+if [ $# -gt 0 ]; then
+    tag="$1"
+    p="$(platform_of_tag "$tag")" || exit 1
+    platform_info "$p"
+    v="$(platform_version "$p")"
+    [ "$tag" = "$TAG_PREFIX$v" ] || fail "tag $tag is not $p's version: $VERSION_FILE says $v"
+fi
+exit "$bad"

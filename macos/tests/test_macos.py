@@ -89,6 +89,34 @@ def wav_info(path: Path) -> tuple[int, int, int]:
     return riff, size, len(data) - pos - 8
 
 
+def set_state(path: Path, state: str) -> None:
+    """The meeting state, written as bmeet-meeting writes it: a new file put in place. (Written
+    over in place, the recorder can read it empty between the two steps: "idle", it ends.)"""
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(state + "\n")
+    tmp.replace(path)
+
+
+def wait_until(check, timeout: float = 10.0) -> bool:
+    """check() turns true within timeout (a file it reads that is not there yet: not yet)."""
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            if check():
+                return True
+        except (OSError, ValueError, struct.error):
+            pass
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.05)
+
+
+def wav_ended(path: Path) -> bool:
+    """The recorder finished the WAV's header (while it records, the sizes are open)."""
+    riff, size, real = wav_info(path)
+    return size == real
+
+
 class StandIn(threading.Thread):
     """A Unix socket server answering each JSON line with answer(request, payload)."""
 
@@ -192,15 +220,19 @@ class Recorder(unittest.TestCase):
             p = subprocess.Popen([str(recorder()), "meeting", str(folder), "--state", str(state), "--pointer", str(pointer)],
                                  env=env, stderr=subprocess.PIPE, text=True)
             time.sleep(2.0)
+            # (CI's Macs can be slow: each step waits for the recorder, not a set time)
+            self.assertTrue(wait_until(pointer.exists), "no pointer file")
             self.assertEqual(pointer.read_text().strip(), str(folder))
             # while it records, the WAV is readable (open sizes) and growing
-            riff, size, real = wav_info(folder / "part-1-mic.wav")
-            self.assertGreater(real, 16000)
-            state.write_text("paused\n")
-            time.sleep(1.0)
-            state.write_text("recording\n")
+            self.assertTrue(wait_until(lambda: wav_info(folder / "part-1-mic.wav")[2] > 16000), "part 1 not growing")
+            self.assertFalse(wav_ended(folder / "part-1-mic.wav"))
+            set_state(state, "paused")
+            self.assertTrue(wait_until(lambda: wav_ended(folder / "part-1-remote.wav")), "part 1 did not end")
+            time.sleep(0.5)
+            set_state(state, "recording")
+            self.assertTrue(wait_until((folder / "part-2.start").exists), "part 2 did not start")
             time.sleep(1.5)
-            state.write_text("idle\n")
+            set_state(state, "idle")
             self.assertEqual(p.wait(timeout=10), 0, p.stderr.read())
             self.assertFalse(pointer.exists())
             for part, least in ((1, 1.5), (2, 1.0)):
@@ -234,7 +266,7 @@ class Recorder(unittest.TestCase):
             p = subprocess.Popen([str(recorder()), "meeting", str(folder), "--state", str(state),
                                   "--pointer", str(tmp / "recording")], env=env, stderr=subprocess.PIPE, text=True)
             time.sleep(4.0)
-            state.write_text("idle\n")
+            set_state(state, "idle")
             self.assertEqual(p.wait(timeout=10), 0, p.stderr.read())
             mic, remote = (wav_info(folder / f"part-1-{t}.wav")[2] / 32000 for t in ("mic", "remote"))
             self.assertGreater(mic, 3)

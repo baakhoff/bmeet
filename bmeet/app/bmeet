@@ -2716,6 +2716,16 @@ class MainWindow(QMainWindow):
                                                               "media-playback-start")
         self.ctl_banner = Banner("error")
         self.ctl_banner.text.setText(f"Live status is unavailable: {CTL_ERROR}" if CTL_ERROR else "")
+        # a newer release (bmeet-ctl's last check), or a newer version installed while this runs
+        self.update_banner = Banner("info")
+        self._update_key: tuple | None = None    # ("update" | "restart", version) shown
+        self._update_hidden: tuple | None = None  # the one "Later" hid
+        self._update_url = ""
+        self._restart = False
+        self.update_news_btn = self.update_banner.add_button("What's New", self.update_news, "help-about")
+        self.update_btn = self.update_banner.add_button("Update…", self.start_update, "system-software-update")
+        self.restart_btn = self.update_banner.add_button("Restart", self.restart_window, "view-refresh")
+        self.update_banner.add_button("Later", self.hide_update, "")
 
         # sidebar: search + pages
         self.search = QLineEdit()
@@ -2762,7 +2772,8 @@ class MainWindow(QMainWindow):
         cl = QVBoxLayout(central)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
-        for banner, visible in ((self.ctl_banner, bool(CTL_ERROR)), (self.daemon_banner, False)):
+        for banner, visible in ((self.ctl_banner, bool(CTL_ERROR)), (self.daemon_banner, False),
+                                (self.update_banner, False)):
             wrap = QWidget()  # the margins around the banner hide with it
             wl = QVBoxLayout(wrap)
             wl.setContentsMargins(8, 6, 8, 0)
@@ -2789,6 +2800,11 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self, interval=1000)
         self.poll_timer.timeout.connect(self.poll)
         self.poll_timer.start()
+        # GitHub at most once a day (bmeet-ctl decides; off with ~/.config/bmeet/update-check "off")
+        self.update_timer = QTimer(self, interval=6 * 3600 * 1000)
+        self.update_timer.timeout.connect(self.check_update)
+        self.update_timer.start()
+        QTimer.singleShot(3000, self.check_update)
 
     # -- toolbar ---------------------------------------------------------------
     def _build_toolbar(self) -> None:
@@ -2874,6 +2890,7 @@ class MainWindow(QMainWindow):
         if dictation == "streaming":
             dictation = "recording"
         self._set_banner(self.daemon_banner, not daemon_on)
+        self.show_update(st)
 
         # dictation
         if not daemon_on:
@@ -2985,6 +3002,50 @@ class MainWindow(QMainWindow):
     def _set_banner(banner: Banner, visible: bool) -> None:
         if banner.wrapper.isHidden() == visible:
             banner.wrapper.setVisible(visible)
+
+    # -- updates ---------------------------------------------------------------
+    def check_update(self) -> None:
+        """bmeet-ctl asks GitHub when it is due; the next poll shows what it found."""
+        run_command(self, [sys.executable, "-I", str(CTL_PATH), "update", "--check", "--auto", "--json"],
+                    lambda *_: self.poll(), timeout_ms=60_000)
+
+    def show_update(self, st: dict) -> None:
+        installed, upd = st.get("version"), st.get("update")
+        if installed and installed != __version__:   # updated while this window ran: it is the old one
+            key = ("restart", installed)
+            text = f"BMeet {installed} is installed. Restart this window to use it (it is still {__version__})."
+        elif isinstance(upd, dict) and upd.get("version"):
+            key = ("update", upd["version"])
+            text = f"BMeet {upd['version']} is available (you have {upd.get('installed') or __version__})."
+        else:
+            key, text = None, ""
+        if key != self._update_key:
+            self._update_key = key
+            self._update_url = upd.get("url") or "" if key and key[0] == "update" else ""
+            self.update_banner.text.setText(text)
+            self.update_news_btn.setVisible(bool(self._update_url))
+            self.update_btn.setVisible(bool(key) and key[0] == "update")
+            self.update_btn.setToolTip("Opens a terminal window that installs it: the installer of the new "
+                                       "release, with the options BMeet was installed with (bmeet-ctl update)")
+            self.restart_btn.setVisible(bool(key) and key[0] == "restart")
+        self._set_banner(self.update_banner, key is not None and key != self._update_hidden)
+
+    def update_news(self) -> None:
+        if self._update_url:
+            open_url(QUrl(self._update_url))
+
+    def start_update(self) -> None:
+        run_detached([sys.executable, "-I", str(CTL_PATH), "update", "--terminal"])
+        self.message("The update runs in a terminal window")
+
+    def hide_update(self) -> None:
+        self._update_hidden = self._update_key
+        self._set_banner(self.update_banner, False)
+
+    def restart_window(self) -> None:
+        self._restart = True
+        if not self.close():   # (a transcription is running and you kept it)
+            self._restart = False
 
     def check_data(self) -> None:
         """Reload a list when its source changed (cheap stat calls, every poll)."""
@@ -3271,6 +3332,10 @@ class MainWindow(QMainWindow):
             if proc.state() != QProcess.ProcessState.NotRunning:
                 proc.kill()
                 proc.waitForFinished(1000)
+        if self._restart:   # the new version's window, once this one is gone (one window at a time)
+            run_detached(["/bin/sh", "-c", 'i=0; while kill -0 "$1" 2>/dev/null && [ "$i" -lt 100 ]; do '
+                          'sleep 0.2; i=$((i + 1)); done; exec "$2" -I "$3" open "$4"',
+                          "sh", str(os.getpid()), sys.executable, str(CTL_PATH), self.page()])
 
 
 # ============================================================================ single instance

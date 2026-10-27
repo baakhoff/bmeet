@@ -7,6 +7,16 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Updates from the menu bar:** when a new release of BMeet for macOS is out, BMeet's menu shows **Update to BMeet X…**, and a notification says so once. Update opens Terminal with the new release's installer, which quits BMeet and opens the new one at the end. *Check for Updates…* asks now. The BMeet window shows the same, with **What's New**. In Terminal: `bmeet-ctl update`, or `bmeet-ctl update --check` to only look.
+  - BMeet asks GitHub for its releases once a day, with no data about you or your use of BMeet. *Settings → Check for Updates Automatically* turns that off.
+  - An update keeps the options you installed with (`--no-start` and the like). The installer keeps them in `~/.local/share/bmeet/install-options`.
+  - It waits while a meeting is recorded or its speaker pass runs.
+  - A BMeet window that was open during an update offers **Restart**, so it runs the new version.
+  - Coming from 0.9.0, which has no update check: run the install line once.
+
 ## [0.9.0] - 2026-10-27
 
 BMeet on Macs with Apple silicon: everything it does on Linux, with the models on the Neural Engine. The first release of BMeet for macOS.
@@ -65,4 +75,5 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
   - bmeet-ctl's commands to BMeet.app.
 - **The app's tests on a Mac:** they run there too (`BMEET_PLATFORM=linux` runs the Linux window with its fake voxtype), and keep their files out of your own Trash.
 
+[Unreleased]: https://github.com/baakhoff/bmeet/compare/macos-v0.9.0...main
 [0.9.0]: https://github.com/baakhoff/bmeet/releases/tag/macos-v0.9.0

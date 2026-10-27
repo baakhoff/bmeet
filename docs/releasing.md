@@ -62,6 +62,12 @@ so release as soon as CI has passed.
 `release/release status` shows each platform's version, its last release and the commits
 since.
 
+## How users get it
+
+BMeet looks for a newer release of its own platform once a day: `bmeet-ctl update --check --auto`, which the BMeet window, the panel widget and BMeet.app run. It reads the GitHub releases whose tags have the platform's prefix (`v`, `macos-v`). Drafts and pre-releases are skipped, and a release is published only after CI passed on its tag. The apps then show **Update…**, which runs `bmeet-ctl update` in a terminal window. That command downloads the new release's own `install.sh` and runs it with the options BMeet was installed with (`~/.local/share/bmeet/install-options`, written by the installers). So a release reaches its users within a day of being published.
+
+Releases made before this (Linux 0.8.1, macOS 0.9.0) have no update check: their users update once with the install line.
+
 ## Adding a platform (Windows)
 
 1. Give it a version file and a changelog (`windows/VERSION`, `windows/CHANGELOG.md`).

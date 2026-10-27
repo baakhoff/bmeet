@@ -10,6 +10,12 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 ## [Unreleased]
 
 ### Added
+- **Updates from the app:** when a new release is out, the BMeet window and the panel widget say so, with **Update…** and **What's New**. Update opens a terminal window with the new release's installer, which asks for sudo there. In a terminal, `bmeet-ctl update` does the same, and `bmeet-ctl update --check` only looks.
+  - BMeet asks GitHub for its releases once a day, with no data about you or your use of BMeet. To turn it off: `echo off > ~/.config/bmeet/update-check`.
+  - An update keeps the options you installed with (`--no-speakers` and the like). The installer keeps them in `~/.local/share/bmeet/install-options`.
+  - It waits while a meeting is recorded or its speaker pass runs.
+  - A BMeet window that was open during an update offers **Restart**, so it runs the new version.
+  - Coming from 0.8.1, which has no update check: run the install line once.
 - **BMeet for macOS** lives in this repository now (`macos/`), with releases of its own (tags `macos-vX.Y.Z`) and its own changelog, [macos/CHANGELOG.md](macos/CHANGELOG.md). BMeet on Linux works as before.
 - **Releases, one platform at a time:** `release/release` sets a platform's version (`bump`), checks that it is ready, and tags it. GitHub Actions then runs all of CI on the tag and publishes the release, with its changelog section as the notes (`release-linux.yml`, `release-macos.yml`). How it works: [docs/releasing.md](docs/releasing.md).
 

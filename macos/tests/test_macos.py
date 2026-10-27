@@ -19,7 +19,8 @@ skip without it: swift build -c release --package-path macos)
 - bmeetmac's runtime folder.
 - bmeet-whisper itself (built, no models): its runtime folder, and it removes only its own socket
   and pid file when it ends.
-- bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket.
+- bmeet-ctl's commands to BMeet.app, with a stand-in for its control socket; its update check
+  (BMeet for macOS's own releases) and the Update button's Terminal window.
 - fetch-models (any system): a download that is cut off goes on from its .part, with a stand-in
   for curl.
 - prepare-coreml (any system with numpy): a compute plan that macOS cannot make (14.2, 14.3) is
@@ -768,6 +769,36 @@ class CtlToApp(unittest.TestCase):
         st = self.ctl.status()
         self.assertEqual((st["daemon"], st["dictation"], st["meeting"], st["device"]), ("active", "recording", "idle", "ANE"))
         self.assertEqual(st["languages"], ["en", "ru"])
+
+    def test_updates_of_this_system(self) -> None:
+        # BMeet for macOS's own release line: its macos-vX.Y.Z releases and macos/VERSION, not Linux's
+        from unittest import mock
+        mine = (MACOS / "VERSION").read_text().strip()
+        major, minor, patch = (int(x) for x in mine.split("."))
+        newer = f"{major}.{minor}.{patch + 1}"
+        (self.tmp / "releases.json").write_text(json.dumps([
+            {"tag_name": "v99.0.0", "draft": False, "prerelease": False, "html_url": "https://x/linux"},
+            {"tag_name": f"macos-v{newer}", "draft": False, "prerelease": False, "html_url": "https://x/mac"}]))
+        env = {"XDG_CACHE_HOME": str(self.tmp / "cache"), "XDG_DATA_HOME": str(self.tmp / "data"),
+               "BMEET_RELEASES_URL": (self.tmp / "releases.json").as_uri()}
+        os.environ.update(env)
+        os.environ.pop("BMEET_TERMINAL", None)
+        try:
+            ctl = load(REPO / "bmeet/bmeet-ctl", "bmeet_ctl_mac_update_test")
+            state = ctl.check_update()
+            self.assertEqual(ctl.update_info(state), {"version": newer, "tag": f"macos-v{newer}",
+                                                      "url": "https://x/mac", "installed": mine})
+            self.assertEqual(ctl.status()["update"]["tag"], f"macos-v{newer}")
+            # the Update button: Terminal runs it, from a .command file
+            with mock.patch.object(ctl.subprocess, "call", return_value=0) as call:
+                self.assertEqual(ctl.main(["update", "--terminal"]), 0)
+            script = self.tmp / "cache/bmeet/update.command"
+            call.assert_called_once_with(["open", str(script)])
+            self.assertTrue(os.access(script, os.X_OK))
+            self.assertIn(f"{REPO / 'bmeet/bmeet-ctl'} update;", script.read_text())
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
 
 
 # curl for fetch-models: serves SOURCE, and cuts off as many calls as CUTS says (half of what is

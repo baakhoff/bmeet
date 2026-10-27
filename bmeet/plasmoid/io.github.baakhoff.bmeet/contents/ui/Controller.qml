@@ -34,6 +34,9 @@ Item {
     property string model: ""
     property string device: ""
     property string statusError: ""
+    property string updateVersion: ""    // a newer release (bmeet-ctl's last check), "" = none
+    property string updateUrl: ""
+    property string updateHidden: ""     // the release "Later" hid
 
     // ---- bmeet-ctl recent ----------------------------------------------
     property var recentItems: []
@@ -245,6 +248,8 @@ Item {
         vn.nextLanguage = s.next_language || "";
         vn.model = s.model || "";
         vn.device = s.device || "";
+        vn.updateVersion = (s.update && s.update.version) || "";
+        vn.updateUrl = (s.update && s.update.url) || "";
         vn.haveStatus = true;
 
         // pause bookkeeping for the elapsed clock
@@ -395,6 +400,14 @@ Item {
         });
     }
 
+    // The newest release's installer, in a terminal window (it asks for sudo there).
+    function installUpdate() {
+        vn.act("update --terminal", "Opening the update", ok => {
+            if (ok)
+                vn.expandRequested(false);
+        });
+    }
+
     function openRecent(item) {
         if (item && item.kind === "meeting" && item.id)
             vn.openApp("meetings --id " + vn.shq(item.id));
@@ -483,6 +496,16 @@ Item {
         id: recentAgain
         interval: 5000
         onTriggered: vn.refreshRecent()
+    }
+
+    // A newer release? bmeet-ctl asks GitHub at most once a day (not with
+    // ~/.config/bmeet/update-check "off"); the next status shows what it found.
+    Timer {
+        interval: 6 * 3600 * 1000
+        running: vn.polling
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: vn.run("update --check --auto --json", () => vn.refreshStatus())
     }
 
     onExpandedChanged: {

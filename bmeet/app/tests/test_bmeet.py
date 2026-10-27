@@ -22,6 +22,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -106,6 +107,7 @@ def make_fixture() -> dict:
         'device = "NPU"\nlanguage = "en"\n')
     (WORK / "config/bmeet").mkdir()
     (WORK / "config/bmeet/languages").write_text("en de\n")
+    (WORK / "config/bmeet/update-check").write_text("off\n")   # (the window's own check: A_UpdateTests turn it on)
     ids = {k: str(uuid.uuid4()) for k in "ABCD"}
     t = {"A": epoch(2026, 10, 1, 10, 0, 5), "B": epoch(2026, 10, 2, 14, 30, 58),
          "C": epoch(2026, 10, 3, 9, 15, 0), "D": int(time.time()) - 125}
@@ -182,6 +184,10 @@ ENV = {
     "BMEET_SOCKET": str(WORK / "bmeet.sock"),
     "NPU_MODELS_DIR": NPU_MODELS,
     "BMEET_PLATFORM": "linux",   # (on a Mac too: these tests are the Linux window's, with fake voxtype)
+    # updates: never GitHub; curl reads these files instead (A_UpdateTests writes them)
+    "XDG_CACHE_HOME": str(WORK / "cache"),
+    "BMEET_RELEASES_URL": (WORK / "releases.json").as_uri(),
+    "BMEET_INSTALL_URL": (WORK / "install-{tag}.sh").as_uri().replace("%7B", "{").replace("%7D", "}"),
 }
 os.environ.update(ENV)
 os.environ.pop("XDG_ACTIVATION_TOKEN", None)
@@ -724,6 +730,158 @@ class A_DataTests(unittest.TestCase):
                 self.assertEqual(full_renders, [])   # only the end was redone
 
 
+# ============================================================================ updates
+
+def bump(version: str, part: int = 2) -> str:
+    v = [int(x) for x in version.split(".")]
+    v[part] += 1
+    return ".".join(map(str, v[:part + 1] + [0] * (2 - part)))
+
+
+class A_UpdateTests(unittest.TestCase):
+    """bmeet-ctl update: this system's newest release on GitHub (a file here), what it keeps, and
+    the installer it runs. The window's banner is in B_WindowTests."""
+
+    def setUp(self):
+        self.ctl = vn.ctl
+        self.installed = (REPO / "VERSION").read_text().strip()
+        self.next = bump(self.installed)
+        shutil.rmtree(WORK / "cache", ignore_errors=True)
+        (WORK / "config/bmeet/update-check").write_text("on\n")
+        (WORK / "data/bmeet").mkdir(parents=True, exist_ok=True)
+        self.releases([("v" + self.next, False, False), ("v" + self.installed, False, False)])
+
+    def tearDown(self):
+        (WORK / "config/bmeet/update-check").write_text("off\n")
+        (WORK / "run/meeting_state").write_text("idle\n")
+        shutil.rmtree(WORK / "cache", ignore_errors=True)
+        (WORK / "data/bmeet/install-options").unlink(missing_ok=True)
+
+    def releases(self, rows) -> None:
+        (WORK / "releases.json").write_text(json.dumps([
+            {"tag_name": tag, "draft": draft, "prerelease": pre, "html_url": f"https://example.org/{tag}",
+             "published_at": "2026-10-28T10:00:00Z"} for tag, draft, pre in rows]))
+
+    def ctl_run(self, *args, env=None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-I", str(CTL_PATH), *args], capture_output=True, text=True,
+                              timeout=60, env={**os.environ, **(env or {})})
+
+    def check_json(self, *extra) -> dict:
+        r = self.ctl_run("update", "--check", "--json", *extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_the_newest_release_of_this_system(self):
+        # another system's release, a draft and a pre-release are newer, and not for here
+        self.releases([("macos-v" + bump(self.next, 0), False, False), ("v" + bump(self.next, 1), True, False),
+                       ("v" + bump(self.next, 1), False, True), ("v" + self.installed, False, False),
+                       ("v" + self.next, False, False), ("vnot-a-version", False, False)])
+        first = self.check_json()
+        self.assertEqual(first["installed"], self.installed)
+        self.assertEqual(first["update"], {"version": self.next, "tag": "v" + self.next, "installed": self.installed,
+                                           "url": f"https://example.org/v{self.next}"})
+        self.assertTrue(first["new"])                       # BMeet.app says so once
+        self.assertFalse(self.check_json()["new"])
+        st = self.ctl.status()                             # the window and the widget: no network
+        self.assertEqual((st["version"], st["update"]["version"]), (self.installed, self.next))
+        r = self.ctl_run("update", "--check")
+        self.assertIn(f"BMeet {self.next} is available (this is {self.installed})", r.stdout)
+
+    def test_none_newer(self):
+        self.releases([("v" + self.installed, False, False), ("macos-v" + self.next, False, False)])
+        self.assertIsNone(self.check_json()["update"])
+        self.assertIsNone(self.ctl.status()["update"])
+        self.assertIn(f"BMeet {self.installed} is the newest release", self.ctl_run("update", "--check").stdout)
+        r = self.ctl_run("update")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("is the newest release", r.stdout)
+        # a check that saw a release, after the update to it: nothing left to show
+        (WORK / "cache/bmeet/update.json").write_text(json.dumps({
+            "platform": "linux", "latest": {"version": self.installed, "tag": "v" + self.installed}}))
+        self.assertIsNone(self.ctl.status()["update"])
+
+    def test_automatic_checks_wait(self):
+        missing = {"BMEET_RELEASES_URL": (WORK / "missing.json").as_uri()}
+        self.check_json()                                 # asked now: the answer is kept
+        r = self.ctl_run("update", "--check", "--auto", "--json", env=missing)
+        self.assertEqual((r.returncode, json.loads(r.stdout)["error"]), (0, None))     # a day to go: not asked
+        self.assertEqual(json.loads(r.stdout)["update"]["version"], self.next)
+        state = json.loads((WORK / "cache/bmeet/update.json").read_text())
+        state["tried"] -= 86400 + 5
+        (WORK / "cache/bmeet/update.json").write_text(json.dumps(state))
+        r = self.ctl_run("update", "--check", "--auto", "--json", env=missing)
+        answer = json.loads(r.stdout)
+        self.assertEqual(r.returncode, 0)                  # (the apps do not care; the next try says)
+        self.assertIn("cannot reach GitHub", answer["error"])
+        self.assertEqual(answer["update"]["version"], self.next)    # the last answer still holds
+        r = self.ctl_run("update", "--check", "--auto", "--json")   # an hour after a failed try
+        self.assertIsNone(json.loads(r.stdout)["error"])
+        self.assertFalse(json.loads((WORK / "cache/bmeet/update.json").read_text())["ok"])   # (not asked)
+        self.assertEqual(self.ctl_run("update", "--check", env=missing).returncode, 1)     # you asked: it says
+        # automatic checks off: never asked
+        shutil.rmtree(WORK / "cache")
+        (WORK / "config/bmeet/update-check").write_text("off\n")
+        r = self.ctl_run("update", "--check", "--auto", "--json")
+        self.assertIsNone(json.loads(r.stdout)["update"])
+        self.assertFalse((WORK / "cache/bmeet/update.json").exists())
+
+    def test_the_release_installer_with_the_kept_options(self):
+        log = WORK / "installer-args"
+        installer = WORK / f"install-v{self.next}.sh"
+        installer.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > {shlex.quote(str(log))}\n')
+        (WORK / "data/bmeet/install-options").write_text("--no-turbo\n--no-panel\nnot an option\n")
+        try:
+            r = self.ctl_run("update", "--", "--skip-system")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(f"Updating BMeet {self.installed} -> {self.next}", r.stdout)
+            self.assertEqual(log.read_text().split(), ["--no-turbo", "--no-panel", "--skip-system"])
+            log.unlink()
+            # not while a meeting is recorded, or its speaker pass runs (the installer restarts both)
+            (WORK / "run/meeting_state").write_text("recording\n")
+            r = self.ctl_run("update")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("a meeting is being recorded", r.stderr)
+            (WORK / "run/meeting_state").write_text("idle\n")
+            rec = WORK / "meeting-audio/2026-10-28_1000"
+            rec.mkdir(parents=True)
+            (rec / "speaker-pass").write_text("x.md\n")
+            r = self.ctl_run("update")
+            shutil.rmtree(WORK / "meeting-audio")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("telling the speakers", r.stderr)
+            self.assertFalse(log.exists())
+            # an installer that fails: its exit code
+            installer.write_text("#!/bin/bash\nexit 3\n")
+            self.assertEqual(self.ctl_run("update").returncode, 3)
+        finally:
+            installer.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+
+    def test_in_a_terminal(self):
+        args = WORK / "terminal-args"
+        term = WORK / "fake-terminal"
+        term.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > {shlex.quote(str(args))}\n')
+        term.chmod(0o755)
+        try:
+            r = self.ctl_run("update", "--terminal", env={"BMEET_TERMINAL": f"{term} -e"})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(wait_until(args.exists, 5))
+            got = args.read_text().splitlines()
+            self.assertEqual(got[:3], ["-e", "bash", "-c"])
+            self.assertIn(f"{CTL_PATH} update;", got[3])
+            self.assertIn("read -r -n 1", got[3])         # the window stays open at the end
+        finally:
+            args.unlink(missing_ok=True)
+            term.unlink(missing_ok=True)
+
+    def test_wrong_use(self):
+        for args in (["--bogus"], ["--json"], ["--terminal", "--check"], ["--check", "--", "--no-turbo"],
+                     ["--auto"]):
+            r = self.ctl_run("update", *args)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn("usage: bmeet-ctl update", r.stderr)
+
+
 # ============================================================================ window
 
 class B_WindowTests(unittest.TestCase):
@@ -758,6 +916,63 @@ class B_WindowTests(unittest.TestCase):
     def select(self, page, key):
         self.assertTrue(page.select_key(key), key)
         app.processEvents()
+
+    def test_update_banner(self):
+        """A newer release (bmeet-ctl's last check): the banner, its buttons, Later. A newer version
+        installed while the window runs: Restart, which opens the new window once this one is gone."""
+        w, b = self.win, self.win.update_banner
+        cache = WORK / "cache/bmeet/update.json"
+        installed = (REPO / "VERSION").read_text().strip()
+        new = bump(installed)
+        detached, opened = [], []
+        orig = vn.run_detached, vn.open_url, vn.__version__
+        vn.run_detached = lambda cmd: detached.append(cmd)
+        vn.open_url = lambda url: opened.append(url.toString())
+        try:
+            self.assertTrue(b.wrapper.isHidden())
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"platform": "linux", "latest": {
+                "version": new, "tag": f"v{new}", "url": f"https://example.org/v{new}"}}))
+            self.state()
+            self.assertFalse(b.wrapper.isHidden())
+            self.assertEqual(b.text.text(), f"BMeet {new} is available (you have {installed}).")
+            self.assertTrue(w.update_btn.isVisibleTo(b) and w.update_news_btn.isVisibleTo(b))
+            self.assertFalse(w.restart_btn.isVisibleTo(b))
+            w.update_news_btn.click()
+            self.assertEqual(opened, [f"https://example.org/v{new}"])
+            w.update_btn.click()
+            self.assertEqual(detached[-1][-3:], [str(vn.CTL_PATH), "update", "--terminal"])
+            w.hide_update()                                   # Later: not again for this release
+            self.state()
+            self.assertTrue(b.wrapper.isHidden())
+            cache.write_text(json.dumps({"platform": "linux", "latest": {
+                "version": bump(new), "tag": f"v{bump(new)}", "url": ""}}))
+            self.state()                                      # a newer one: shown again
+            self.assertFalse(b.wrapper.isHidden())
+            self.assertFalse(w.update_news_btn.isVisibleTo(b))   # (no release page)
+            cache.unlink()
+            self.state()
+            self.assertTrue(b.wrapper.isHidden())
+            # updated while it ran: this window is the old version
+            vn.__version__ = "0.0.1"
+            self.state()
+            self.assertFalse(b.wrapper.isHidden())
+            self.assertIn(f"BMeet {installed} is installed. Restart this window", b.text.text())
+            self.assertTrue(w.restart_btn.isVisibleTo(b))
+            self.assertFalse(w.update_btn.isVisibleTo(b))
+            w2 = vn.MainWindow()                              # Restart: the new window after this one
+            w2._restart = True
+            w2.shutdown()
+            sh = detached[-1]
+            self.assertEqual(sh[:2], ["/bin/sh", "-c"])
+            self.assertEqual(sh[4:], [str(os.getpid()), sys.executable, str(vn.CTL_PATH), w2.page()])
+            w2.deleteLater()
+        finally:
+            vn.run_detached, vn.open_url, vn.__version__ = orig
+            cache.unlink(missing_ok=True)
+            w._update_hidden = None
+            self.state()
+        self.assertTrue(b.wrapper.isHidden())
 
     # -- structure
     def test_01_pages_build(self):

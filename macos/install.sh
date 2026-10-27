@@ -52,14 +52,15 @@ main() {
     local LOG="$HOME/Library/Logs/BMeet/install.log"
 
     local languages="" turbo=1 speakers=1 gigaam=1 start=1 system=1
+    local keep=()   # the options an update keeps (bmeet-ctl update)
     while [ $# -gt 0 ]; do
         case "$1" in
             --languages) languages="${2:?--languages needs a value, e.g. \"en ru\"}"; shift ;;
-            --no-turbo) turbo= ;;
-            --no-speakers) speakers= ;;
-            --no-gigaam) gigaam= ;;
-            --no-start) start= ;;
-            --skip-system) system= ;;
+            --no-turbo) turbo=; keep+=("$1") ;;
+            --no-speakers) speakers=; keep+=("$1") ;;
+            --no-gigaam) gigaam=; keep+=("$1") ;;
+            --no-start) start=; keep+=("$1") ;;
+            --skip-system) system=; keep+=("$1") ;;
             --no-panel|--no-npu-driver|--reset-config|--force) ;;   # (Linux options: nothing to do here)
             --version) echo "BMeet installer $VERSION"; return 0 ;;
             -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; return 0 ;;
@@ -478,6 +479,7 @@ exec "$BIN/bmeet-ctl" open "\$@"
 EOF
     chmod 755 "$BIN/bmeet"
     ok "npu-transcribe, bmeet-ctl and bmeet in ~/.local/bin"
+    printf '%s\n' ${keep[@]+"${keep[@]}"} > "$ROOT/install-options"   # (bmeet-ctl update runs the next installer with them)
     local path_note=""
     case ":$PATH:" in *":$BIN:"*) ;; *) path_note=1 ;; esac
     local chrome
@@ -523,6 +525,8 @@ EOF
 
   ${B}Chrome${N} ${D}(leaves out what you say while muted in Meet and Slack): load it once at${N}
     chrome://extensions -> Developer mode -> Load unpacked -> ${src/#$HOME/~}/bmeet/chrome/extension
+
+  ${B}Updates${N}: BMeet's menu shows a new release (it asks GitHub once a day); or run  bmeet-ctl update
 
   ${D}Check: bash ${src/#$HOME/~}/macos/verify.sh   Uninstall: bash ${src/#$HOME/~}/uninstall.sh
   Log:   ${LOG/#$HOME/~}${N}

@@ -63,6 +63,8 @@ enum Settings {
     static var liveText: Bool { Paths.read(Paths.config.appendingPathComponent("live-dictation"), default: "on") != "off" }
     static var speakers: Bool { Paths.read(Paths.config.appendingPathComponent("speakers"), default: "on") == "on" }
     static var startAtLogin: Bool { Paths.read(Paths.config.appendingPathComponent("start-at-login"), default: "on") == "on" }
+    /// Look for a newer release once a day (bmeet-ctl update --check --auto): "on" (the default) or "off".
+    static var updateCheck: Bool { Paths.read(Paths.config.appendingPathComponent("update-check"), default: "on") != "off" }
 
     static func set(_ name: String, _ value: String) { Paths.write(value, to: Paths.config.appendingPathComponent(name)) }
 }

@@ -12,6 +12,10 @@ panel widget and app. Stdlib only, runs on the system python3.
   bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]
                                        (--in-person: microphone only, split by voice)
   bmeet-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
+  bmeet-ctl update [-- OPTIONS]        install the newest release for this system: its installer,
+                                       with the options BMeet was installed with (and OPTIONS)
+  bmeet-ctl update --check [--json]    only look for a newer release (asks GitHub)
+  bmeet-ctl update --terminal          `update` in a new terminal window (the apps' Update button)
   bmeet-ctl version
 
 Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid,meeting-toggle.started},
@@ -21,9 +25,17 @@ $XDG_RUNTIME_DIR/bmeet/meeting-audio/*/{speaker-pass,live.md},
 ~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
 Actions that can take long (meeting stop waits for the last chunk) run detached.
 
+Updates: each system has its own releases on GitHub (tags vX.Y.Z for Linux, macos-vX.Y.Z for
+macOS; docs/releasing.md). The apps run `update --check --auto` (asks GitHub at most once a day;
+not with ~/.config/bmeet/update-check "off"); the answer is kept in ~/.cache/bmeet/update.json,
+and `status` shows it as "update" without asking again. The installers keep the options they
+were run with in ~/.local/share/bmeet/install-options.
+
 Path overrides for testing (env): BMEET_RUN_DIR, BMEET_AUDIO_DIR, BMEET_MEETING_DB,
 VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP, BMEET_RUNTIME_DIR (bmeet-dictate's),
-BMEET_DICTATE_START (how to start bmeet-dictate when it is not running).
+BMEET_DICTATE_START (how to start bmeet-dictate when it is not running), BMEET_RELEASES_URL,
+BMEET_INSTALL_URL ({tag} in it: the release's tag), BMEET_TERMINAL (the terminal for
+`update --terminal`, e.g. "kitty -e").
 
 On macOS there is no voxtype: BMeet.app (macos/BMeetApp) dictates, and macos/bmeet-meeting
 records meetings. bmeet-ctl reads their state from the same file names in
@@ -35,9 +47,12 @@ $XDG_RUNTIME_DIR/bmeet (your temp folder; see macos/bmeetmac.py), the meetings f
 import json
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -75,6 +90,15 @@ LIVE_DICTATION = XDG_CONFIG / "bmeet/live-dictation"
 DICTATE = Path(__file__).resolve().parent / "dictate" / "bmeet-dictate"
 DICTATE_SOCKET = Path(os.environ.get("BMEET_RUNTIME_DIR")
                       or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "bmeet") / "dictate.sock"
+# Updates: this system's release line (docs/releasing.md) and its releases on GitHub.
+REPO = "baakhoff/bmeet"
+PLATFORM, TAG_PREFIX, PRODUCT = ("macos", "macos-v", "BMeet for macOS") if MAC else ("linux", "v", "BMeet")
+RELEASES_URL = os.environ.get("BMEET_RELEASES_URL") or f"https://api.github.com/repos/{REPO}/releases?per_page=100"
+INSTALL_URL = os.environ.get("BMEET_INSTALL_URL") or f"https://raw.githubusercontent.com/{REPO}/{{tag}}/install.sh"
+VERSION_FILE = Path(__file__).resolve().parents[1] / ("macos/VERSION" if MAC else "VERSION")
+UPDATE_FILE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "bmeet/update.json"   # the last check
+UPDATE_SWITCH = XDG_CONFIG / "bmeet/update-check"   # "off": no automatic checks
+INSTALL_OPTIONS = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "bmeet/install-options"
 
 
 def read_first_line(path: Path, default: str = "") -> str:
@@ -319,6 +343,8 @@ def status() -> dict:
         "languages": languages(),
         "model": Path(ov.get("model", "")).name or None,
         "device": ov.get("device"),
+        "version": installed_version(),   # (newer than a running window's after an update)
+        "update": update_info(),
     }
 
 
@@ -474,6 +500,203 @@ def mac_main(cmd: str, args: list[str]) -> int | None:
     return None
 
 
+class UpdateError(Exception):
+    pass
+
+
+def version_key(version: str) -> tuple[int, ...] | None:
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(version).strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def newer(version: str, than: str) -> bool:
+    a, b = version_key(version), version_key(than)
+    return a is not None and b is not None and a > b
+
+
+def installed_version() -> str:
+    """The version on disk: after an update, newer than that of a program already running."""
+    return read_first_line(VERSION_FILE, __version__)
+
+
+def load_update() -> dict:
+    try:
+        state = json.loads(UPDATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) and state.get("platform") == PLATFORM else {}
+
+
+def save_update(state: dict) -> None:
+    UPDATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UPDATE_FILE.with_name(f"{UPDATE_FILE.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({**state, "platform": PLATFORM}) + "\n")
+    tmp.replace(UPDATE_FILE)
+
+
+def latest_release() -> dict | None:
+    """This system's newest release on GitHub (published: not a draft or a pre-release; CI passed
+    before it was published): {version, tag, url, date}, or None when it has none yet."""
+    try:
+        r = subprocess.run(["curl", "-fsSL", "--max-time", "20", "-H", "Accept: application/vnd.github+json",
+                            RELEASES_URL], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UpdateError(f"cannot ask GitHub: {exc}") from None
+    if r.returncode != 0:
+        why = r.stderr.strip().splitlines()
+        raise UpdateError(f"cannot reach GitHub ({why[-1] if why else f'curl exit code {r.returncode}'})")
+    try:
+        releases = json.loads(r.stdout)
+    except ValueError:
+        raise UpdateError("GitHub's answer is not readable") from None
+    best = None
+    for rel in releases if isinstance(releases, list) else []:
+        tag = str(rel.get("tag_name") or "") if isinstance(rel, dict) else ""
+        if not tag.startswith(TAG_PREFIX) or rel.get("draft") or rel.get("prerelease"):
+            continue   # (another system's release: "macos-v..." does not start with "v")
+        version = tag[len(TAG_PREFIX):]
+        if version_key(version) and (best is None or newer(version, best["version"])):
+            best = {"version": version, "tag": tag, "url": str(rel.get("html_url") or ""),
+                    "date": str(rel.get("published_at") or "")[:10]}
+    return best
+
+
+def check_update(auto: bool = False) -> dict:
+    """Ask GitHub for this system's newest release, and keep the answer (UPDATE_FILE). auto: only
+    when it is due - a day after the last answer, an hour after a try that failed - and the
+    automatic checks are on. The state it keeps; "new": this check is the first to see a release
+    newer than the installed version (BMeet.app says so once)."""
+    state, now = load_update(), time.time()
+    if auto:
+        wait = 86400 if state.get("ok") else 3600
+        if read_first_line(UPDATE_SWITCH, "on").lower() == "off" or 0 <= now - state.get("tried", 0) < wait:
+            return {**state, "new": False}
+    state["tried"] = now
+    save_update(state)   # (an automatic check meanwhile waits)
+    try:
+        latest = latest_release()
+    except UpdateError as exc:
+        state.update(ok=False, error=str(exc))
+        save_update(state)
+        raise
+    state.update(ok=True, error=None, checked=now, latest=latest)
+    new = bool(latest) and newer(latest["version"], installed_version()) and state.get("announced") != latest["version"]
+    if new:
+        state["announced"] = latest["version"]
+    save_update(state)
+    return {**state, "new": new}
+
+
+def update_info(state: dict | None = None) -> dict | None:
+    """From the last check (no network): the newest release when it is newer than the installed
+    version - {version, tag, url, installed} - else None."""
+    latest = (load_update() if state is None else state).get("latest")
+    installed = installed_version()
+    if not isinstance(latest, dict) or not newer(str(latest.get("version")), installed) \
+            or not str(latest.get("tag", "")).startswith(TAG_PREFIX):
+        return None
+    return {"version": latest["version"], "tag": latest["tag"], "url": latest.get("url") or "", "installed": installed}
+
+
+def update_blocked() -> str | None:
+    """Why an update has to wait, or None: the installer restarts what records and transcribes."""
+    if read_first_line(RUN / "meeting_state", "idle") in ("recording", "paused"):
+        return "a meeting is being recorded: stop it first"
+    if speakers_pending():
+        return "BMeet is telling the speakers of a meeting apart: wait until it is done"
+    return None
+
+
+def install_options() -> list[str]:
+    """What BMeet was installed with that an update keeps (--no-speakers, ...; the installers
+    write the file)."""
+    try:
+        return [o for o in INSTALL_OPTIONS.read_text().split() if re.fullmatch(r"--[a-z-]+", o)]
+    except OSError:
+        return []
+
+
+def run_update(extra: list[str]) -> int:
+    """`update`: the newest release's installer, as you would run it yourself (it shows its steps
+    and, on Linux, asks for sudo), with the options BMeet was installed with."""
+    try:
+        check_update()
+    except UpdateError as exc:
+        print(f"bmeet-ctl: {exc}", file=sys.stderr)
+        return 1
+    if not (upd := update_info()):
+        print(f"{PRODUCT} {installed_version()} is the newest release.")
+        return 0
+    if why := update_blocked():
+        print(f"bmeet-ctl: {why}, then update (bmeet-ctl update).", file=sys.stderr)
+        return 1
+    options = install_options() + extra
+    print(f"Updating {PRODUCT} {upd['installed']} -> {upd['version']}"
+          + (f" (installer options: {' '.join(options)})" if options else ""))
+    if upd["url"]:
+        print(f"What's new: {upd['url']}")
+    sys.stdout.flush()
+    # The release's own install.sh, as the README's one line runs main's: it downloads the release
+    # and hands over to its installer (macos/install.sh on a Mac).
+    script = 'set -o pipefail; curl -fsSL "$1" | bash -s -- "${@:2}"'
+    return subprocess.call(["bash", "-c", script, "bash", INSTALL_URL.format(tag=upd["tag"]), *options])
+
+
+TERMINALS = (["xdg-terminal-exec"], ["konsole", "-e"], ["gnome-terminal", "--"], ["ptyxis", "--"], ["kgx", "--"],
+             ["xfce4-terminal", "-x"], ["x-terminal-emulator", "-e"], ["xterm", "-e"])
+
+
+def update_in_terminal() -> int:
+    """`update --terminal`: `bmeet-ctl update` in a new terminal window, which stays open at the
+    end (the installer asks there: sudo on Linux, Homebrew on a Mac)."""
+    cmd = (f"{shlex.quote(sys.executable)} -I {shlex.quote(str(Path(__file__).resolve()))} update; "
+           "echo; read -r -n 1 -s -p 'Press any key to close this window.'")
+    terminal = shlex.split(os.environ.get("BMEET_TERMINAL", ""))
+    if MAC and not terminal:   # (Terminal, or the app you open .command files with)
+        script = UPDATE_FILE.with_name("update.command")
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f"#!/bin/bash\nclear\n{cmd}\n")
+        script.chmod(0o700)
+        return subprocess.call(["open", str(script)])
+    terminal = terminal or next((t for t in TERMINALS if shutil.which(t[0])), [])
+    if not terminal:
+        print("bmeet-ctl: no terminal found: run  bmeet-ctl update  in one", file=sys.stderr)
+        return 1
+    detached(*terminal, "bash", "-c", cmd)
+    return 0
+
+
+def update_main(args: list[str]) -> int:
+    flags, extra = (args[:args.index("--")], args[args.index("--") + 1:]) if "--" in args else (args, [])
+    if any(f not in ("--check", "--json", "--auto", "--terminal") for f in flags) \
+            or ("--terminal" in flags and (len(flags) > 1 or extra)) or ("--check" in flags and extra) \
+            or (("--json" in flags or "--auto" in flags) and "--check" not in flags):
+        print("usage: bmeet-ctl update [-- INSTALLER OPTIONS] | update --check [--json] [--auto] | update --terminal",
+              file=sys.stderr)
+        return 2
+    if "--terminal" in flags:
+        return update_in_terminal()
+    if "--check" not in flags:
+        return run_update(extra)
+    error = None
+    try:
+        state = check_update(auto="--auto" in flags)
+    except UpdateError as exc:
+        state, error = {"new": False}, str(exc)
+    upd = update_info(None if error else state)
+    if "--json" in flags:
+        print(json.dumps({"installed": installed_version(), "update": upd, "new": state.get("new", False),
+                          "error": error}))
+    elif error:
+        print(f"bmeet-ctl: {error}", file=sys.stderr)
+    elif upd:
+        print(f"{PRODUCT} {upd['version']} is available (this is {upd['installed']}): {upd['url']}\n"
+              "Update: bmeet-ctl update")
+    else:
+        print(f"{PRODUCT} {installed_version()} is the newest release.")
+    return 1 if error and "--auto" not in flags else 0
+
+
 def main(argv: list[str]) -> int:
     cmd, args = (argv[0], argv[1:]) if argv else ("status", [])
     if MAC and (code := mac_main(cmd, args)) is not None:
@@ -511,6 +734,8 @@ def main(argv: list[str]) -> int:
             return 2
     elif cmd == "open":
         detached(str(APP), *args)
+    elif cmd == "update":
+        return update_main(args)
     elif cmd in ("version", "--version"):
         print(f"bmeet-ctl {__version__}")
     else:

@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var recent: [[String: Any]] = []
     private weak var recentMenu: NSMenu?    // the Recent Transcripts submenu of the menu last shown
     private var timer: Timer?
+    private var updateTimer: Timer?
     private var pidWritten = Date.distantPast
     /// Quit without asking about a meeting: SIGTERM (main.swift), logging out, a second BMeet.app.
     var quitWithoutAsking = false
@@ -66,6 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         schedulePoll()
         poll()
         loadRecent()
+        // A newer release? bmeet-ctl asks GitHub at most once a day (not with ~/.config/bmeet/update-check
+        // "off"); looked at a while after login, then every 6 hours
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.checkUpdate(auto: true) }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            self?.checkUpdate(auto: true)
+        }
     }
 
     /// Quitting BMeet does not stop a meeting: its recorder would go on, without the menu bar
@@ -329,6 +336,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let i = add("Telling speakers apart…", "person.2.wave.2", nil, nil)
             i.isEnabled = false
         }
+        if let update = status["update"] as? [String: Any], let version = update["version"] as? String {
+            add("Update to BMeet \(version)…", "arrow.down.circle", nil, #selector(menuUpdate))
+        }
         menu.addItem(.separator())
         if dictation.state == .recording {
             add("Stop Dictation", "stop.circle", "dictate", #selector(menuDictate))
@@ -383,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             Settings.set("start-at-login", on ? "on" : "off")
             self?.loginItem()
         }
+        toggleItem(ssub, "Check for Updates Automatically", Settings.updateCheck) { Settings.set("update-check", $0 ? "on" : "off") }
         ssub.addItem(.separator())
         let ax = NSMenuItem(title: AXIsProcessTrusted() ? "Pasting Allowed" : "Allow Pasting (Accessibility)…",
                             action: AXIsProcessTrusted() ? nil : #selector(menuAccessibility), keyEquivalent: "")
@@ -396,6 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         ssub.addItem(folder)
         settings.submenu = ssub
         menu.addItem(.separator())
+        add("Check for Updates…", nil, nil, #selector(menuCheckUpdate))
         add("About BMeet", nil, nil, #selector(menuAbout))
         let quit = NSMenuItem(title: "Quit BMeet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
@@ -482,6 +494,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
     @objc private func menuTranscribeFile() { openWindow(["transcribe"]) }
     @objc private func menuToggle(_ sender: NSMenuItem) { toggles[sender]?(sender.state != .on) }
+    @objc private func menuCheckUpdate() { checkUpdate(auto: false) }
+    /// The update runs in Terminal (`bmeet-ctl update --terminal`): the installer quits BMeet and
+    /// opens the new one at the end, and it may ask there (Homebrew, the Command Line Tools).
+    @objc private func menuUpdate() {
+        run(Paths.python, ["-I", Paths.ctl.path, "update", "--terminal"], log: "update.log") { _ in }
+    }
     @objc private func menuSettingsFolder() {
         try? FileManager.default.createDirectory(at: Paths.config, withIntermediateDirectories: true)
         NSWorkspace.shared.open(Paths.config)
@@ -557,6 +575,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
         } catch {
             NSLogLine("start at login: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: updates
+
+    /// bmeet-ctl looks for a newer release of BMeet for macOS on GitHub (`auto`: when it is due).
+    /// The menu shows one from the status; a notification says so once per release, and every
+    /// time you asked (Check for Updates…), with what it found.
+    private func checkUpdate(auto: Bool) {
+        run(Paths.python, ["-I", Paths.ctl.path, "update", "--check", "--json"] + (auto ? ["--auto"] : []),
+            capture: true) { [weak self] out in
+            guard let self else { return }
+            var answer: [String: Any]?
+            if let data = out?.data(using: .utf8) {
+                answer = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            }
+            let version = (answer?["update"] as? [String: Any])?["version"] as? String
+            if auto {
+                if let version, answer?["new"] as? Bool == true {
+                    self.post("BMeet \(version) is available", "Update from BMeet's menu (the microphone in the menu bar).")
+                }
+            } else if let answer, answer["error"] as? String == nil {
+                if let version {
+                    self.post("BMeet \(version) is available", "Choose Update to BMeet \(version)… in BMeet's menu.")
+                } else {
+                    self.post("BMeet is up to date", "BMeet \(answer["installed"] as? String ?? "") is the newest release.")
+                }
+            } else {
+                self.post("Could not look for updates", answer?["error"] as? String ?? "bmeet-ctl did not answer")
+            }
+            self.poll()
         }
     }
 

@@ -106,7 +106,11 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 
 **From a checkout:** run `git clone https://github.com/baakhoff/bmeet && cd bmeet && ./install.sh`.
 
-**Upgrading:** run the same command again. The installer is idempotent and keeps your settings.
+**Updating:** when a new release is out, the BMeet window and the panel widget say so, with an **Update…** button. It opens a terminal window that runs the new release's installer, which asks for your sudo password there. In a terminal, `bmeet-ctl update` does the same, and `bmeet-ctl update --check` only looks.
+- **Your options are kept:** an update uses the options you installed with (`--no-turbo`, `--no-speakers`, `--no-gigaam`, `--no-panel`, `--no-npu-driver`, `--force`). For one-time options, add them after `--`, as in `bmeet-ctl update -- --skip-system`.
+- **Your settings are kept,** and models already downloaded are not downloaded again.
+- **Not during a meeting:** an update waits until no meeting is being recorded and no speaker pass is running.
+- **Running the same command again** also works: it installs the newest release.
 
 ## Use
 
@@ -167,6 +171,7 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 ## Privacy
 
 - **Local only:** audio is transcribed on your machine, and nothing is uploaded.
+- **Update check:** once a day, BMeet asks GitHub for the list of its releases, a plain request with no data about you or your use of BMeet. GitHub sees your IP address, as with any website. To turn it off: `echo off > ~/.config/bmeet/update-check` (`bmeet-ctl update` still works).
 - **Meetings:** only the text is stored.
   - To tell the speakers apart, the meeting audio is recorded into RAM (`$XDG_RUNTIME_DIR`, a tmpfs; ~230 MB per hour) while the meeting runs. It is deleted as soon as the speaker pass ends, whether it succeeds, fails or is stopped. A logout or reboot clears it too.
   - Nothing is recorded while a meeting is paused.

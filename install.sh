@@ -79,17 +79,18 @@ main() {
 
     # --- options -------------------------------------------------------------------
     local languages="" turbo=1 speakers=1 gigaam=1 panel=1 system=1 system_args=() reset_config="" args=("$@")
+    local keep=()   # the options an update keeps (bmeet-ctl update): not the one-time ones
     while [ $# -gt 0 ]; do
         case "$1" in
             --languages) languages="${2:?--languages needs a value, e.g. \"en de\"}"; shift ;;
-            --no-turbo) turbo= ;;
-            --no-speakers) speakers= ;;
-            --no-gigaam) gigaam= ;;
-            --no-panel) panel= ;;
-            --no-npu-driver) system_args+=(--no-npu-driver) ;;
+            --no-turbo) turbo=; keep+=("$1") ;;
+            --no-speakers) speakers=; keep+=("$1") ;;
+            --no-gigaam) gigaam=; keep+=("$1") ;;
+            --no-panel) panel=; keep+=("$1") ;;
+            --no-npu-driver) system_args+=(--no-npu-driver); keep+=("$1") ;;
             --skip-system) system= ;;
             --reset-config) reset_config=--reset-config ;;
-            --force) system_args+=(--force) ;;
+            --force) system_args+=(--force); keep+=("$1") ;;
             --version) echo "BMeet installer $VERSION"; return 0 ;;
             -h|--help)
                 if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,28p' "${BASH_SOURCE[0]}"
@@ -347,6 +348,9 @@ with open(sys.argv[2], "wb") as f:
         echo "  removed $old_root (BMeet replaces it; your settings and transcripts were moved or kept)"
     fi
 
+    # bmeet-ctl update runs the next release's installer with these
+    printf '%s\n' ${keep[@]+"${keep[@]}"} > "$ROOT/install-options"
+
     # --- done --------------------------------------------------------------------------
     say "Done - BMeet $version"
     cat <<EOF
@@ -363,6 +367,7 @@ with open(sys.argv[2], "wb") as f:
                   $src/bmeet/chrome/extension
 
   Check the setup:  bash $src/voxtype/verify.sh
+  Update:           bmeet-ctl update   (or Update in the BMeet window or the panel widget)
   Uninstall:        bash $src/uninstall.sh
   If a shortcut does nothing, log out and in once.
 EOF

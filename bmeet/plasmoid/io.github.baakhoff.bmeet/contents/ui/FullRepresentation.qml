@@ -121,6 +121,32 @@ PlasmaExtras.Representation {
 
         Kirigami.InlineMessage {
             Layout.fillWidth: true
+            visible: full.app.updateVersion !== "" && full.app.updateVersion !== full.app.updateHidden
+            type: Kirigami.MessageType.Information
+            text: "BMeet " + full.app.updateVersion + " is available."
+            actions: [
+                Kirigami.Action {
+                    icon.name: "system-software-update"
+                    text: "Update…"
+                    tooltip: "Opens a terminal window that installs it (bmeet-ctl update)"
+                    onTriggered: full.app.installUpdate()
+                },
+                Kirigami.Action {
+                    icon.name: "help-about"
+                    text: "What's New"
+                    visible: full.app.updateUrl !== ""
+                    onTriggered: Qt.openUrlExternally(full.app.updateUrl)
+                },
+                Kirigami.Action {
+                    icon.name: "dialog-close"
+                    text: "Later"
+                    onTriggered: full.app.updateHidden = full.app.updateVersion
+                }
+            ]
+        }
+
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
             visible: full.app.mode === "off"
             type: Kirigami.MessageType.Warning
             text: "The voxtype dictation service is not running, so dictation and meetings are unavailable.\n"

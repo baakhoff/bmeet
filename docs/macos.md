@@ -51,7 +51,7 @@ What it needs and what it does:
   - the Core ML versions of GigaAM and the speaker models (`macos/prepare-coreml`, a few minutes).
 - **Warms up:** macOS compiles each model for the Neural Engine the first time it is loaded (Whisper turbo: about 2 minutes on an M1). The installer does that once at the end, so the first dictation does not wait.
 
-Options are the Linux ones that apply: `--languages "en ru"`, `--no-turbo`, `--no-speakers`, `--no-gigaam`, plus `--no-start` (do not start BMeet.app, and not at login) and `--skip-system` (no Homebrew packages). **Upgrade:** run the installer again. **Uninstall:** `bash ~/.local/share/bmeet/src/uninstall.sh` (`--purge` also deletes the models).
+Options are the Linux ones that apply: `--languages "en ru"`, `--no-turbo`, `--no-speakers`, `--no-gigaam`, plus `--no-start` (do not start BMeet.app, and not at login) and `--skip-system` (no Homebrew packages). **Update:** when a new release of BMeet for macOS is out, BMeet's menu shows **Update to BMeet X…**, and a notification says so once. It opens Terminal with the new release's installer, which uses the options you installed with. BMeet asks GitHub once a day; *Settings → Check for Updates Automatically* turns that off, and *Check for Updates…* asks now. In Terminal: `bmeet-ctl update` (or `--check` to only look). Running the install line again works too. **Uninstall:** `bash ~/.local/share/bmeet/src/uninstall.sh` (`--purge` also deletes the models).
 
 ### Permissions
 

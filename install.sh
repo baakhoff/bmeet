@@ -35,8 +35,8 @@ main() {
     set -euo pipefail
 
     # Each platform is released on its own (docs/releasing.md); release/release bump sets these.
-    local VERSION=0.8.1
-    local MACOS_VERSION=0.9.0
+    local VERSION=0.8.2
+    local MACOS_VERSION=0.9.1
     local REPO=baakhoff/bmeet
     local data="${XDG_DATA_HOME:-$HOME/.local/share}"
     local ROOT="$data/bmeet"

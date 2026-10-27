@@ -48,7 +48,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 PROG = "bmeet-dictate"
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()

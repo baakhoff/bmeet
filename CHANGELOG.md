@@ -7,7 +7,7 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.2] - 2026-10-27
 
 ### Added
 - **Updates from the app:** when a new release is out, the BMeet window and the panel widget say so, with **Update…** and **What's New**. Update opens a terminal window with the new release's installer, which asks for sudo there. In a terminal, `bmeet-ctl update` does the same, and `bmeet-ctl update --check` only looks.
@@ -240,7 +240,8 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
-[Unreleased]: https://github.com/baakhoff/bmeet/compare/v0.8.1...main
+[Unreleased]: https://github.com/baakhoff/bmeet/compare/v0.8.2...main
+[0.8.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.2
 [0.8.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.1
 [0.8.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.0
 [0.7.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.7.1

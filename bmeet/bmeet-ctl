@@ -56,7 +56,7 @@ import time
 import tomllib
 from pathlib import Path
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 MAC = sys.platform == "darwin" and os.environ.get("BMEET_PLATFORM") != "linux"   # (tests: Linux on a Mac)
 if MAC:

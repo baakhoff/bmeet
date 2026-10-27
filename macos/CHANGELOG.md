@@ -7,7 +7,7 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.9.0] - 2026-10-20
+## [0.9.0] - 2026-10-27
 
 BMeet on Macs with Apple silicon: everything it does on Linux, with the models on the Neural Engine. The first release of BMeet for macOS.
 

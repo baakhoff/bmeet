@@ -345,6 +345,17 @@ class Languages(Base):
         self.assertEqual(self.f.get("languages"), "en")
         self.assertEqual(self.f.get("language"), "en")
 
+    def test_the_dictation_language_is_always_one_that_is_on(self) -> None:
+        # a language file naming one that is off (by hand, or `bmeet-ctl lang de`): BMeet dictates
+        # in the first one that is on, as bmeet-ctl status says, and so with no file at all
+        self.f.set("languages", "ru en")
+        self.f.set("language", "de")
+        self.assertEqual(self.f.act("page:languages")["dictation_language"], "ru")
+        (self.f.config / "language").unlink()
+        self.assertEqual(self.f.act("page:languages")["dictation_language"], "ru")
+        self.f.set("language", "EN")
+        self.assertEqual(self.f.act("page:languages")["dictation_language"], "en")
+
     def test_one_turned_on_goes_last_and_can_be_chosen(self) -> None:
         self.f.set("languages", "en ru")
         self.f.set("language", "ru")

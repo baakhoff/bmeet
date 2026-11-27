@@ -71,7 +71,14 @@ enum Settings {
     static func file(_ name: String) -> URL { Paths.config.appendingPathComponent(name) }
     static func word(_ name: String, default value: String) -> String { Paths.read(file(name), default: value) }
 
-    static var language: String { word("language", default: "en") }
+    /// The current dictation language, always one of `languages`: the first of them while the file
+    /// names none of them (missing, written by hand, or a `bmeet-ctl lang` to one that is off), as
+    /// bmeet-ctl reads it too.
+    static var language: String {
+        let on = languages
+        let chosen = word("language", default: on[0]).lowercased()
+        return on.contains(chosen) ? chosen : on[0]
+    }
     static var languages: [String] {
         let words = word("languages", default: "en")
             .replacingOccurrences(of: ",", with: " ").split(separator: " ").map { $0.lowercased() }
@@ -109,7 +116,7 @@ enum Settings {
         let on = codes.filter { seen.insert($0).inserted }
         guard !on.isEmpty else { return }
         set("languages", on.joined(separator: " "))
-        if !on.contains(language) { set("language", on[0]) }
+        if !on.contains(word("language", default: "").lowercased()) { set("language", on[0]) }
     }
 
     /// Everything BMeet.app follows, read at once: compared with the last reading, it says what

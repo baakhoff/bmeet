@@ -4,7 +4,8 @@
 // for other languages, both on the Neural Engine), which takes commands on stdin and tells the
 // text as it changes on stdout. It runs as BMeet.app's child, so its recorder (bmeet-record,
 // the microphone) is part of BMeet for macOS's permission. It stays loaded between dictations
-// and exits after ENGINE_IDLE without one (memory on an 8 GB Mac).
+// and is ended after ~/.config/bmeet/unload-after minutes without one (Settings → General →
+// Free memory after; 0: right after each dictation), and when dictation is turned off.
 //
 // While you speak, a small panel at the bottom of the screen shows the words (underlined while
 // they may still change); it never takes the keyboard focus, so the text goes where you were
@@ -17,7 +18,6 @@ import ApplicationServices
 import AVFoundation
 import Foundation
 
-let ENGINE_IDLE: TimeInterval = 15 * 60
 let MAX_DICTATION: TimeInterval = 5 * 60     // as voxtype: a forgotten dictation ends by itself
 
 final class Dictation {
@@ -44,6 +44,9 @@ final class Dictation {
 
     init() { writeState() }
 
+    /// How often the panel was shown (or would have been, in a check).
+    var panelShown: Int { panel.shown }
+
     private func writeState() {
         Paths.write(state.rawValue, to: Paths.runtime.appendingPathComponent("state"))
     }
@@ -63,9 +66,9 @@ final class Dictation {
         Microphone.ask { [weak self] allowed in
             guard let self else { return }
             guard allowed else {
-                self.notify("Dictation needs the microphone",
-                            "Allow BMeet in System Settings → Privacy & Security → Microphone.")
-                NSWorkspace.shared.open(Microphone.settings)
+                self.notify(L("Dictation needs the microphone"),
+                            L("Allow BMeet in System Settings → Privacy & Security → Microphone."))
+                if !Checks.active { NSWorkspace.shared.open(Microphone.settings) }
                 return
             }
             self.record(clipboard: clipboard)
@@ -81,7 +84,7 @@ final class Dictation {
         if engine?.isRunning != true, !startEngine() { return }
         send(["start": ["language": language]])   // (the engine switches models when the language changes)
         state = .recording
-        panel.show(final: "", draft: "", status: "Listening…", live: Settings.liveText)
+        panel.show(final: "", draft: "", listening: true, live: Settings.liveText)
         idleTimer?.invalidate()
         maxTimer?.invalidate()
         maxTimer = Timer.scheduledTimer(withTimeInterval: MAX_DICTATION, repeats: false) { [weak self] _ in self?.stop() }
@@ -92,7 +95,7 @@ final class Dictation {
         maxTimer?.invalidate()
         send(["stop": [:]])
         state = .transcribing
-        panel.show(final: final, draft: draft, status: "Transcribing…", live: Settings.liveText)
+        panel.show(final: final, draft: draft, listening: false, live: Settings.liveText)
     }
 
     func cancel() {
@@ -106,8 +109,19 @@ final class Dictation {
         maxTimer?.invalidate()
         panel.hide()
         state = .idle
+        scheduleIdle()
+    }
+
+    /// The engine (and its model) goes after unload-after minutes without a dictation; with 0, now.
+    func scheduleIdle() {
         idleTimer?.invalidate()
-        idleTimer = Timer.scheduledTimer(withTimeInterval: ENGINE_IDLE, repeats: false) { [weak self] _ in
+        guard state == .idle, engine != nil else { return }
+        let idle = TimeInterval(Settings.unloadAfter * 60)
+        if idle == 0 {
+            stopEngine()
+            return
+        }
+        idleTimer = Timer.scheduledTimer(withTimeInterval: idle, repeats: false) { [weak self] _ in
             self?.stopEngine()
         }
     }
@@ -158,7 +172,7 @@ final class Dictation {
                 try? self.input?.close()
                 self.input = nil
                 if self.state != .idle {
-                    self.notify("Dictation stopped", "The speech engine ended (see ~/Library/Logs/BMeet/dictation.log)")
+                    self.notify(L("Dictation stopped"), L("The speech engine ended (see ~/Library/Logs/BMeet/dictation.log)."))
                     self.finish()
                 }
             }
@@ -171,7 +185,7 @@ final class Dictation {
         } catch {
             stdout.fileHandleForReading.readabilityHandler = nil
             input = nil
-            notify("Dictation failed", "Could not start npu-transcribe: \(error.localizedDescription)")
+            notify(L("Dictation failed"), L("Could not start npu-transcribe: %@", error.localizedDescription))
             return false
         }
     }
@@ -207,7 +221,7 @@ final class Dictation {
             return
         }
         if let error = ev["error"] as? String {
-            notify("Dictation failed", error)
+            notify(L("Dictation failed"), error)
             finish()
         } else if ev["done"] != nil {
             guard state == .transcribing else { return }   // (nobody waits for this text any more)
@@ -220,8 +234,7 @@ final class Dictation {
             final = f
             draft = ev["draft"] as? String ?? ""
             if state != .idle {
-                panel.show(final: final, draft: draft, status: state == .recording ? "Listening…" : "Transcribing…",
-                           live: Settings.liveText)
+                panel.show(final: final, draft: draft, listening: state == .recording, live: Settings.liveText)
             }
         }
     }
@@ -229,11 +242,12 @@ final class Dictation {
     // MARK: the text into the app you were in
 
     private func deliver(_ text: String) {
+        guard !Checks.active else { return }   // (a check's stand-in engine hears nothing; still, never the clipboard)
         let board = NSPasteboard.general
         if clipboardOnly {
             board.clearContents()
             board.setString(text, forType: .string)
-            notify("Dictation copied", String(text.prefix(120)))
+            notify(L("Dictation copied"), String(text.prefix(120)))
             return
         }
         guard AXIsProcessTrusted() else {
@@ -241,7 +255,8 @@ final class Dictation {
             board.setString(text, forType: .string)
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
-            notify("Dictation copied: press ⌘V", "To paste by itself, allow BMeet in System Settings → Privacy & Security → Accessibility.")
+            notify(L("Dictation copied: press ⌘V"),
+                   L("To paste by itself, allow BMeet in System Settings → Privacy & Security → Accessibility."))
             return
         }
         Paste.paste(text)
@@ -404,11 +419,17 @@ final class DictationPanel {
         return panel
     }
 
-    func show(final: String, draft: String, status text: String, live: Bool) {
+    /// A check never shows it: it only counts how often it would have been shown.
+    static var offScreen = false
+    private(set) var shown = 0
+
+    func show(final: String, draft: String, listening: Bool, live: Bool) {
+        shown += 1
+        if DictationPanel.offScreen { return }
         let panel = window ?? make()
         window = panel
-        let listening = text == "Listening…"
-        status.stringValue = text.uppercased() + "  ·  " + Settings.language.uppercased()
+        let text = listening ? L("Listening…") : L("Transcribing…")
+        status.stringValue = text.uppercased(with: Interface.locale) + "  ·  " + Settings.language.uppercased()
         dot.layer?.backgroundColor = (listening ? NSColor.systemRed : NSColor.systemOrange).cgColor
         // (a slow pulse while it listens, as macOS's own recording indicators do)
         if listening, dot.layer?.animation(forKey: "pulse") == nil {

@@ -594,8 +594,12 @@ RU: dict[str, str | tuple[str, str, str]] = {
     "BMeet could not write in {folder}: {why}": "BMeet не удалось записать в {folder}: {why}",
     "Nothing was transcribed": "Ничего не расшифровано",
     "Speakers not told apart": "Собеседники не различены",
-    "Could not start npu-transcribe; the transcript has You/Remote only":
-        "Не удалось запустить npu-transcribe; в расшифровке только You/Remote",
+    "The speaker pass could not be started.": "Различение собеседников не запустилось.",
+    "The speaker pass crashed ({signal}).": "Различение собеседников завершилось сбоем ({signal}).",
+    "The speaker pass was ended ({signal}).": "Различение собеседников было прервано ({signal}).",
+    "The speaker pass ended with status {status}.": "Различение собеседников завершилось с кодом {status}.",
+    "The transcript stays as it was written during the meeting: {file}":
+        "Расшифровка осталась такой, какой она была записана во время встречи: {file}",
     "Meeting recording stopped unexpectedly": "Запись встречи неожиданно остановилась",
     "BMeet stops the meeting and saves what was recorded. Start a new one to go on.":
         "BMeet останавливает встречу и сохраняет записанное. Чтобы продолжить, начните новую.",

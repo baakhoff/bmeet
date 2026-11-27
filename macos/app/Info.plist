@@ -12,6 +12,9 @@
 	<key>CFBundleShortVersionString</key><string>@VERSION@</string>
 	<key>CFBundleVersion</key><string>@VERSION@</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<!-- English is the text in the source, Russian is ru.lproj (macos/app/lproj.sh puts them in) -->
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleLocalizations</key><array><string>en</string><string>ru</string></array>
 	<key>LSMinimumSystemVersion</key><string>14.2</string>
 	<key>LSUIElement</key><true/>
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>

@@ -1,0 +1,2 @@
+/* BMeet.app in English: the texts are in the source itself, L("…") in macos/Sources/BMeet.
+   This folder only tells macOS that BMeet comes in English (and Russian, ru.lproj). */

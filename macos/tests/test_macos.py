@@ -338,7 +338,7 @@ class Recorder(unittest.TestCase):
 
 
 FAKE_TRANSCRIBE = r'''
-import json, os, sys, time
+import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 if "--live" in args:
@@ -357,7 +357,8 @@ if "--live" in args:
     if os.environ.get("FAKE_LIVE_NONE"):   # (nothing was said)
         (folder / "live.done").touch()
         sys.exit(0)
-    (folder / "live.md").write_text("# Live\n\n## Meeting Info\n\n- **Speakers:** You\n\n"
+    (folder / "live.md").write_text("# Live\n\n## Meeting Info\n\n- **Speakers:** You\n"
+                                    "- **Transcribed:** as people talked (live), fake\n\n"
                                     "## Transcript\n\n### You\n\nhello\n")
     if os.environ.get("FAKE_LIVE_FAIL"):   # (an error: no live.done)
         sys.exit(1)
@@ -366,8 +367,55 @@ elif "--meeting" in args:
     folder = Path(args[args.index("--meeting") + 1])
     out = Path(args[args.index("--output") + 1])
     assert (folder / "speaker-pass").exists()
+    if os.environ.get("FAKE_PASS_KILLED"):   # (ended without a word, as a crash ends it)
+        os.kill(os.getpid(), signal.SIGKILL)
+    if os.environ.get("FAKE_PASS_FAIL"):     # (an error npu-transcribe reports itself)
+        sys.exit(1)
     out.write_text("# Speakers\n\n### You\n\nhello\n\n### Person 1\n\nhi\n")
 '''
+
+
+def mac_runtime_root() -> str | None:
+    """The temp folder whose bmeet/ holds the running BMeet.app's sockets (getconf DARWIN_USER_TEMP_DIR)."""
+    try:
+        return os.confstr(65537).rstrip("/") or None   # (_CS_DARWIN_USER_TEMP_DIR)
+    except (ValueError, OSError):
+        return None
+
+
+def sealed(env: dict, notes: Path) -> dict:
+    """`env` for what a meeting test starts, kept off this Mac's BMeet: a runtime folder of the
+    test's own (checked: not the real one), and notifications into the file `notes`
+    (BMEET_NOTIFY_LOG: bmeetmac.notify then neither asks BMeet.app nor runs osascript, which would
+    put them on the screen)."""
+    root, real = env.get("BMEET_RUNTIME_ROOT", ""), mac_runtime_root()
+    if not root or (real and os.path.realpath(root) == os.path.realpath(real)):
+        raise RuntimeError(f"refusing to run: BMEET_RUNTIME_ROOT={root!r} is not a test's own")
+    return dict(env, BMEET_NOTIFY_LOG=str(notes))
+
+
+def notes_in(path: Path) -> list[tuple[str, bool]]:
+    """(title, ok) of the notifications a test's processes posted (BMEET_NOTIFY_LOG)."""
+    try:
+        return [(n["title"], n["ok"]) for n in map(json.loads, path.read_text().splitlines())]
+    except OSError:
+        return []
+
+
+def no_apps_opened(test: unittest.TestCase) -> None:
+    """For the rest of `test`, nothing in this process can run `open` or `osascript` (bmeet-ctl
+    opens BMeet.app when its control socket does not answer): it fails the test instead."""
+    from unittest import mock
+    real = subprocess.Popen
+
+    def popen(args, *more, **kwargs):
+        argv = [args] if isinstance(args, (str, bytes)) else list(args)
+        if argv and os.path.basename(str(argv[0])) in ("open", "osascript"):
+            raise AssertionError(f"a test would have run {argv}")
+        return real(args, *more, **kwargs)
+    guard = mock.patch.object(subprocess, "Popen", popen)
+    guard.start()
+    test.addCleanup(guard.stop)
 
 
 @unittest.skipUnless(sys.platform == "darwin" and recorder(), "macOS with bmeet-record built")
@@ -385,6 +433,7 @@ class MeetingRunner(unittest.TestCase):
                         BMEET_RECORD_MIC_FILE=str(self.tmp / "mic.wav"), BMEET_RECORD_SYSTEM_FILE=str(self.tmp / "mic.wav"),
                         BMEET_TRANSCRIBE=str(self.tmp / "fake-transcribe"))
         self.env.pop("BMEET_RUN_DIR", None)
+        self.env = sealed(self.env, self.tmp / "notes.jsonl")
 
     def tearDown(self) -> None:
         subprocess.run(self.cmd("cleanup"), env=self.env, capture_output=True)
@@ -512,8 +561,13 @@ class MeetingStandIns(unittest.TestCase):
                         BMEET_MEETING_DB=str(self.tmp / "index.db"), VOXTYPE_MEETING_DIR=str(self.tmp / "Meetings"),
                         BMEET_NO_RAMDISK="1", BMEET_RECORD=str(rec), BMEET_WHISPER="/usr/bin/true",
                         BMEET_TRANSCRIBE=str(self.tmp / "fake-transcribe"))
-        for k in ("BMEET_RUN_DIR", "FAKE_LIVE_FAIL", "FAKE_LIVE_NONE", "FAKE_RECORD_DIE_AFTER"):
+        for k in ("BMEET_RUN_DIR", "FAKE_LIVE_FAIL", "FAKE_LIVE_NONE", "FAKE_RECORD_DIE_AFTER", "FAKE_PASS_KILLED",
+                  "FAKE_PASS_FAIL"):
             self.env.pop(k, None)
+        self.env = sealed(self.env, self.tmp / "notes.jsonl")
+        # (the notifications below are checked in English, whatever this Mac's language is)
+        (self.tmp / "config/bmeet").mkdir(parents=True, exist_ok=True)
+        (self.tmp / "config/bmeet/interface-language").write_text("en\n")
 
     def tearDown(self) -> None:
         subprocess.run(self.cmd("cleanup"), env=self.env, capture_output=True, timeout=60)
@@ -630,6 +684,80 @@ class MeetingStandIns(unittest.TestCase):
         self.assertEqual(status, "completed")
         self.assertIn("Person 1", Path(md).read_text())
 
+    def notes(self) -> list[tuple[str, bool]]:
+        return notes_in(self.tmp / "notes.jsonl")
+
+    def test_a_speaker_pass_that_dies_says_so(self) -> None:
+        # Ended without a word of its own, as the Core ML crash of 2026-11-27 ended it (status -11;
+        # here SIGKILL, which leaves no crash report): the live copy stays, with a line that says
+        # the voices were not told apart, a notification says so, and the audio goes
+        self.env["FAKE_PASS_KILLED"] = "1"
+        self.assertEqual(self.run_cmd("start", "--in-person").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        r = self.run_cmd("stop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        md = Path(r.stdout.strip())
+        self.wait_for(lambda: not folder.exists())
+        text = md.read_text()
+        line = "- **Speaker pass:** the voices were not told apart: it was ended (SIGKILL)"
+        self.assertIn(line, text)
+        self.assertLess(text.index(line), text.index("## Transcript"))
+        self.assertIn("hello", text)
+        self.assertIn(("Speakers not told apart", False), self.notes())
+
+    def test_a_speaker_pass_that_fails_is_marked_once(self) -> None:
+        # npu-transcribe reports its own errors (status 1, its own notification): the transcript
+        # gets the line, and no second notification comes from here
+        self.env["FAKE_PASS_FAIL"] = "1"
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        md = Path(self.run_cmd("stop").stdout.strip())
+        self.wait_for(lambda: not folder.exists())
+        self.assertIn("- **Speaker pass:** the voices were not told apart: it ended with status 1", md.read_text())
+        self.assertNotIn("Speakers not told apart", [title for title, _ in self.notes()])
+
+    def test_a_speaker_pass_that_works_leaves_no_line(self) -> None:
+        self.assertEqual(self.run_cmd("start").returncode, 0)
+        folder = self.folder()
+        time.sleep(0.5)
+        md = Path(self.run_cmd("stop").stdout.strip())
+        self.wait_for(lambda: not folder.exists())
+        self.assertIn("Person 1", md.read_text())
+        self.assertNotIn("Speaker pass", md.read_text())
+        self.assertNotIn("Speakers not told apart", [title for title, _ in self.notes()])
+
+    def test_a_pass_that_ends_before_its_pid_is_seen_is_not_a_failure(self) -> None:
+        # unit_start says False for a unit that ran and ended before it saw the unit's pid (a fast
+        # pass on a busy Mac, as on CI): its `after` has run, so nothing is marked or notified.
+        # One that never started is: the transcript gets the line and a notification goes out.
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ.update(self.env)
+        bm = load(MACOS / "bmeet-meeting", "bmeet_meeting_fast_pass_test")
+        live = ("# M\n\n## Meeting Info\n\n- **Transcribed:** as people talked (live), fake\n\n"
+                "## Transcript\n\n### You\n\nhello\n")
+        for ran in (True, False):
+            folder, md = bm.AUDIO_ROOT / f"rec-{ran}", self.tmp / f"m-{ran}.md"
+            folder.mkdir(parents=True)
+            md.write_text(live)
+
+            def unit_start(name, cmd, after=None, nice=0, ran=ran):
+                if ran and name.startswith("bmeet-speakers-"):   # (it ran and ended at once, after and all)
+                    subprocess.run(after, env=dict(os.environ, BMEET_UNIT_STATUS="0"), check=True)
+                return False
+            bm.unit_start = unit_start
+            bm.speaker_pass(folder.name, folder, md)
+            self.assertFalse(folder.exists())
+            if ran:
+                self.assertNotIn("Speaker pass", md.read_text())
+                self.assertEqual(self.notes(), [])
+            else:
+                self.assertIn("- **Speaker pass:** the voices were not told apart: it could not be started",
+                              md.read_text())
+                self.assertEqual(self.notes(), [("Speakers not told apart", False)])
+
     def test_units(self) -> None:
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
@@ -665,6 +793,32 @@ class RuntimeFolder(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
+    def test_notifications_of_tests_stay_off_the_screen(self) -> None:
+        # BMEET_NOTIFY_LOG: into the file; a test's runtime folder without BMeet.app: nowhere,
+        # osascript is not run; with neither seal, the guard of these tests refuses
+        mac = load(MACOS / "bmeetmac.py", "bmeetmac_notify_test")
+        tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        saved = dict(os.environ)
+        no_apps_opened(self)
+        try:
+            os.environ.update(BMEET_RUNTIME_ROOT=str(tmp), BMEET_NOTIFY_LOG=str(tmp / "notes.jsonl"))
+            mac.notify("Title", "body", ok=False)
+            self.assertEqual(notes_in(tmp / "notes.jsonl"), [("Title", False)])
+            del os.environ["BMEET_NOTIFY_LOG"]
+            mac.notify("Not shown")                   # (no agent.sock there, and osascript would fail the test)
+            self.assertEqual(len(notes_in(tmp / "notes.jsonl")), 1)
+            with self.assertRaises(RuntimeError):
+                sealed({}, tmp / "x")
+            if mac_runtime_root():
+                with self.assertRaises(RuntimeError):
+                    sealed({"BMEET_RUNTIME_ROOT": mac_runtime_root()}, tmp / "x")
+            with self.assertRaises(AssertionError):   # (harmless even if the guard failed)
+                subprocess.run(["open", "--help"], capture_output=True)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 def whisper_server() -> Path | None:
     p = MACOS / ".build/release/bmeet-whisper"
@@ -677,8 +831,14 @@ class WhisperServer(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
-        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "shell"))
+        # (the setting from a folder of the test's own: XDG_CONFIG_HOME)
+        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "shell"),
+                        XDG_CONFIG_HOME=str(self.tmp / "config"))
+        for k in ("BMEET_UNLOAD_AFTER_SECONDS", "BMEET_WHISPER_TEST"):
+            self.env.pop(k, None)
+        (self.tmp / "config/bmeet").mkdir(parents=True)
         self.procs: list[subprocess.Popen] = []
+        self.run_dir = self.tmp / "run/bmeet"
 
     def tearDown(self) -> None:
         for p in self.procs:
@@ -687,11 +847,36 @@ class WhisperServer(unittest.TestCase):
                 p.wait()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def serve(self, *extra: str) -> subprocess.Popen:
-        p = subprocess.Popen([str(whisper_server()), "serve", "--models", str(self.tmp / "models"), *extra],
-                             env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def serve(self, *extra: str, **env: str) -> subprocess.Popen:
+        """The server (env: more of its environment); what it logs goes to self.tmp/server.log."""
+        with open(self.tmp / "server.log", "ab") as log:
+            p = subprocess.Popen([str(whisper_server()), "serve", "--models", str(self.tmp / "models"), *extra],
+                                 env=dict(self.env, **env), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=log)
         self.procs.append(p)
         return p
+
+    def ask(self, request: dict, samples: int = 0, sock: Path | None = None) -> dict:
+        """One request to the server (`samples` of silence after it, for the ops that take audio)."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(str(sock or self.run_dir / "whisper.sock"))
+            s.sendall(json.dumps(dict(request, samples=samples) if samples else request).encode() + b"\n"
+                      + bytes(4 * samples))
+            return json.loads(s.makefile("rb").readline())
+
+    def stand_ins(self, extra: tuple[str, ...] = (), **env: str) -> subprocess.Popen:
+        """The server with stand-in models (BMEET_WHISPER_TEST: they load at once, without files)."""
+        p = self.serve(*extra, BMEET_WHISPER_TEST="1", **env)
+        self.wait_for(self.run_dir / "whisper.pid")
+        self.assertTrue(wait_until(lambda: self.ask({"op": "status"})["ok"]))
+        return p
+
+    def loaded(self) -> dict:
+        return self.ask({"op": "status"})["loaded"]
+
+    def logged(self) -> str:
+        return (self.tmp / "server.log").read_text()
 
     def wait_for(self, path: Path) -> None:
         deadline = time.time() + 15
@@ -727,6 +912,233 @@ class WhisperServer(unittest.TestCase):
         self.assertFalse((run / "whisper.sock").exists())
         self.assertFalse((run / "whisper.pid").exists())
 
+    def test_a_look_or_a_status_keeps_no_model(self) -> None:
+        # Clients that only look whether the server is up (bmeetmac.whisper_up) or ask for its
+        # status, every 0.1 s: the model still goes when unload-after (1 s here) is over
+        self.stand_ins(BMEET_UNLOAD_AFTER_SECONDS="1")
+        t0 = time.time()
+        self.assertEqual(self.ask({"op": "load", "model": "turbo"})["device"], "TEST")
+        [(key, info)] = self.loaded().items()
+        self.assertEqual(key, "turbo/ane")
+        self.assertLess(abs(info["since"] - t0), 5)
+        end = time.monotonic() + 6
+        while self.loaded() and time.monotonic() < end:
+            with socket.socket(socket.AF_UNIX) as look:   # (a look, closed at once)
+                look.connect(str(self.run_dir / "whisper.sock"))
+            time.sleep(0.1)
+        self.assertEqual(self.loaded(), {})
+        self.assertIn("unloaded turbo/ane (unused for", self.logged())
+
+    def test_unload(self) -> None:
+        self.stand_ins()
+        self.ask({"op": "load", "model": "turbo"})
+        self.ask({"op": "load", "model": "small"})
+        self.assertEqual(sorted(self.loaded()), ["small/ane", "turbo/ane"])
+        self.assertEqual(self.ask({"op": "unload", "model": "small"})["unloaded"], ["small/ane"])
+        self.assertEqual(sorted(self.loaded()), ["turbo/ane"])
+        self.assertEqual(self.ask({"op": "unload"})["unloaded"], ["turbo/ane"])
+        self.assertEqual(self.loaded(), {})
+        self.assertEqual(self.ask({"op": "unload"})["unloaded"], [])
+
+    def test_the_setting_is_read_when_it_is_needed(self) -> None:
+        # ~/.config/bmeet/unload-after: 60 minutes keeps the model after a transcription; changed to
+        # 0 between two, it goes right after the second (no restart)
+        setting = self.tmp / "config/bmeet/unload-after"
+        setting.write_text("60\n")
+        self.stand_ins()
+        request = {"op": "transcribe", "model": "turbo", "language": "en"}
+        self.assertTrue(self.ask(request, samples=1600)["ok"])
+        self.assertEqual(self.ask({"op": "status"})["unload_after"], 3600)
+        time.sleep(1.0)
+        self.assertEqual(sorted(self.loaded()), ["turbo/ane"])
+        setting.write_text("0\n")
+        self.assertTrue(self.ask(request, samples=1600)["ok"])
+        self.assertTrue(wait_until(lambda: self.loaded() == {}, 3), self.loaded())
+        self.assertIn("unloaded turbo/ane (unload-after is 0", self.logged())
+
+    def test_memory_pressure_releases_the_models(self) -> None:
+        (self.tmp / "config/bmeet/unload-after").write_text("60\n")
+        self.stand_ins()
+        self.ask({"op": "load", "model": "turbo"})
+        self.assertEqual(self.ask({"op": "pressure", "level": "critical"}), {"ok": True})
+        self.assertTrue(wait_until(lambda: self.loaded() == {}, 3), self.loaded())
+        self.assertIn("unloaded turbo/ane (memory pressure: critical)", self.logged())
+        # (the test op exists only with BMEET_WHISPER_TEST: not in the server BMeet starts)
+        self.serve("--socket", str(self.tmp / "o/x.sock"))
+        self.wait_for(self.tmp / "o/whisper.pid")
+        self.assertEqual(self.ask({"op": "pressure"}, sock=self.tmp / "o/x.sock"),
+                         {"ok": False, "error": "unknown op pressure"})
+
+    def test_a_one_off_model_does_not_take_the_install_models_time(self) -> None:
+        # turbo (the install's model) keeps the whole of unload-after (10 minutes here) after a
+        # transcription with small; small, used last, gets at most 3 minutes
+        self.stand_ins(BMEET_UNLOAD_AFTER_SECONDS="600")
+        for model in ("turbo", "small"):
+            self.assertTrue(self.ask({"op": "transcribe", "model": model, "language": "en"}, samples=1600)["ok"])
+        loaded = self.loaded()
+        self.assertGreater(loaded["turbo/ane"]["unload_in"], 500)
+        self.assertLessEqual(loaded["small/ane"]["unload_in"], 180)
+
+    def test_it_exits_when_idle_though_asked_for_its_status(self) -> None:
+        # --idle 1: no model loaded or used for a second, and only status requests: it exits
+        p = self.stand_ins(extra=("--idle", "1"))
+        end = time.monotonic() + 10
+        while p.poll() is None and time.monotonic() < end:
+            with contextlib.suppress(OSError, ValueError):
+                self.ask({"op": "status"})
+            time.sleep(0.2)
+        self.assertEqual(p.poll(), 0)
+        self.assertFalse((self.run_dir / "whisper.sock").exists())
+        self.assertIn("no model loaded or used for 1 s: exiting", self.logged())
+
+
+@unittest.skipUnless(importlib.util.find_spec("coremltools") and importlib.util.find_spec("numpy"),
+                     "coremltools and numpy (the Mac venv's)")
+class CoreMLPredict(unittest.TestCase):
+    """bmeetmac.coreml_predict through coremltools' own predict() code, with a stand-in for Core ML
+    that keeps the arrays it was given, as Core ML keeps a prediction's inputs (no model needed)."""
+
+    def test_core_ml_holds_only_inputs_that_are_watched(self) -> None:
+        # coremltools replaces a float16 array in the dict by a float32 copy of its own: had that
+        # copy reached Core ML, nothing would have watched it, and Core ML's release on its own
+        # thread could have been its last reference (the crash of 2026-11-27)
+        import types
+        import numpy as np
+        from coremltools.models._compiled_model import CompiledMLModel
+        mac = load(MACOS / "bmeetmac.py", "bmeetmac_coreml_test")
+
+        class CoreML:   # (the proxy coremltools hands the inputs to)
+            held: list = []
+
+            def predict(self, data, state=None):
+                CoreML.held = list(data.values())
+                return {}
+        model = types.SimpleNamespace(_proxy=CoreML())
+        model.predict = lambda feed: CompiledMLModel.predict(model, feed)
+        given = {"x": np.ones((2, 3), np.float16), "n": np.array([3], np.int64),
+                 "y": np.arange(8, dtype=np.float32)[::2]}
+        mac.coreml_predict(model, given)
+        self.assertEqual([a.dtype.name for a in CoreML.held], ["float32", "int32", "float32"])
+        self.assertTrue(all(a.flags.c_contiguous for a in CoreML.held))
+        self.assertFalse(any(np.shares_memory(a, b) for a in CoreML.held for b in given.values()))   # (copies)
+        self.assertEqual(sorted(id(a) for a in CoreML.held), sorted(mac._HELD[-1][1]))
+        self.assertEqual(mac.release_coreml_inputs(), 1)   # (Core ML still holds them: kept)
+        CoreML.held = []
+        self.assertEqual(mac.release_coreml_inputs(), 0)   # (let go of: freed, by Python)
+
+
+INSTALLED_MODELS = Path(os.environ.get("NPU_MODELS_DIR") or Path.home() / ".local/share/npu-models")
+
+
+def coreml_models() -> bool:
+    """The installed Core ML models (read only here), coremltools, `say` and ffmpeg: a Mac with BMeet."""
+    return (sys.platform == "darwin" and importlib.util.find_spec("coremltools") is not None
+            and bool(shutil.which("say")) and bool(shutil.which("ffmpeg"))
+            and all((INSTALLED_MODELS / p).exists() for p in (
+                "gigaam-v3-ctc-ru/model.mlmodelc", "gigaam-v3-ctc-ru/tokens.txt", "speaker-diarization/titanet.mlmodelc",
+                "speaker-diarization/nemotron-3-diarization/embedder.mlmodelc",
+                "speaker-diarization/nemotron-3-diarization/encoder.mlmodelc")))
+
+
+# GigaAM, then the speaker models, on the Neural Engine, with a pause after each prediction that
+# is longer than Core ML takes to let go of a model's inputs on its own thread (~1.2 s after the
+# first prediction, measured on macOS 27): the pass of 2026-11-27 crashed in such a pause (status
+# -11). Prints what it heard, how many voices, and how many predictions' inputs bmeetmac still held
+# right after each prediction and after each pause (information only: it depends on macOS).
+COREML_DRIVER = r'''
+import importlib.machinery, importlib.util, json, sys, time
+from pathlib import Path
+repo, wav, pause = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+loader = importlib.machinery.SourceFileLoader("npu_transcribe", str(repo / "transcribe/npu-transcribe"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+nt = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = nt
+loader.exec_module(nt)
+samples = nt.decode_all(wav)
+gigaam = nt.GigaAM(["ANE", "CPU"])
+words, held = [], []
+for _, block in nt.array_blocks(samples):
+    words += [w.text for w in gigaam.words(block)]
+    held.append(nt.bmeetmac.release_coreml_inputs())
+    time.sleep(pause)
+    held.append(nt.bmeetmac.release_coreml_inputs())
+turns, _, _ = nt.diarize(nt.SpeakerModels(["ANE", "CPU"]), samples)
+time.sleep(pause)
+held.append(nt.bmeetmac.release_coreml_inputs())
+print(json.dumps({"text": "".join(words), "voices": len({t.speaker for t in turns}), "device": gigaam.device,
+                  "held": held}, ensure_ascii=False))
+'''
+
+SAID = [   # (two people: the second one's voice made lower with ffmpeg)
+    "Добрый день, коллеги. Сегодня мы обсуждаем план работ на следующую неделю.",
+    "Спасибо. Я подготовил отчет о продажах за прошлый месяц, цифры хорошие.",
+    "Отлично. Тогда давайте начнем с отчета, а потом перейдем к бюджету.",
+    "Хорошо. Бюджет на рекламу мы предлагаем увеличить на десять процентов.",
+]
+
+
+@unittest.skipUnless(coreml_models(), "a Mac with BMeet's Core ML models installed (not in CI: no models)")
+class CoreMLInputs(unittest.TestCase):
+    """The installed GigaAM, Nemotron and TitaNet on the Neural Engine, in processes this test
+    starts and ends, on speech made with `say` (nothing is recorded or played). Local only."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bm-"))
+        # (a runtime and config folder of its own: no Whisper is asked, and none of yours is touched)
+        self.env = sealed(dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp / "run"), XDG_RUNTIME_DIR=str(self.tmp / "run"),
+                               XDG_CONFIG_HOME=str(self.tmp / "config"),
+                               NPU_TRANSCRIBE_HISTORY=str(self.tmp / "history.jsonl")), self.tmp / "notes.jsonl")
+        self.wav = self.tmp / "meeting.wav"
+        self.speech(self.wav)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def speech(self, out: Path) -> None:
+        """SAID, two voices taking turns, 2.5 s of quiet between them, 16 kHz mono WAV."""
+        import numpy as np
+        rate, pieces = 16000, []
+        for i, text in enumerate(SAID):
+            aiff, wav = self.tmp / f"{i}.aiff", self.tmp / f"{i}.wav"
+            subprocess.run(["say", "-v", "Milena", "-o", str(aiff), text], check=True, timeout=60)
+            voice = ["-af", "asetrate=16000*0.8,aresample=16000,atempo=1.25"] if i % 2 else []
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(aiff), "-ar", "16000", "-ac", "1", *voice, str(wav)],
+                           check=True, timeout=60)
+            with wave.open(str(wav)) as w:
+                pieces += [np.frombuffer(w.readframes(w.getnframes()), "<i2"), np.zeros(int(2.5 * rate), "<i2")]
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(np.concatenate(pieces).tobytes())
+
+    def test_pauses_after_predictions_do_not_crash(self) -> None:
+        r = subprocess.run([PY, "-I", "-c", COREML_DRIVER, str(REPO), str(self.wav), "3"], env=self.env,
+                           capture_output=True, text=True, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        print(f"\n  Core ML inputs still held (after each prediction, after each pause): {out['held']}",
+              file=sys.stderr)
+        self.assertRegex(out["text"], "[а-яА-Я]{3}")
+        self.assertGreaterEqual(out["voices"], 1)
+
+    def test_a_speaker_pass(self) -> None:
+        # npu-transcribe --meeting on an in-person recording, Russian given and no English terms:
+        # GigaAM and the speaker models only (no Whisper), as the pass of 2026-11-27 ran
+        folder = self.tmp / "rec"
+        folder.mkdir()
+        shutil.copy(self.wav, folder / "part-1-mic.wav")
+        (folder / "meeting.json").write_text(json.dumps({"title": "Test", "started": int(time.time()), "in_person": True}))
+        out = self.tmp / "out.md"
+        r = subprocess.run([PY, "-I", str(REPO / "transcribe/npu-transcribe"), "--meeting", str(folder), "--output", str(out),
+                            "--language", "ru", "--no-english-terms"], env=self.env, capture_output=True, text=True,
+                           timeout=600)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        text = out.read_text()
+        self.assertIn("## Transcript", text)
+        self.assertRegex(text, "[а-яА-Я]{3}")
+        self.assertNotIn("bmeet-whisper", r.stderr)
+
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS only")
 class CtlToApp(unittest.TestCase):
@@ -739,11 +1151,16 @@ class CtlToApp(unittest.TestCase):
         self.server = StandIn(self.tmp / "bmeet/agent.sock", lambda req, _: {"ok": True})
         self.server.start()
         self.ctl = load(REPO / "bmeet/bmeet-ctl", "bmeet_ctl_mac_test")
+        # bmeet-ctl opens BMeet.app when its control socket does not answer: here that must never
+        # reach the BMeet.app of this Mac, nor a notification the screen
+        no_apps_opened(self)
+        sealed(dict(os.environ), self.tmp / "notes.jsonl")       # (checks BMEET_RUNTIME_ROOT)
+        os.environ["BMEET_NOTIFY_LOG"] = str(self.tmp / "notes.jsonl")
 
     def tearDown(self) -> None:
         self.server.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
-        for k in ("BMEET_RUNTIME_ROOT", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"):
+        for k in ("BMEET_RUNTIME_ROOT", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "BMEET_NOTIFY_LOG"):
             os.environ.pop(k, None)
 
     def test_commands(self) -> None:

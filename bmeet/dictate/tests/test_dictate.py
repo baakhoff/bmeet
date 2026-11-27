@@ -33,6 +33,28 @@ FAKE = HERE / "fake-engine"
 STAND_IN = "/usr/share/applications/org.kde.plasma.keyboard.desktop"   # (only a name in the private kwinrc)
 
 
+def mac_runtime_root() -> str | None:
+    """The temp folder whose bmeet/ holds a running BMeet.app's control socket (getconf
+    DARWIN_USER_TEMP_DIR), or None off a Mac."""
+    try:
+        return os.confstr(65537).rstrip("/") or None   # (_CS_DARWIN_USER_TEMP_DIR)
+    except (ValueError, OSError):
+        return None
+
+
+def keep_off_the_mac(env: dict) -> dict:
+    """`env` for a bmeet-ctl or bmeet-dictate this file starts, checked: bmeet-ctl must take its
+    Linux path (BMEET_PLATFORM=linux) and see a runtime folder of the test's own. On a Mac its other
+    path sends `dictate` to the BMeet.app running there, which records from the microphone (it did,
+    2026-11-27, before this check). Anything else stops the test before the command runs."""
+    root = env.get("BMEET_RUNTIME_ROOT", "")
+    real = mac_runtime_root()
+    if env.get("BMEET_PLATFORM") != "linux" or not root or (real and os.path.realpath(root) == os.path.realpath(real)):
+        raise RuntimeError("refusing to run: bmeet-ctl could reach the BMeet.app of this Mac "
+                           f"(BMEET_PLATFORM={env.get('BMEET_PLATFORM')!r}, BMEET_RUNTIME_ROOT={root!r})")
+    return env
+
+
 def load_dictate():
     import importlib.machinery
     import importlib.util
@@ -46,6 +68,18 @@ def load_dictate():
 class Helpers(unittest.TestCase):
     def setUp(self):
         self.bd = load_dictate()
+
+    def test_the_macs_bmeet_app_is_kept_out(self):
+        # what this file starts never takes bmeet-ctl's Mac path or the Mac's real runtime folder
+        with self.assertRaises(RuntimeError):
+            keep_off_the_mac({"BMEET_RUNTIME_ROOT": "/tmp/bm-x"})                     # (no BMEET_PLATFORM)
+        with self.assertRaises(RuntimeError):
+            keep_off_the_mac({"BMEET_PLATFORM": "linux"})                             # (no runtime root)
+        if mac_runtime_root():
+            with self.assertRaises(RuntimeError):
+                keep_off_the_mac({"BMEET_PLATFORM": "linux", "BMEET_RUNTIME_ROOT": mac_runtime_root() + "/"})
+        env = {"BMEET_PLATFORM": "linux", "BMEET_RUNTIME_ROOT": "/tmp/bm-x"}
+        self.assertIs(keep_off_the_mac(env), env)
 
     def test_rest_of(self):
         self.assertEqual(self.bd.rest_of("One. Two three.", ""), "One. Two three.")
@@ -89,13 +123,17 @@ class Service(unittest.TestCase):
         (self.work / "config/bmeet/live-dictation").write_text("panel\n")
         (self.work / "voxtype.toml").write_text('engine = "openvino"\n[openvino]\nlanguage = "ru"\n')
         self.run_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / f"bmeet-test-{os.getpid()}"
-        self.env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(self.work / "config"),
+        # BMEET_PLATFORM=linux: on a Mac, bmeet-ctl would otherwise send `dictate` and `cancel` to
+        # the BMeet.app that runs there (its real control socket), and that dictates from the
+        # microphone; BMEET_RUNTIME_ROOT: nothing of the Mac's runtime folder, should it look there
+        self.env = dict(os.environ, BMEET_PLATFORM="linux", BMEET_RUNTIME_ROOT=str(self.run_dir / "mac"),
+                        QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=str(self.work / "config"),
                         BMEET_RUNTIME_DIR=str(self.run_dir), BMEET_STATE_DIR=str(self.work / "state"),
                         BMEET_DICTATE_ENGINE=str(FAKE), BMEET_DICTATE_OUTPUT=f"file:{self.work / 'out.jsonl'}",
                         VOXTYPE_CONFIG=str(self.work / "voxtype.toml"), FAKE_ENGINE_LOG=str(self.work / "engine.log"),
                         DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent/bmeet-test-bus")
         self.env.pop("WAYLAND_DISPLAY", None)
-        self.service = subprocess.Popen([sys.executable, "-I", str(DICTATE), "serve"], env=self.env,
+        self.service = subprocess.Popen([sys.executable, "-I", str(DICTATE), "serve"], env=keep_off_the_mac(self.env),
                                         stderr=subprocess.PIPE, text=True)
         for _ in range(100):
             if (self.run_dir / "dictate.sock").exists():
@@ -114,8 +152,8 @@ class Service(unittest.TestCase):
         shutil.rmtree(self.run_dir, ignore_errors=True)
 
     def ctl(self, *args) -> dict:
-        out = subprocess.run([sys.executable, "-I", str(DICTATE), *args], env=self.env, capture_output=True,
-                             text=True, timeout=10)
+        out = subprocess.run([sys.executable, "-I", str(DICTATE), *args], env=keep_off_the_mac(self.env),
+                             capture_output=True, text=True, timeout=10)
         return json.loads(out.stdout or "{}")
 
     def wait_for(self, state: str, timeout: float = 5.0) -> dict:
@@ -171,6 +209,40 @@ class Service(unittest.TestCase):
         self.wait_for("idle")
         self.assertEqual(self.out(), [])
 
+    def test_idle_engine_goes_and_comes_back(self):
+        # ~/.config/bmeet/unload-after, read when it is needed: 0 ends the engine (and its model)
+        # right after a dictation; the next dictation starts a new one, which gets the text through,
+        # and with 5 minutes it stays
+        end = time.monotonic() + 5
+        while not (st := self.ctl("status"))["engine_ready"] and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertTrue(st["engine"] and st["engine_ready"])
+        setting = self.work / "config/bmeet/unload-after"
+        sentence = "Второй челлендж, он чисто поисковый."
+
+        def dictation() -> None:   # (stopped once the first sentence shows: a new engine takes a while to start)
+            self.assertEqual(self.ctl("toggle")["state"], "recording")
+            end = time.monotonic() + 10
+            while sentence not in self.ctl("status")["panel_text"] and time.monotonic() < end:
+                time.sleep(0.05)
+            self.ctl("toggle")
+            self.wait_for("idle")
+        setting.write_text("0\n")
+        dictation()
+        end = time.monotonic() + 5
+        while self.ctl("status")["engine"] and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertFalse(self.ctl("status")["engine"])
+        setting.write_text("5\n")
+        dictation()
+        texts = [o["text"] for o in self.out()]   # (how far each got after that depends on timing)
+        self.assertEqual(len(texts), 2, texts)
+        self.assertTrue(all(t.startswith(sentence) for t in texts), texts)
+        time.sleep(0.5)
+        self.assertTrue(self.ctl("status")["engine"])
+        engine = [list(json.loads(line)) for line in (self.work / "engine.log").read_text().splitlines()]
+        self.assertEqual(engine, [["start"], ["stop"], ["start"], ["stop"]])
+
     def test_engine_gone_mid_dictation(self):
         self.ctl("toggle")
         time.sleep(0.5)
@@ -191,7 +263,8 @@ class Service(unittest.TestCase):
             (bin_dir / "voxtype").symlink_to(FAKE_VOXTYPE)
         env = dict(self.env, PATH=f"{bin_dir}:{os.environ['PATH']}", FAKE_VOXTYPE_LOG=str(self.work / "voxtype.log"),
                    BMEET_RUN_DIR=str(self.work / "voxtype-run"), BMEET_MEETING_DB=str(self.work / "none.db"))
-        return subprocess.run([sys.executable, "-I", str(CTL), *args], env=env, capture_output=True, text=True, timeout=15)
+        return subprocess.run([sys.executable, "-I", str(CTL), *args], env=keep_off_the_mac(env), capture_output=True,
+                              text=True, timeout=15)
 
     def test_bmeet_ctl_goes_to_bmeet_dictate_when_it_is_on(self):
         self.assertEqual(self.bmeet_ctl("dictate").returncode, 0)

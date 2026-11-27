@@ -25,6 +25,7 @@ npu-transcribe --help
 - **Existing files are never overwritten:** the outputs become `NAME.2.*`, `NAME.3.*` and so on, unless you pass `--overwrite`.
 - **Read-only input folders:** output goes to `~/Transcripts`.
 - **History:** every finished file is appended to `~/.local/share/npu-transcribe/history.jsonl`, which the BMeet app and the widget list.
+- **One at a time, if asked:** with `--queue`, a run waits until the other runs started with `--queue` are done (a lock on `$XDG_RUNTIME_DIR/bmeet/file-queue.lock`, which a run that crashes lets go of too). Files started while another one is being transcribed then do not each load the models. Without it, runs go side by side as before.
 - **Exit status:** 0 all done, 1 some file failed, 2 usage error, 130 Ctrl+C.
 
 **Other ways to start it:**
@@ -258,7 +259,7 @@ starts it as the unit `bmeet-live` next to the recorder. It is off when
 - **Language:** `--language`, or detected by Whisper on the first 8 s said on the other side (in person: on the microphone), as the speaker pass does. For Russian, Whisper is let go of then.
 - **Your microphone:** what you said while the call could not hear you is left out ([Muted in the call](#muted-in-the-call)), and the other side's echo is cut as in the speaker pass ([Speakers](#speakers), step 3). Your phrases are only what is clearly louder (2x) than the echo the system audio would cause at that moment, so their reply, heard by your microphone, doesn't keep your phrase open. A phrase of yours becomes final once the other side's text for the same moment is there.
 - **Labels:** You and Remote; in person, Room. Telling the other voices apart (Person 1, …) stays the speaker pass's work after the meeting.
-- **Memory:** only the audio a phrase still needs is kept (in RAM, at most a minute or so), plus the loudness per 100 ms. The process peaks at ~1.6 GB while Whisper is loaded (for the language, or for good with other languages than Russian).
+- **Memory:** only the audio a phrase still needs is kept (in RAM, at most a minute or so), plus the loudness per 100 ms. The process peaks at ~1.6 GB while Whisper is loaded (for the language, or for good with other languages than Russian). It keeps its model while the meeting runs, pauses included, and ends with it, which lets go of everything. On a Mac, Whisper is only a client of `bmeet-whisper`, which releases the model by its own clock ([docs/macos.md](macos.md#memory)).
 - **The end:** when the recorder no longer names the folder in `$XDG_RUNTIME_DIR/bmeet/recording` (or at SIGTERM, or when the speaker pass begins), it transcribes the last phrases, writes `live.md` once more without italics, and marks it complete with `live.done`. `voxtype-meeting-toggle` waits for that (at most 60 s) before it starts the speaker pass; a live transcript that did not get to the end leaves voxtype's in place.
 
 **Measured** with `tests/meeting_test.py --live`: the made-up meetings of real voices are recorded again in real time while `--live` follows them.
@@ -277,6 +278,22 @@ speech). Lines of different people with under 0.8 s between them become one phra
 earlier one is final only when the later one ends (the words show in italics meanwhile).
 **CPU:** ~2-2.7 s to start (Whisper and GigaAM loaded, the language detected), then 0.2-0.3 s
 per minute of meeting in Russian (~15 s an hour) and ~1.3 s per minute with Whisper.
+
+## Memory
+
+Which runs hold a model, and when they let go of it:
+
+| Run | Holds | Lets go |
+|---|---|---|
+| files, `--meeting` (the speaker pass) | what the file needs: Whisper or GigaAM, the speaker models | when it ends |
+| `--live` | GigaAM or Whisper, for the whole meeting | when the meeting ends (the process ends) |
+| `--dictate` (the dictation engine) | the model of the dictation language | `unload-after` minutes after the last dictation, and on a Mac at once when macOS says memory is short; the next dictation loads it again |
+
+**`unload-after`:** `~/.config/bmeet/unload-after` holds the minutes, 0 to 60 (a number outside counts as the nearest end; a missing or unreadable file means 5; 0 lets go right after each dictation). It is read each time it is needed, so a change applies without a restart.
+
+**The dictation engine:** while it waits with a model, it looks at the setting every 30 s, and on a Mac at macOS's memory-pressure level (`kern.memorystatus_vm_pressure_level`: one system call, no process and no faster timer). Without a model it waits for its next command and does not wake at all. It starts recording first and loads the model while you speak, so nothing said meanwhile is lost (GigaAM loads in well under a second once compiled; Whisper on the Linux NPU in a few seconds from its compile cache; on a Mac the engine holds only a client of `bmeet-whisper`). The service that runs it ends it too, on the same clock: `bmeet-dictate` on Linux, BMeet.app on a Mac.
+
+`BMEET_UNLOAD_AFTER_SECONDS` gives the time in seconds instead of the file. It is for tests only.
 
 ## Tidying the text
 
@@ -358,6 +375,11 @@ transcribe/tests/run-tests.sh /tmp/npt-work "NPU CPU"
    - **Load failures** (driver missing, compile error, out of memory) switch to the CPU.
    - **Inference failures** retry the failed block on the CPU and continue there. This was tested by injecting errors into the load step, into every `generate()`, and into one `generate()` in the middle of a file.
    - **openvino.genai #4222** ("invalid unordered_map key") didn't occur with these exports.
+8. **macOS: Core ML lets go of a prediction's inputs on a thread of its own** (coremltools 9.0, macOS 27):
+   - **The crash:** the speaker pass of an in-person meeting ended with status -11 (2026-11-27), and four of the installer's model checks crashed the same way the day before. The reports show `EXC_BAD_ACCESS` at `0x10` on the queue `com.apple.coreml.MLE5ExecutionStream.resetQueue`. In the stack, `-[MLE5ExecutionStream resetAfterLingering:]` → `-[MLFeatureValue dealloc]` → coremltools' `libcoremlpython.so` → numpy's `array_dealloc` → `_PyObject_Free`.
+   - **Why:** coremltools hands Core ML numpy arrays without a copy. Its `MLMultiArray` subclass (`PybindCompatibleArray`) keeps a reference to the array and drops it in its destructor (a plain `Py_DECREF`, without Python's lock). Core ML keeps the inputs of a model's last prediction after `predict()` returns. It lets go of them at the next prediction, when the model is freed, or on its reset queue some time later (1.2 s after the first prediction of GigaAM on the Neural Engine, measured; later predictions' inputs stayed for more than 90 s). When that release on the reset queue is the array's last reference, numpy frees it there, on a thread Python does not know. Python 3.13's allocator looks up the thread's state and gets NULL. The address `0x10` fits that: it is where the interpreter field of a thread state would be, read through NULL. In the speaker pass that array was GigaAM's `feature_lengths`, an int32 copy only the call held. The pass ran GigaAM once (28 s of audio) and then waited for Whisper, longer than 1.2 s.
+   - **The fix** (`macos/bmeetmac.py`, `coreml_predict`, used by npu-transcribe's Core ML models and by `macos/prepare-coreml`): every input is a copy that only BMeet's list of held inputs refers to, from before `predict()` until Core ML has let go of it. A float16 input is copied as float32 (and an int64 one as int32): coremltools would otherwise put a float32 copy of its own in the dict, which Core ML would hold without BMeet knowing of it. Core ML's release then never frees anything. Python touches those arrays at no time in between, so no reference count is changed from two threads at once. Whether Core ML still holds one is read from the array's count in memory, without changing it, and the copy is freed by Python once that count is back to 1. At exit, inputs Core ML still holds are kept: the dict that holds them gets one more reference, so Python's shutdown cannot free them either.
+   - **Tests:** `macos/tests/test_macos.py`'s `CoreMLInputs` runs the installed models on speech made with `say`, with pauses longer than Core ML's release after each prediction (local only: CI has no models). `CoreMLPredict` runs `coreml_predict` through coremltools' own `predict()` code with a stand-in for Core ML that keeps what it is given: Core ML gets only the copies BMeet watches, and they are freed once it lets go (in CI too).
 
 ## Edge cases checked
 

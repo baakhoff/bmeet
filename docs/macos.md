@@ -136,7 +136,7 @@ The meetings and files transcribed before stay in the BMeet window and in *Recen
 | `languages` | the dictation languages ⌃⌥⇧H cycles through, in this order, e.g. `en ru` (the installer's default: English + your Mac's languages); never empty |
 | `language` | the current dictation language, one of `languages` (on Linux it is in voxtype's config) |
 | `interface-language` | `system` (default), `en` or `ru` |
-| `unload-after` | minutes, 0–60 (default 5): how long a process that waits for work keeps a model after its last use; `0`: right after each use. BMeet.app ends its speech engine after that long without a dictation |
+| `unload-after` | minutes, 0–60 (default 5): how long a process that waits for work keeps a model after its last use; `0`: right after each use. BMeet.app ends its speech engine after that long without a dictation ([Memory](#memory)) |
 | `live-dictation` | `on` (default on a Mac) or `off`: the words while you speak |
 | `speakers` | `on` / `off`: tell meeting speakers apart (Person 1, Person 2, …) |
 | `remember-voices` | `on` / `off` (default): as on Linux; also set in the window's *Name speakers…* |
@@ -163,7 +163,7 @@ The meetings and files transcribed before stay in the BMeet window and in *Recen
 
 | Linux | macOS |
 |---|---|
-| Whisper with OpenVINO GenAI on the NPU, in each process | **bmeet-whisper** (`macos/Sources/bmeet-whisper`): [WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) (Argmax, MIT) runs Whisper large-v3-turbo as Core ML models, encoder and decoder on the Neural Engine. One server holds the model for every process: an 8 GB Mac loads it once. Dictation goes first, then the live transcript, then files. It exits after 10 idle minutes. The models are pinned in `macos/models/whisperkit.tsv` (`openai_whisper-large-v3-v20240930_626MB`, and `openai_whisper-small_216MB` for `--translate`) |
+| Whisper with OpenVINO GenAI on the NPU, in each process | **bmeet-whisper** (`macos/Sources/bmeet-whisper`): [WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) (Argmax, MIT) runs Whisper large-v3-turbo as Core ML models, encoder and decoder on the Neural Engine. One server holds the model for every process: an 8 GB Mac loads it once. Dictation goes first, then the live transcript, then files. It releases a model `unload-after` minutes after its last use, at once when macOS says memory is short, and exits once it has held no model for 10 minutes ([Memory](#memory)). The models are pinned in `macos/models/whisperkit.tsv` (`openai_whisper-large-v3-v20240930_626MB`, and `openai_whisper-small_216MB` for `--translate`) |
 | GigaAM, Nemotron, TitaNet with OpenVINO on the NPU | the same pinned files, built into **Core ML programs** by `macos/prepare-coreml` (see below) and run with coremltools on the Neural Engine |
 | voxtype: the dictation daemon and meetings | **BMeet.app**: dictation, through the same `npu-transcribe --dictate` engine as the Linux text-while-you-speak. **`macos/bmeet-meeting`**: meetings, with voxtype's state files and voxtype's meeting index columns (`~/.local/share/bmeet/meetings/index.db`), so bmeet-ctl and the app read both alike |
 | pw-record, bmeet-meeting-audio | **bmeet-record** (`macos/Sources/bmeet-record`): the microphone (AVAudioEngine) and the system audio, a Core Audio process tap of every process (macOS 14.2+). Both are written as 16 kHz mono WAV parts, the layout of bmeet-meeting-audio, and lined up by their hardware timestamps |
@@ -195,6 +195,30 @@ Measured on an M1 with 8 GB (macOS 27):
 
 Whisper is the slow part. A 30 s window takes about 1 s in the encoder and ~30 tokens per second in the decoder. That is slower than the GPU would be, and that is the point: like the NPU on Linux, it leaves the CPU and the GPU to your calls and apps. Russian goes to GigaAM, which is ~35× faster than Whisper.
 
+### Memory
+
+BMeet keeps a model loaded only while it may be needed soon. One setting says how long: `~/.config/bmeet/unload-after`, in minutes. It goes from 0 to 60, the default is 5, and `0` releases a model right after each use. Every process reads it when it decides, so a change applies at once.
+
+| Process | Holds | Lets go |
+|---|---|---|
+| **bmeet-whisper** | Whisper turbo, and small when something translates, for every process | each model `unload-after` after its last use; small, and a copy on the CPU, after at most 3 minutes; every model when macOS says memory is short. The process exits once it has held no model and had no work for 10 minutes |
+| **the dictation engine** (`npu-transcribe --dictate`, run by BMeet.app) | GigaAM for Russian (for other languages it is only a client of bmeet-whisper) | `unload-after` after the last dictation, or when macOS says memory is short. BMeet.app ends the engine after the same time without a dictation |
+| **the live transcript** (`bmeet-live`) | GigaAM, or a client of bmeet-whisper | when the meeting ends |
+| **the speaker pass, file transcriptions** | GigaAM, Nemotron, TitaNet (Whisper through bmeet-whisper) | when they end |
+| BMeet.app, the window | no model | – |
+
+- **Only real use counts:** for bmeet-whisper, a use is a request that transcribes, detects a language or loads a model. Asking for its status, `{"op": "unload"}`, or a client that only checks whether it is up keeps nothing loaded and does not keep the server running. Its `status` lists what is loaded, since when, and how long until it goes.
+- **The install's model keeps its time:** turbo (small, on an install without turbo) gets the whole of `unload-after`, whatever was used last. A translation with small no longer makes turbo the model that goes first.
+- **Memory pressure:** bmeet-whisper listens to macOS's memory-pressure events (warning and critical). It releases every model as soon as the request that runs, if one does, is done, and logs it in `whisper.log`. The dictation engine reads the same level (`kern.memorystatus_vm_pressure_level`) when it looks at the setting, every 30 s while it holds a model. That is one system call and no process, and without a model it does not wake at all.
+- **No idle copies:** GigaAM can be loaded in up to three processes while they work: a dictation during a meeting, with the speaker pass of the meeting before it still running. Once the dictation engine waits, its copy goes by the setting; the other two end with their work.
+- **Files from Finder:** each request of Finder's services starts its own run, side by side. `npu-transcribe --queue` makes runs wait for one another; the services do not pass it yet.
+- **What a reload costs** (M5 Pro, macOS 27.2, private servers of the installed bmeet-whisper):
+  - Once macOS has compiled turbo for a bmeet-whisper binary, a new server process loads it in 2.6 s, and the same process loads it again after a release in 2.5 s (small: 1.3 s). So a release costs a few seconds at the next use, whether the server is still up or has exited.
+  - The compile itself took ~190 s here (small: 46 s). It happens once per bmeet-whisper binary: the installer's warm-up does it after an update that rebuilds the server. A bmeet-whisper of another build that loads the models under the same name (a development build) has macOS compile them again for itself, and the installed one then compiles once more at its next load.
+  - GigaAM loads in a fraction of a second once compiled (0.2-0.4 s in the logs).
+- **What it frees:** `footprint` shows the server at ~70 MB with turbo loaded and about the same after the release. The weights the Neural Engine runs are not counted in a process's footprint, so how much a release frees is not shown there.
+- **Tests only:** `BMEET_UNLOAD_AFTER_SECONDS` gives the time in seconds. `BMEET_WHISPER_TEST=1` gives bmeet-whisper stand-in models and an op that does what a memory-pressure event does.
+
 ## Differences from Linux
 
 - **No text into the field while you speak:** on Linux BMeet can be KWin's input method. On a Mac the words show in the floating panel and are pasted when you stop.
@@ -218,8 +242,11 @@ python3 -I macos/tools/check-strings.py                                         
 - `macos/tests/test_macos.py` tests the Mac parts without models or permissions:
   - the WhisperKit server protocol, with a stand-in;
   - bmeet-record, playing files instead of the devices (`BMEET_RECORD_MIC_FILE`, `BMEET_RECORD_SYSTEM_FILE`): parts, pauses, WAV headers;
-  - bmeet-meeting's start, pause, stop and index, without the RAM disk (`BMEET_NO_RAMDISK=1`);
+  - bmeet-meeting's start, pause, stop and index, without the RAM disk (`BMEET_NO_RAMDISK=1`), and a speaker pass that fails or is killed;
+  - bmeet-whisper's memory: idle release, `unload`, the setting, memory pressure, with stand-in models (`BMEET_WHISPER_TEST=1`);
   - bmeet-ctl's Mac commands.
+  - Everything they start gets a runtime folder of its own (`BMEET_RUNTIME_ROOT`), and notifications go to a file (`BMEET_NOTIFY_LOG`), so nothing reaches the BMeet.app running on that Mac or its screen.
+  - `CoreMLInputs` runs the installed GigaAM, Nemotron and TitaNet on speech made with `say`, with pauses longer than Core ML takes to let go of a prediction's inputs. It runs only where the models are installed (not in CI).
 - `macos/tests/test_settings.py` drives BMeet's own check modes (`BMeet --help` lists them), which show nothing and need a test's own `XDG_CONFIG_HOME` and `BMEET_RUNTIME_ROOT`:
   - `--settings-check PAGE|all --lang en|ru`: each page of the Settings window built off screen, in both languages: at most 600 points tall, no text cut short, every text translated. `--picture DIR` draws the window into PNG files (`docs/macos-settings.png` is one);
   - `--menu-check`: the menu and the shortcuts for the settings in that folder, so turning each feature off removes exactly its items and shortcuts;

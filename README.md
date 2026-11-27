@@ -164,6 +164,7 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 - **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
 - **Text while you speak:** `~/.config/bmeet/live-dictation` says `on`, `panel` or `off` (the default; see above).
 - **Meeting speakers:** `~/.config/bmeet/speakers` says `on` or `off`. When two people end up as one, or one person is split in two, see [docs/troubleshooting.md](docs/troubleshooting.md#meeting-speakers).
+- **Memory:** `~/.config/bmeet/unload-after` holds the minutes a process that waits for work keeps a model after its last use: 0 to 60, default 5, and `0` releases it right after each use. On Linux this is the engine of text while you speak, which `bmeet-dictate` ends after that time; voxtype keeps its own whisper-small loaded, because its `on_demand_loading` would reload it for every dictation (~3 s each time). On a Mac it also covers the Whisper server ([docs/macos.md](docs/macos.md#memory)).
 - **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.

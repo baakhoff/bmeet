@@ -42,6 +42,10 @@ def main() -> int:
             print(f"ready on {w.device} ({time.monotonic() - t0:.0f} s)")
         except Exception as exc:  # (the first use does it then)
             print(f"not now ({exc})")
+    try:   # (small is only for translating: the server need not keep it for its 3 minutes)
+        nt.bmeetmac.whisper_unload("small")
+    except (OSError, RuntimeError, ValueError):
+        pass
     if nt.gigaam_ready():
         t0 = time.monotonic()
         g = nt.GigaAM(["ANE", "CPU"])

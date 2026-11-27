@@ -256,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func openWindow(_ args: [String]) {
+        guard !Checks.active else { return NSLogLine("would open the window: \(args)") }
         let app = Paths.windowApp
         guard FileManager.default.fileExists(atPath: app.path) else {
             post(L("The BMeet window is missing"), L("Run the installer again."))
@@ -601,7 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     @objc private func menuNextLanguage() { switchLanguage(nil) }
     @objc private func menuOpenMeetings() { openWindow(["meetings"]) }
     @objc private func menuOpenFile(_ sender: NSMenuItem) {
-        if let p = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
+        if let p = sender.representedObject as? String, !Checks.active { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
     }
     @objc private func menuTranscribeFile() { openWindow(["transcribe"]) }
     @objc private func menuSettings() { showSettings(.general) }
@@ -643,7 +644,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     /// Run from BMeet.app (not the bare executable of a build or a test).
     private var inBundle: Bool {
-        !checking && Bundle.main.bundleIdentifier != nil && ProcessInfo.processInfo.environment["BMEET_NO_NOTIFY"] == nil
+        !checking && !Checks.active && Bundle.main.bundleIdentifier != nil && ProcessInfo.processInfo.environment["BMEET_NO_NOTIFY"] == nil
     }
 
     func post(_ title: String, _ body: String) {

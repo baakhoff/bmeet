@@ -31,6 +31,10 @@ enum Checks {
 
     enum Outcome { case exit(Int32), app(checking: Bool) }
 
+    /// A check runs: BMeet opens nothing (no app, file or System Settings), posts no
+    /// notification, and never touches the clipboard or pastes, whatever path it takes.
+    private(set) static var active = false
+
     /// What main.swift does with these arguments: run the app, run a check, or end (2: an option
     /// BMeet does not know). macOS's own arguments (-psn_…, -NSKey value, -AppleKey value) pass.
     static func start(_ arguments: [String]) -> Outcome {
@@ -88,6 +92,7 @@ enum Checks {
             complain("--control-check needs BMEET_PYTHON: a stand-in, so that no dictation or meeting records")
             return .exit(2)
         }
+        active = true
         logToFile = false
         if mode != "--control-check" { Paths.pythonForCheck = URL(fileURLWithPath: "/usr/bin/false") }
         DictationPanel.offScreen = true

@@ -68,7 +68,7 @@ final class Dictation {
             guard allowed else {
                 self.notify(L("Dictation needs the microphone"),
                             L("Allow BMeet in System Settings → Privacy & Security → Microphone."))
-                NSWorkspace.shared.open(Microphone.settings)
+                if !Checks.active { NSWorkspace.shared.open(Microphone.settings) }
                 return
             }
             self.record(clipboard: clipboard)
@@ -242,6 +242,7 @@ final class Dictation {
     // MARK: the text into the app you were in
 
     private func deliver(_ text: String) {
+        guard !Checks.active else { return }   // (a check's stand-in engine hears nothing; still, never the clipboard)
         let board = NSPasteboard.general
         if clipboardOnly {
             board.clearContents()

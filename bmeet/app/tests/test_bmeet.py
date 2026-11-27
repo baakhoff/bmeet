@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -I
 """Offscreen tests for the BMeet app: data functions, every page of the window,
-single-instance forwarding and (REAL_TRANSCRIBE=1) the npu-transcribe history change.
+single-instance forwarding and (REAL_TRANSCRIBE=1) the npu-transcribe history change; the
+interface language and its one table of texts (E), the Transcribe page's engine choice (F), the
+feature switches and bmeet-ctl's settings, status and refusals (G).
 
 Safety: works on a TEMPORARY meetings DB with voxtype 1.1.0's schema and synthetic
 rows (voxtype's real index.db is never opened); voxtype is replaced
@@ -18,21 +20,30 @@ NPU_PYTHON (Python with openvino-genai for the real runs; default: the installer
 """
 from __future__ import annotations
 
+import ast
+import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
+import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -40,6 +51,10 @@ HERE = Path(__file__).resolve().parent
 APP_PATH = HERE.parent / "bmeet"
 CTL_PATH = HERE.parent.parent / "bmeet-ctl"
 REPO = HERE.parents[2]
+MEETING_RUNNER = REPO / "macos/bmeet-meeting"
+# a test run must never write QSettings' native place on a Mac (an old run once did: 2026-10-20)
+MAC_PREFS = Path.home() / "Library/Preferences/com.bmeet.bmeet.plist"
+MAC_PREFS_BEFORE = os.stat(MAC_PREFS).st_mtime_ns if MAC_PREFS.exists() else None
 NPU_TRANSCRIBE = REPO / "transcribe/npu-transcribe"
 # The installed models: the tests point XDG_DATA_HOME at a scratch folder (below), and
 # npu-transcribe looks for its models under it.
@@ -108,6 +123,8 @@ def make_fixture() -> dict:
     (WORK / "config/bmeet").mkdir()
     (WORK / "config/bmeet/languages").write_text("en de\n")
     (WORK / "config/bmeet/update-check").write_text("off\n")   # (the window's own check: A_UpdateTests turn it on)
+    # English, whatever this machine's language is (E_LanguageTests try the others)
+    (WORK / "config/bmeet/interface-language").write_text("en\n")
     ids = {k: str(uuid.uuid4()) for k in "ABCD"}
     t = {"A": epoch(2026, 10, 1, 10, 0, 5), "B": epoch(2026, 10, 2, 14, 30, 58),
          "C": epoch(2026, 10, 3, 9, 15, 0), "D": int(time.time()) - 125}
@@ -184,6 +201,9 @@ ENV = {
     "BMEET_SOCKET": str(WORK / "bmeet.sock"),
     "NPU_MODELS_DIR": NPU_MODELS,
     "BMEET_PLATFORM": "linux",   # (on a Mac too: these tests are the Linux window's, with fake voxtype)
+    # ... and should a Mac path run all the same, its runtime folder is this one, never the one of
+    # BMeet.app in real use (agent.sock): no socket is ever made here
+    "BMEET_RUNTIME_ROOT": str(WORK / "rt"),
     # updates: never GitHub; curl reads these files instead (A_UpdateTests writes them)
     "XDG_CACHE_HOME": str(WORK / "cache"),
     "BMEET_RELEASES_URL": (WORK / "releases.json").as_uri(),
@@ -975,6 +995,12 @@ class B_WindowTests(unittest.TestCase):
         self.assertTrue(b.wrapper.isHidden())
 
     # -- structure
+    def test_00_settings_are_the_tests_own(self):
+        """The window keeps its settings in $XDG_CONFIG_HOME/bmeet/bmeet.conf on every system (a
+        Mac's QSettings would use ~/Library/Preferences): here, the work dir's."""
+        self.assertEqual(Path(self.win.settings.fileName()), WORK / "config/bmeet/bmeet.conf")
+        self.assertEqual(self.win.settings.format(), vn.QSettings.Format.IniFormat)
+
     def test_01_pages_build(self):
         w = self.win
         for i, name in enumerate(vn.PAGES):
@@ -1457,10 +1483,11 @@ class B_WindowTests(unittest.TestCase):
         self.assertTrue(wait_until(watch, 20), [(j.state, j.error, j.log) for j in tp.jobs])
         self.assertTrue({0.4, 0.8} & {round(f, 2) for f in fractions if f}, fractions)  # parsed progress
         a, b = tp.jobs
-        self.assertEqual(a.args()[:5], ["--model", "small", "--language", "de", "--translate"])
-        self.assertEqual(a.options_text(), "small · de → English")
+        self.assertEqual(a.args()[:7], ["--engine", "whisper", "--model", "small", "--language", "de", "--translate"])
+        self.assertEqual(a.options_text(), "Whisper small · de → English")
         self.assertEqual([Path(o).name for o in b.outputs], ["b.srt", "b.md"])
-        self.assertEqual(b.language_found, "en")
+        self.assertEqual(b.language_found, "")   # (given, so not detected; F_EngineTests detect one)
+        self.assertEqual(b.ran, "whisper-small-int8-ov")   # (its done line)
         self.assertFalse(tp.run_frame.isVisible())
         # finished queue -> the result opens on the files page
         self.assertEqual(w.page(), "files")
@@ -1535,7 +1562,7 @@ class B_WindowTests(unittest.TestCase):
         w2 = vn.MainWindow()
         w2.handle_request({"page": None, "id": None, "files": []}, initial=True)
         self.assertEqual(w2.page(), "files")
-        self.assertEqual(w2.transcribe_page.options()["model"], "small")  # saved by start_ready
+        self.assertEqual(w2.transcribe_page.options()["engine"], "small")  # saved by start_ready
         self.assertTrue(w2.transcribe_page.log_toggle.isChecked())
         w2.force_quit = True
         w2.close()
@@ -1759,6 +1786,874 @@ class D_RealTranscribeTests(unittest.TestCase):
             vn.TRANSCRIBE = orig
             win.force_quit = True
             win.close()
+
+
+# ============================================================================ settings files, helpers
+
+BMEET_CONFIG = WORK / "config/bmeet"
+FEATURE_FILES = ("dictation", "meetings", "in-person-meetings", "file-transcription")
+
+
+def set_config(name: str, value: str | None) -> None:
+    """One of ~/.config/bmeet's files (here the work dir's); None removes it (its default)."""
+    if value is None:
+        (BMEET_CONFIG / name).unlink(missing_ok=True)
+    else:
+        (BMEET_CONFIG / name).write_text(value + "\n")
+
+
+def reset_config() -> None:
+    for name in FEATURE_FILES:
+        set_config(name, None)
+    set_config("languages", "en de")
+    set_config("language", None)
+    set_config("interface-language", "en")
+
+
+def new_window() -> vn.MainWindow:
+    w = vn.MainWindow()
+    w.error_box = lambda *a: None
+    w.handle_request({"page": None, "id": None, "files": []}, initial=True)
+    w.show()
+    app.processEvents()
+    return w
+
+
+def close_window(w: vn.MainWindow) -> None:
+    w.force_quit = True
+    w.close()
+    w.deleteLater()
+    app.processEvents()
+    vn.texts.use("en")
+
+
+class StandInAgent:
+    """BMeet.app's control socket (agent.sock) in a runtime folder of the test's own: notes each
+    request (one JSON line) and answers it with answer(request)."""
+
+    def __init__(self, path: Path, answer) -> None:
+        self.path, self.answer, self.requests = path, answer, []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(str(path))
+        self.sock.listen(5)
+        self.sock.settimeout(0.1)
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(5)
+                line = conn.makefile("rb").readline()
+                request = json.loads(line)
+                self.requests.append(request)
+                conn.sendall(json.dumps(self.answer(request)).encode() + b"\n")
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.thread.join(5)
+        self.sock.close()
+        self.path.unlink(missing_ok=True)
+
+
+def load_bmeetmac():
+    loader = importlib.machinery.SourceFileLoader("bmeetmac_test", str(REPO / "macos/bmeetmac.py"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+@contextlib.contextmanager
+def runtime_root():
+    """A runtime folder for bmeetmac (BMEET_RUNTIME_ROOT), short for the socket path limit, and
+    the environment as it was afterwards: never the real one of BMeet.app in real use."""
+    root = Path(tempfile.mkdtemp(prefix="bm-"))
+    saved = {k: os.environ.get(k) for k in ("BMEET_RUNTIME_ROOT", "XDG_RUNTIME_DIR", "PATH")}
+    os.environ["BMEET_RUNTIME_ROOT"] = str(root)
+    try:
+        yield root
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def recorder_script(log: Path) -> Path:
+    """A program that notes its arguments in `log` (a stand-in for the file manager)."""
+    script = WORK / f"record-{log.stem}"
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> {shlex.quote(str(log))}\n')
+    script.chmod(0o755)
+    return script
+
+
+# ============================================================================ texts and the interface language
+
+def tr_calls(path: Path) -> list[tuple[int, str, ast.expr | None, ast.expr | None]]:
+    """(line, function, first text, second text) of each tr() / texts.tr() / N_() / ntr() call."""
+    calls = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else (f"{f.value.id}.{f.attr}" if isinstance(f, ast.Attribute)
+                                                     and isinstance(f.value, ast.Name) else None)
+        if name in ("tr", "N_", "texts.tr"):
+            calls.append((node.lineno, name, node.args[0] if node.args else None, None))
+        elif name in ("ntr", "texts.ntr"):
+            calls.append((node.lineno, name, node.args[1], node.args[2]))
+    return calls
+
+
+def literal(node: ast.expr | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def fields(text: str) -> set[str]:
+    return {name for _, name, _, _ in string.Formatter().parse(text) if name is not None}
+
+
+def latin_words(text: str) -> set[str]:
+    """Words in Latin letters, without paths and file names (they name things, not text)."""
+    words = set()
+    for token in text.split():
+        if "/" not in token and "~" not in token:
+            words.update(w.strip(".-") for w in re.findall(r"[A-Za-z][A-Za-z0-9+.-]*", token))
+    return words - {""}
+
+
+# what may stay in Latin letters in the Russian window: names of products, models, keys, formats,
+# and of transcript contents (You, Person 1), which stay English
+LATIN_OK = {"BMeet", "Whisper", "GigaAM", "v3", "large-v3", "turbo", "small", "Markdown", "JSON", "NPU", "CPU",
+            "Meta+H", "Meta+Alt+H", "Meta+Alt+M", "Meta+Alt+Shift+M", "Meta+Shift+H", "Ctrl+V", "Ctrl+F",
+            "voxtype", "Voxtype", "npu-transcribe", "You", "Person", "Remote", "NAME.srt", "NAME.md", "srt", "md",
+            "EN", "DE", "RU", "Dolphin", "Transcribe", "OK", "bmeet-ctl", "update",
+            "whisper-small-int8-ov"}   # (the model in the test's voxtype config: a name)
+
+
+class E_LanguageTests(unittest.TestCase):
+    """The texts a person sees: one table (bmeettext) for the window and bmeet-meeting's
+    notifications, the interface language from ~/.config/bmeet/interface-language, and a window
+    that speaks Russian."""
+
+    def setUp(self):
+        reset_config()
+        self.saved_env = {k: os.environ.get(k) for k in ("LC_ALL", "LC_MESSAGES", "LANG")}
+
+    def tearDown(self):
+        reset_config()
+        for k, v in self.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        vn.texts.use("en")
+
+    def test_every_text_has_a_russian_line(self):
+        """Each tr() text of the window and of bmeet-meeting has its Russian line, with the same
+        {fields}, and each Russian line belongs to a text (on a Mac the window writes ⌃⌥, ⌘ and
+        Finder: those versions have lines of their own). A text made at run time (an f-string)
+        would have none: tr() takes literals, or values marked with N_()."""
+        ru, needed, problems = vn.texts.RU, {}, []
+        for path in (APP_PATH, MEETING_RUNNER):
+            for line, name, first, second in tr_calls(path):
+                text = literal(first)
+                if isinstance(first, ast.Call) and getattr(first.func, "id", "") == "mac_words":
+                    continue   # (the window's own tr() and ntr(), which hand their text on)
+                if text is None:
+                    if isinstance(first, (ast.JoinedStr, ast.BinOp)) or name != "tr" or path != APP_PATH:
+                        problems.append(f"{path.name}:{line}: {name}() of a text made at run time")
+                    continue   # (a value marked with N_ where it was written, checked there)
+                plural = literal(second)
+                variants = {text}
+                if path == APP_PATH and name in ("tr", "N_", "ntr"):   # (texts.tr: already one platform's)
+                    with mock.patch.object(vn, "MAC", True):
+                        variants.add(vn.mac_words(text))
+                for v in variants:
+                    needed[v] = (f"{path.name}:{line}", plural)
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(t for t in needed if t not in ru), [], "texts without a Russian line")
+        self.assertEqual(sorted(t for t in ru if t not in needed), [], "Russian lines without a text")
+        for text, (where, plural) in needed.items():
+            line = ru[text]
+            if plural is None:
+                self.assertIsInstance(line, str, where)
+                self.assertEqual(fields(line), fields(text), where)
+            else:   # (a number's three forms)
+                self.assertIsInstance(line, tuple, where)
+                self.assertEqual(len(line), 3, where)
+                for form in line:
+                    self.assertEqual(fields(form), fields(plural), where)
+        for line in [x for v in ru.values() for x in (v if isinstance(v, tuple) else [v])] \
+                + list(vn.texts.RU_LANGUAGES.values()):
+            self.assertNotIn("ё", line.lower())   # (the glossary: no ё)
+
+    def test_numbers_and_language_names(self):
+        vn.texts.use("ru")
+        self.assertEqual([vn.ntr(n, "{n} file", "{n} files") for n in (1, 2, 5, 11, 21, 22, 112)],
+                         ["1 файл", "2 файла", "5 файлов", "11 файлов", "21 файл", "22 файла", "112 файлов"])
+        self.assertEqual((vn.language_name("de"), vn.language_name("de", True), vn.language_name("xx")),
+                         ("Немецкий", "немецкий", "XX"))
+        vn.texts.use("en")
+        self.assertEqual([vn.ntr(n, "{n} file", "{n} files") for n in (1, 2)], ["1 file", "2 files"])
+        self.assertEqual((vn.language_name("de"), vn.language_name("de", True)), ("German", "German"))
+
+    def test_interface_language_from_the_setting(self):
+        """en and ru as set; system: the first of the system's languages that BMeet has, else
+        English (Linux: LC_ALL, LC_MESSAGES, LANG; a Mac: its list of preferred languages)."""
+        t = vn.texts
+        for value, want in (("en", "en"), ("ru", "ru"), ("RU", "ru")):
+            set_config("interface-language", value)
+            self.assertEqual((t.setting(), t.interface_language()), (value.lower(), want))
+        for value in ("system", "fr", None):   # (missing, or not one BMeet has: system)
+            set_config("interface-language", value)
+            self.assertEqual(t.setting(), "system")
+        with mock.patch.object(t, "MAC", False):
+            for env, want in (({"LC_ALL": "ru_RU.UTF-8", "LANG": "en_US.UTF-8"}, "ru"),
+                              ({"LC_ALL": "", "LC_MESSAGES": "ru_RU.UTF-8", "LANG": "en_US.UTF-8"}, "ru"),
+                              ({"LC_ALL": "", "LC_MESSAGES": "", "LANG": "ru_RU.UTF-8"}, "ru"),
+                              ({"LC_ALL": "de_DE.UTF-8"}, "en"), ({"LC_ALL": "C.UTF-8"}, "en"),
+                              ({"LC_ALL": "", "LC_MESSAGES": "", "LANG": ""}, "en")):
+                os.environ.update(env)
+                self.assertEqual(t.interface_language(), want, env)
+        with mock.patch.object(t, "MAC", True):   # (a stand-in for the Mac's list)
+            for languages, want in ((["de", "ru", "en"], "ru"), (["en", "ru"], "en"), (["fr", "de"], "en")):
+                with mock.patch.object(t, "_mac_languages", lambda langs=languages: langs):
+                    self.assertEqual(t.interface_language(), want, languages)
+            os.environ.update(LC_ALL="ru_RU.UTF-8")   # (the list unreadable: the locale)
+            with mock.patch.object(t, "_mac_languages", lambda: []):
+                self.assertEqual(t.interface_language(), "ru")
+        set_config("interface-language", "en")
+        os.environ.update(LC_ALL="ru_RU.UTF-8")
+        self.assertEqual(t.interface_language(), "en")   # (set: the system does not matter)
+        if sys.platform == "darwin":   # the real list: codes, whatever this Mac's languages are
+            self.assertTrue(all(re.fullmatch(r"[a-z]{2,3}", c) for c in t._mac_languages()), t._mac_languages())
+
+    def test_the_window_in_russian(self):
+        """interface-language ru: the window's pages, engine choices, languages and controls in
+        Russian, and nothing English left in what it shows but names."""
+        set_config("interface-language", "ru")
+        set_config("languages", "en de ru")
+        models = WORK / "models-ru"
+        for f in ("model.xml", "model.bin", "tokens.txt", "model.mlmodelc"):
+            (models / "gigaam-v3-ctc-ru").mkdir(parents=True, exist_ok=True)
+            (models / "gigaam-v3-ctc-ru" / f).touch()
+        with mock.patch.object(vn, "MODELS_DIR", models):
+            w = new_window()
+            try:
+                self.assertEqual(w.ui_language, "ru")
+                self.assertEqual([w.nav.item(i).text().split(" (")[0] for i in range(3)],
+                                 ["Встречи", "Расшифрованные файлы", "Расшифровать файл"])
+                tp = w.transcribe_page
+                self.assertEqual([tp.engine.itemText(i) for i in range(tp.engine.count())],
+                                 ["Автоматически", "GigaAM v3 (русский)", "Whisper large-v3 turbo", "Whisper small"])
+                self.assertEqual([tp.language.itemText(i) for i in range(tp.language.count())],
+                                 ["Определить автоматически", "Английский", "Немецкий", "Русский"])
+                self.assertEqual((w.act_meet_start.text(), w.act_meet_room.text()), ("Начать встречу", "Очная встреча"))
+                self.assertEqual(w.meetings_page.tree.headerItem().text(0), "Название")
+                self.assertIn("Различаем", vn.tr("Telling the speakers apart… the transcript is replaced when that "
+                                                 "is done."))
+                shown = []
+                data = {p.title for p in (w.meetings_page, w.files_page)} | {p.meta for p in (w.meetings_page,
+                                                                                            w.files_page)}
+                for widget in [w, *w.findChildren(vn.QWidget)]:
+                    if widget in data:   # (a meeting's or a file's own title and details)
+                        continue
+                    shown.append(widget.toolTip())
+                    for attr in ("text", "placeholderText", "windowTitle"):
+                        if hasattr(widget, attr) and callable(getattr(widget, attr)):
+                            with contextlib.suppress(TypeError):
+                                shown.append(getattr(widget, attr)())
+                for act in w.findChildren(vn.QAction):
+                    shown += [act.text(), act.toolTip()]
+                for combo in w.findChildren(vn.QComboBox):
+                    shown += [combo.itemText(i) for i in range(combo.count())]
+                for tree in w.findChildren(vn.QTreeWidget):
+                    shown += [tree.headerItem().text(i) for i in range(tree.columnCount())]
+                shown += [w.nav.item(i).text() for i in range(w.nav.count())]
+                shown += [w.meetings_page.empty_text(), w.files_page.empty_text(), tp.hint.text()]
+                words = set().union(*(latin_words(s) for s in shown if isinstance(s, str)))
+                self.assertEqual(sorted(words - LATIN_OK), [], "English left in the Russian window")
+            finally:
+                close_window(w)
+
+    def test_qt_translations(self):
+        """Qt's own texts too (standard buttons, a Mac's application menu), where Qt has them."""
+        before = vn.QApplication.translate("QPlatformTheme", "Cancel")
+        vn.install_qt_translations(app, "en")
+        self.assertEqual(vn.QApplication.translate("QPlatformTheme", "Cancel"), before)
+        from PyQt6.QtCore import QLibraryInfo
+        if not (Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)) / "qtbase_ru.qm").exists():
+            self.skipTest("this Qt has no Russian translations")
+        vn.install_qt_translations(app, "ru")
+        try:
+            self.assertEqual(vn.QApplication.translate("QPlatformTheme", "Cancel"), "Отмена")
+        finally:
+            for t in app.findChildren(vn.QObject):
+                if type(t).__name__ == "QTranslator":
+                    app.removeTranslator(t)
+                    t.deleteLater()
+        self.assertEqual(vn.QApplication.translate("QPlatformTheme", "Cancel"), before)
+
+    def test_language_changed_while_open(self):
+        """Another interface language while the window runs: it says it switches when it opens
+        again, with Restart (its texts are made with each widget, so not redone in place)."""
+        w = new_window()
+        b = w.language_banner
+        try:
+            self.assertTrue(b.wrapper.isHidden())
+            set_config("interface-language", "ru")
+            w.poll()
+            self.assertFalse(b.wrapper.isHidden())
+            self.assertEqual(b.text.text(), "This window switches to Russian when it opens again.")
+            self.assertEqual([x.text() for x in b.findChildren(vn.QPushButton)], ["Restart", "Later"])
+            self.assertEqual(w.act_meet_start.text(), "Start meeting")   # (still English until then)
+            w.hide_language()                                             # Later: not again for ru
+            w.poll()
+            self.assertTrue(b.wrapper.isHidden())
+            set_config("interface-language", "system")
+            with mock.patch.dict(os.environ, {"LC_ALL": "en_US.UTF-8"}), mock.patch.object(vn.texts, "MAC", False):
+                w.poll()
+            self.assertTrue(b.wrapper.isHidden())                         # (system is English here: the same)
+            detached = []
+            with mock.patch.object(vn, "run_detached", detached.append):
+                set_config("interface-language", "ru")
+                w._language_hidden = None
+                w.poll()
+                b.findChildren(vn.QPushButton)[0].click()                 # Restart: this window, then the new one
+                self.assertEqual(detached[-1][:2], ["/bin/sh", "-c"])
+                self.assertIn('"$3" open "$4"', detached[-1][2])
+                self.assertEqual(detached[-1][-2:], [str(vn.CTL_PATH), w.page()])
+        finally:
+            close_window(w)
+
+    def test_meeting_notifications_in_russian(self):
+        """bmeet-meeting's notifications come from the same table: one that needs nothing
+        recorded (a start while another is starting) reaches a stand-in BMeet.app in Russian."""
+        with runtime_root() as root:
+            agent = StandInAgent(root / "bmeet/agent.sock", lambda req: {"ok": True})
+            env = dict(os.environ, BMEET_RUNTIME_ROOT=str(root), XDG_CONFIG_HOME=str(WORK / "config"),
+                       XDG_DATA_HOME=str(root / "data"), BMEET_MEETING_DB=str(root / "index.db"),
+                       VOXTYPE_MEETING_DIR=str(root / "Meetings"))
+            try:
+                with open(root / "bmeet/meeting.lock", "w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)          # (a start or stop is running)
+                    for language, title in (("ru", "Встреча уже начинается или останавливается"),
+                                            ("en", "Meeting start or stop already running")):
+                        set_config("interface-language", language)
+                        r = subprocess.run([sys.executable, "-I", str(MEETING_RUNNER), "start"], env=env,
+                                           capture_output=True, text=True, timeout=60)
+                        self.assertEqual(r.returncode, 0, r.stderr)
+                        self.assertEqual(agent.requests[-1]["op"], "notify")
+                        self.assertEqual(agent.requests[-1]["title"], title)
+            finally:
+                agent.close()
+            self.assertFalse((root / "bmeet/meeting_state").exists())   # (nothing was started)
+
+
+# ============================================================================ the engine choice
+
+class F_EngineTests(unittest.TestCase):
+    """Transcribe a file: Engine (Automatic, GigaAM v3, Whisper turbo, Whisper small), what
+    each passes to npu-transcribe, GigaAM ↔ Russian ↔ Translate, the Options column, the
+    options saved, and the languages offered (those that are on)."""
+    win: vn.MainWindow
+
+    @classmethod
+    def setUpClass(cls):
+        reset_config()
+        set_config("languages", "en de ru")
+        cls.models = WORK / "models"
+        cls.patch = mock.patch.object(vn, "MODELS_DIR", cls.models)
+        cls.patch.start()
+        os.environ["NPU_MODELS_DIR"] = str(cls.models)   # (the fake npu-transcribe's GigaAM)
+        cls.gigaam(True)
+        cls.win = new_window()
+
+    @classmethod
+    def tearDownClass(cls):
+        close_window(cls.win)
+        cls.patch.stop()
+        os.environ["NPU_MODELS_DIR"] = NPU_MODELS
+        reset_config()
+
+    @classmethod
+    def gigaam(cls, installed: bool) -> None:
+        """A stand-in for GigaAM v3's files (the ones of Linux and of a Mac), or none."""
+        folder = cls.models / "gigaam-v3-ctc-ru"
+        shutil.rmtree(folder, ignore_errors=True)
+        if installed:
+            (folder / "model.mlmodelc").mkdir(parents=True)
+            for f in ("model.xml", "model.bin", "tokens.txt"):
+                (folder / f).touch()
+
+    def offers(self) -> tuple[list[str], list[str]]:
+        tp = self.win.transcribe_page
+        return ([tp.engine.itemData(i) for i in range(tp.engine.count())],
+                [tp.language.itemData(i) for i in range(tp.language.count())])
+
+    def choose(self, combo, value) -> None:
+        combo.setCurrentIndex(combo.findData(value))   # (as a click: its reactions run)
+
+    def setUp(self):
+        set_config("languages", "en de ru")
+        self.gigaam(True)
+        self.win.poll()
+        self.win.transcribe_page.set_options("auto", "auto", False)   # (not what earlier tests saved)
+
+    def test_engines_offered(self):
+        tp = self.win.transcribe_page
+        self.assertEqual(self.offers(), (["auto", "gigaam", "turbo", "small"], ["auto", "en", "de", "ru"]))
+        self.assertEqual([tp.engine.itemText(i) for i in range(4)],
+                         ["Automatic", "GigaAM v3 (Russian)", "Whisper large-v3 turbo", "Whisper small"])
+        self.assertIn("GigaAM v3 for Russian, with Whisper turbo redoing the sentences", tp.hint.text())
+        self.gigaam(False)                       # (installed --no-gigaam): not offered
+        self.win.poll()
+        self.assertEqual(self.offers()[0], ["auto", "turbo", "small"])
+        self.assertIn("GigaAM v3 for Russian is not installed", tp.hint.text())
+        self.gigaam(True)
+        set_config("languages", "en de")         # Russian off: not offered either
+        self.win.poll()
+        self.assertEqual(self.offers(), (["auto", "turbo", "small"], ["auto", "en", "de"]))
+        set_config("languages", "en de ru")      # back while the window is open
+        self.win.poll()
+        self.assertEqual(self.offers()[0], ["auto", "gigaam", "turbo", "small"])
+
+    def test_gigaam_russian_translate(self):
+        tp = self.win.transcribe_page
+        tp.set_options("auto", "de", True)
+        self.choose(tp.engine, "gigaam")         # GigaAM: Russian, no translation
+        self.assertEqual(tp.options(), {"engine": "gigaam", "language": "ru", "translate": False})
+        self.assertIn("GigaAM v3 transcribes the Russian speech, and Whisper turbo redoes", tp.hint.text())
+        tp.translate.setChecked(True)            # Translate: not GigaAM (small translates best)
+        self.assertEqual(tp.options(), {"engine": "small", "language": "ru", "translate": True})
+        self.assertIn("Translation uses the small model", tp.hint.text())
+        tp.translate.setChecked(False)
+        self.choose(tp.engine, "gigaam")
+        self.choose(tp.language, "de")           # another language: not GigaAM
+        self.assertEqual(tp.options(), {"engine": "auto", "language": "de", "translate": False})
+        self.choose(tp.language, "auto")
+        self.choose(tp.engine, "gigaam")
+        self.assertEqual(tp.options()["language"], "ru")
+        self.choose(tp.engine, "turbo")          # (Whisper keeps the language)
+        self.assertEqual(tp.options(), {"engine": "turbo", "language": "ru", "translate": False})
+        tp.set_options("gigaam", "en", True)     # (saved options that break the rules: GigaAM's win)
+        self.assertEqual(tp.options(), {"engine": "gigaam", "language": "ru", "translate": False})
+        tp.set_options("gigaam", "ru", False)
+        set_config("languages", "en de")         # Russian turned off while GigaAM is chosen
+        self.win.poll()
+        self.assertEqual(tp.options()["engine"], "auto")
+        self.assertEqual(tp.options()["language"], "auto")
+
+    def test_what_each_choice_passes(self):
+        J = vn.Job
+        self.assertEqual(J("/x.ogg", engine="auto").args(),
+                         ["--engine", "auto", "--model", "turbo", "--language", "auto", "--", "/x.ogg"])
+        self.assertEqual(J("/x.ogg", engine="gigaam", language="ru").args()[:6],
+                         ["--engine", "gigaam", "--model", "turbo", "--language", "ru"])
+        self.assertEqual(J("/x.ogg", engine="turbo", language="de").args()[:6],
+                         ["--engine", "whisper", "--model", "turbo", "--language", "de"])
+        self.assertEqual(J("/x.ogg", engine="small", language="en", translate=True).args(),
+                         ["--engine", "whisper", "--model", "small", "--language", "en", "--translate", "--", "/x.ogg"])
+        # the Options column before it runs: what will run
+        for kw, want in (({"engine": "gigaam", "language": "ru"}, "GigaAM v3 · ru"),
+                         ({"engine": "auto", "language": "ru"}, "GigaAM v3 · ru"),
+                         ({"engine": "auto", "language": "auto"}, "Automatic · auto"),
+                         ({"engine": "auto", "language": "de"}, "Whisper turbo · de"),
+                         ({"engine": "turbo", "language": "auto"}, "Whisper turbo · auto"),
+                         ({"engine": "auto", "language": "ru", "translate": True}, "Whisper turbo · ru → English"),
+                         ({"engine": "small", "language": "en"}, "Whisper small · en")):
+            self.assertEqual(J("/x.ogg", state="queued", **kw).options_text(), want, kw)
+        self.gigaam(False)
+        self.assertEqual(J("/x.ogg", state="queued", engine="auto", language="ru").options_text(), "Whisper turbo · ru")
+        self.assertEqual(J("/x.ogg").options_text(), "–")   # (ready: its options are taken at the start)
+
+    def test_runs_and_shows_what_ran(self):
+        """Through the queue (the fake npu-transcribe chooses as the real one): the Options
+        column says what ran, the Files page names the model, the options are saved."""
+        w, tp = self.win, self.win.transcribe_page
+        w.set_page("transcribe")
+        tp.clear_finished()
+        tp.set_options("gigaam", "ru", False)
+        tp.add_files([FIX["files"]["a.ogg"]])
+        tp.start_ready()
+        tp.set_options("auto", "auto", False)
+        tp.add_files([FIX["files"]["b.ogg"]])
+        tp.start_ready()
+        a, b = tp.jobs
+        self.assertEqual((a.item.text(1), b.item.text(1)), ("GigaAM v3 · ru", "Automatic · auto"))
+        self.assertTrue(wait_until(lambda: all(j.state == "done" for j in tp.jobs), 20), [j.log for j in tp.jobs])
+        self.assertEqual(a.args()[:2], ["--engine", "gigaam"])
+        self.assertEqual((a.ran, a.item.text(1)), ("gigaam-v3-ctc", "GigaAM v3 · ru"))
+        self.assertEqual((b.language_found, b.item.text(1)), ("en", "Whisper turbo · en"))
+        w.files_page.reload()
+        entry = next(k for k, e in w.files_page.entries.items() if e.name == "a.ogg" and e.model == "gigaam")
+        self.assertEqual(w.files_page.item_for(entry).text(3), "GigaAM v3 · NPU")
+        self.assertEqual(w.settings.value("transcribe/engine"), "auto")   # (the last start's)
+        # Transcribe again: the file is queued, and takes the page's options when started
+        self.assertTrue(w.files_page.select_key(entry))
+        tp.set_options("gigaam", "ru", False)
+        w.files_page.again()
+        self.assertEqual(w.page(), "transcribe")
+        self.assertEqual(tp.jobs[-1].state, "ready")
+        tp.start_ready()
+        self.assertEqual(tp.jobs[-1].args()[:6], ["--engine", "gigaam", "--model", "turbo", "--language", "ru"])
+        self.assertTrue(wait_until(lambda: tp.jobs[-1].state == "done", 20))
+        tp.clear_finished()
+
+    def test_options_saved_and_restored(self):
+        s = self.win.settings
+        s.setValue("transcribe/engine", "gigaam")
+        s.setValue("transcribe/language", "ru")
+        s.setValue("transcribe/translate", False)
+        w2 = vn.MainWindow()
+        try:
+            self.assertEqual(w2.transcribe_page.options(), {"engine": "gigaam", "language": "ru", "translate": False})
+        finally:
+            close_window(w2)
+        # from before the engine choice: a Whisper size (turbo was Automatic: no --engine)
+        s.remove("transcribe/engine")
+        for model, engine in (("turbo", "auto"), ("small", "small"), (None, "auto")):
+            if model:
+                s.setValue("transcribe/model", model)
+            else:
+                s.remove("transcribe/model")
+            s.setValue("transcribe/language", "de")
+            w2 = vn.MainWindow()
+            try:
+                self.assertEqual(w2.transcribe_page.options()["engine"], engine, model)
+            finally:
+                close_window(w2)
+        s.setValue("transcribe/engine", "gigaam")   # GigaAM saved, but not installed any more
+        self.gigaam(False)
+        w2 = vn.MainWindow()
+        try:
+            self.assertEqual(w2.transcribe_page.options(), {"engine": "auto", "language": "de", "translate": False})
+        finally:
+            close_window(w2)
+
+    def test_languages_that_are_off(self):
+        """Only the languages that are on, and Detect automatically: English too is one of them
+        (no longer offered when it is off), on the page and on the toolbar's language button."""
+        w, tp = self.win, self.win.transcribe_page
+        tp.set_options("auto", "de", False)
+        set_config("languages", "de ru")
+        set_config("language", None)
+        w.poll()
+        self.assertEqual(self.offers()[1], ["auto", "de", "ru"])
+        self.assertEqual(tp.options()["language"], "de")
+        set_config("languages", "ru")            # the chosen one turned off: Detect automatically
+        w.poll()
+        self.assertEqual(self.offers()[1], ["auto", "ru"])
+        self.assertEqual(tp.options()["language"], "auto")
+        st = vn.ctl.status()                     # the toolbar's button cycles the languages that are on
+        self.assertEqual((st["languages"], st["next_language"]), (["ru"], "ru"))   # (voxtype's says en)
+        self.assertIn("switch to Russian", w.act_lang.toolTip())
+        self.assertNotIn("German", w.act_lang.toolTip())
+
+
+# ============================================================================ features, bmeet-ctl
+
+class G_FeatureTests(unittest.TestCase):
+    """~/.config/bmeet/dictation, meetings, in-person-meetings, file-transcription: a feature that
+    is off disappears from the window while it is open, what it made stays listed; bmeet-ctl's
+    status, its refusals, and `bmeet-ctl settings`."""
+    win: vn.MainWindow
+
+    @classmethod
+    def setUpClass(cls):
+        reset_config()
+        cls.win = new_window()
+
+    @classmethod
+    def tearDownClass(cls):
+        close_window(cls.win)
+        reset_config()
+
+    def setUp(self):
+        reset_config()
+        (WORK / "run/meeting_state").write_text("idle\n")
+        (WORK / "run/state").write_text("idle\n")
+        self.win.poll()
+
+    def tearDown(self):
+        reset_config()
+        (WORK / "run/meeting_state").write_text("idle\n")
+        (WORK / "run/state").write_text("idle\n")
+        self.win.poll()
+
+    def visible(self) -> dict[str, bool]:
+        w = self.win
+        acts = {"dictation state": w.act_dict_state, "dictate": w.act_dictate, "language": w.act_lang,
+                "cancel": w.act_cancel, "start meeting": w.act_meet_start, "in person": w.act_meet_room,
+                "meeting state": w.act_meet_state, "pause": w.act_meet_pause, "stop": w.act_meet_stop,
+                "transcribe again": w.files_page.act_again}
+        out = {name: act.isVisible() for name, act in acts.items()}
+        out["transcribe page"] = not w.nav.item(2).isHidden()
+        out["Ctrl+O"] = all(s.isEnabled() if isinstance(s, vn.QShortcut) else s.isVisible()
+                            for s in w.transcribe_shortcuts)
+        return out
+
+    def test_each_feature_hides_its_controls(self):
+        w = self.win
+        everything = {"dictation state": True, "dictate": True, "language": True, "cancel": False,
+                      "start meeting": True, "in person": True, "meeting state": True, "pause": True,
+                      "stop": True, "transcribe again": True, "transcribe page": True, "Ctrl+O": True}
+        self.assertEqual(self.visible(), everything)
+        counts = (w.meetings_page.tree.topLevelItemCount(), w.files_page.tree.topLevelItemCount())
+        for files, gone in (
+                ({"dictation": "off"}, {"dictation state", "dictate", "language"}),
+                ({"meetings": "off"}, {"start meeting"}),
+                ({"in-person-meetings": "off"}, {"in person"}),
+                ({"meetings": "off", "in-person-meetings": "off"},
+                 {"start meeting", "in person", "meeting state", "pause", "stop"}),
+                ({"file-transcription": "off"}, {"transcribe again", "transcribe page", "Ctrl+O"})):
+            for name, value in files.items():
+                set_config(name, value)
+            w.poll()                                 # (open: it follows at once)
+            self.assertEqual({k for k, v in self.visible().items() if not v} - {"cancel"}, gone, files)
+            # the history stays
+            self.assertEqual((w.meetings_page.tree.topLevelItemCount(), w.files_page.tree.topLevelItemCount()),
+                             counts, files)
+            reset_config()
+            w.poll()                                 # turned on again: back
+            self.assertEqual(self.visible(), everything, files)
+        set_config("dictation", "off")               # (Cancel shows while one dictates, but not while off)
+        (WORK / "run/state").write_text("recording\n")
+        w.poll()
+        self.assertFalse(w.act_cancel.isVisible())
+        set_config("dictation", None)
+        w.poll()
+        self.assertTrue(w.act_cancel.isVisible())
+
+    def test_a_running_meeting_can_still_be_stopped(self):
+        set_config("meetings", "off")
+        set_config("in-person-meetings", "off")
+        (WORK / "run/meeting_state").write_text("recording\n")
+        self.win.poll()
+        v = self.visible()
+        self.assertEqual((v["start meeting"], v["in person"], v["stop"], v["pause"]), (False, False, True, True))
+        self.assertTrue(self.win.act_meet_stop.isEnabled())
+
+    def test_file_transcription_off(self):
+        """No Transcribe page, ⌘3/⌘O (Ctrl+O) or Transcribe again; a recording opened with BMeet is
+        not queued; the Transcribed files page stays with its list, saying nothing that starts one."""
+        w = self.win
+        w.set_page("transcribe")
+        set_config("file-transcription", "off")
+        w.poll()
+        self.assertEqual(w.page(), "files")          # (it was open: its history instead)
+        w.set_page("transcribe")
+        self.assertEqual(w.page(), "files")
+        before = len(w.transcribe_page.jobs)
+        w.handle_request({"page": None, "id": None, "files": [FIX["files"]["clip.ogg"]]})
+        self.assertEqual(len(w.transcribe_page.jobs), before)
+        self.assertIn("File transcription is turned off", w.statusBar().currentMessage())
+        self.assertEqual(w.files_page.empty_text(), "No transcribed files yet.")
+        w.open_files()                               # (⌘O: nothing; a dry run never shows a dialog anyway)
+        self.assertEqual(w.page(), "files")
+        set_config("file-transcription", None)
+        w.poll()
+        self.assertIn("Transcribe a file", w.files_page.empty_text())
+        w.set_page("transcribe")
+        self.assertEqual(w.page(), "transcribe")
+
+    def test_meetings_page_text_follows(self):
+        """An empty list says how to start a meeting, only the kinds that are on."""
+        p = self.win.meetings_page
+        with mock.patch.object(vn, "MEETING_DB", WORK / "no-meetings.db"):
+            p.reload()                                   # (no meetings: the placeholder shows)
+            try:
+                self.assertEqual(p.detail_stack.currentIndex(), 0)
+                self.assertIn("Press “Start meeting” above", p.placeholder.text())
+                set_config("meetings", "off")
+                self.win.poll()
+                self.assertIn("Press “In person” above", p.placeholder.text())
+                set_config("in-person-meetings", "off")
+                self.win.poll()
+                self.assertEqual(p.placeholder.text(), "No meetings yet.")
+            finally:
+                reset_config()
+                self.win.poll()
+        p.reload()
+        self.assertEqual(p.tree.topLevelItemCount(), len(vn.load_meetings()))
+
+    def test_mac_menus(self):
+        """A Mac's menus: Settings… and About BMeet open BMeet.app's Settings window (bmeet-ctl
+        settings), Transcribe Files… (⌘O) and Transcribe a File (⌘3) go with file transcription."""
+        from PyQt6.QtWidgets import QMenu
+        w2 = vn.MainWindow()
+        detached = []
+        try:
+            vn.apply_mac_look(w2, w2.split.widget(0))
+            menus = {a.text(): a for m in w2.menuBar().findChildren(QMenu) for a in m.actions() if a.text()}
+            with mock.patch.object(vn, "run_detached", detached.append):
+                menus["Settings…"].trigger()
+                menus["About BMeet"].trigger()
+            self.assertEqual([c[-2:] for c in detached], [[str(vn.CTL_PATH), "settings"], ["settings", "about"]])
+            self.assertEqual(menus["Settings…"].shortcut().toString(), "Ctrl+,")
+            set_config("file-transcription", "off")
+            w2.poll()
+            self.assertFalse(menus["Transcribe Files…"].isVisible() or menus["Transcribe a File"].isVisible())
+            self.assertTrue(menus["Transcribed Files"].isVisible())
+            set_config("dictation", "off")
+            w2.poll()
+            controls = next(m for m in w2.menuBar().findChildren(QMenu) if m.title() == "Controls")
+            self.assertIn(w2.act_dictate, controls.actions())   # (the same action as the toolbar's: gone too)
+            self.assertFalse(w2.act_dictate.isVisible())
+        finally:
+            close_window(w2)
+
+    # -- bmeet-ctl
+    OLD_KEYS = {"daemon", "dictation", "live_dictation", "meeting", "meeting_id", "meeting_title", "meeting_started",
+                "meeting_live", "speakers_pending", "language", "next_language", "languages", "model", "device",
+                "version", "update"}   # (the panel widget reads them)
+
+    def test_ctl_status_keys(self):
+        st = vn.ctl.status()
+        self.assertEqual(set(st), self.OLD_KEYS | {"features", "interface_language"})
+        self.assertEqual(st["features"], dict.fromkeys(vn.FEATURES, True))
+        self.assertEqual(st["interface_language"], "en")
+        set_config("meetings", "off")
+        set_config("file-transcription", "OFF")
+        set_config("dictation", "on")
+        set_config("interface-language", "ru")
+        st = vn.ctl.status()
+        self.assertEqual(st["features"], {"dictation": True, "meetings": False, "in_person_meetings": True,
+                                          "file_transcription": False})
+        self.assertEqual(st["interface_language"], "ru")
+        r = subprocess.run([sys.executable, "-I", str(CTL_PATH), "status"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(r.stdout)["features"]["meetings"], False)   # (the widget's way)
+
+    def test_ctl_live_dictation_follows_the_platform(self):
+        set_config("live-dictation", None)
+        try:
+            self.assertEqual(vn.ctl.live_dictation(), "off")          # Linux: off without the file
+            with mock.patch.object(vn.ctl, "MAC", True):
+                self.assertEqual(vn.ctl.live_dictation(), "on")       # a Mac: on, as BMeet.app reads it
+                set_config("live-dictation", "off")
+                self.assertEqual(vn.ctl.live_dictation(), "off")
+            set_config("live-dictation", "panel")
+            self.assertEqual(vn.ctl.live_dictation(), "panel")
+        finally:
+            set_config("live-dictation", None)
+
+    def test_ctl_mac_language_is_one_that_is_on(self):
+        ctl = vn.ctl
+        with mock.patch.object(ctl, "MAC", True):
+            set_config("languages", "ru en")
+            self.assertEqual(ctl.config()["openvino"]["language"], "ru")   # (none set: the first)
+            set_config("language", "en")
+            self.assertEqual(ctl.config()["openvino"]["language"], "en")
+            set_config("language", "de")                                   # (turned off: the first)
+            self.assertEqual(ctl.config()["openvino"]["language"], "ru")
+
+    def test_ctl_refusals(self):
+        """dictate, lang and starting a meeting refuse while their feature is off (status 3, why on
+        stderr); stopping, pausing and resuming a meeting still work. BMeet.app is a stand-in."""
+        ctl, sent = vn.ctl, []
+        from types import SimpleNamespace as NS
+        fake = NS(agent=lambda command, timeout=5.0: sent.append(command) or {"ok": True}, agent_running=lambda: True)
+
+        def run(*args) -> tuple[int, str]:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = ctl.main(list(args))
+            return code, err.getvalue()
+        with mock.patch.object(ctl, "MAC", True), mock.patch.object(ctl, "bmeetmac", fake, create=True):
+            set_config("dictation", "off")
+            for args in (["dictate"], ["dictate", "--clipboard"], ["lang", "de"], ["lang"]):
+                code, err = run(*args)
+                self.assertEqual(code, ctl.TURNED_OFF, args)
+                self.assertIn("dictation is turned off", err)
+            self.assertEqual(sent, [])
+            self.assertFalse((BMEET_CONFIG / "language").exists())
+            self.assertEqual(run("cancel")[0], 0)                       # (cancelling is never refused)
+            set_config("dictation", None)
+            self.assertEqual(run("dictate")[0], 0)
+            self.assertEqual(sent[-1]["op"], "dictate")
+            sent.clear()
+            set_config("meetings", "off")
+            code, err = run("meeting", "start")
+            self.assertEqual((code, sent), (ctl.TURNED_OFF, []))
+            self.assertIn("online meetings are turned off", err)
+            self.assertEqual(run("meeting", "toggle")[0], ctl.TURNED_OFF)   # (it would start one)
+            self.assertEqual(run("meeting", "start", "--in-person")[0], 0)  # (in person is on)
+            self.assertEqual(sent[-1], {"op": "meeting", "action": "start", "in_person": True})
+            set_config("in-person-meetings", "off")
+            self.assertEqual(run("meeting", "toggle", "--in-person")[0], ctl.TURNED_OFF)
+            (WORK / "run/meeting_state").write_text("recording\n")      # one runs: it can be stopped
+            sent.clear()
+            for args in (["meeting", "toggle"], ["meeting", "stop"], ["meeting", "pause"], ["meeting", "resume"]):
+                self.assertEqual(run(*args)[0], 0, args)
+            self.assertEqual([c["action"] for c in sent], ["toggle", "stop", "pause", "resume"])
+            self.assertEqual(run("meeting", "start")[0], ctl.TURNED_OFF)
+        # the same as a program on Linux (only what is refused: the rest would run voxtype)
+        set_config("dictation", "off")
+        for args in (["dictate"], ["lang", "de"], ["meeting", "start"]):
+            r = subprocess.run([sys.executable, "-I", str(CTL_PATH), *args], capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 3, (args, r.stderr))
+            self.assertRegex(r.stderr, r"^bmeet-ctl: .* turned off in BMeet's settings \(~/\.config/bmeet/")
+
+    def test_ctl_settings(self):
+        """`bmeet-ctl settings [PAGE]`: the settings op to BMeet.app's control socket (a stand-in,
+        in a runtime folder of the test's own); without an answer, or from a BMeet.app without
+        that op, and on Linux: the settings folder in the file manager (a stand-in)."""
+        ctl, log = vn.ctl, WORK / "file-manager.log"
+        log.unlink(missing_ok=True)
+        manager = recorder_script(log)
+        saved = os.environ.get("BMEET_FILE_MANAGER")
+        os.environ["BMEET_FILE_MANAGER"] = str(manager)
+        try:
+            with runtime_root() as root, mock.patch.object(ctl, "MAC", True), \
+                    mock.patch.object(ctl, "bmeetmac", load_bmeetmac(), create=True):
+                answers = {"settings": {"ok": True}}
+                agent = StandInAgent(root / "bmeet/agent.sock",
+                                     lambda req: answers.get(req.get("op"), {"ok": False, "error": "unknown op"}))
+                try:
+                    self.assertEqual(ctl.main(["settings", "features"]), 0)
+                    self.assertEqual(ctl.main(["settings"]), 0)
+                    self.assertEqual(agent.requests, [{"op": "settings", "page": "features"},
+                                                      {"op": "settings", "page": "general"}])
+                    self.assertFalse(log.exists())
+                    answers.clear()                                  # a BMeet.app of before: unknown op
+                    self.assertEqual(ctl.main(["settings", "about"]), 0)
+                    self.assertEqual(log.read_text().splitlines(), [str(BMEET_CONFIG)])
+                finally:
+                    agent.close()
+                self.assertEqual(ctl.main(["settings", "shortcuts"]), 0)  # not running at all
+                self.assertEqual(log.read_text().splitlines(), [str(BMEET_CONFIG)] * 2)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ctl.main(["settings", "bogus"]), 2)
+                    self.assertEqual(ctl.main(["settings", "general", "about"]), 2)
+                self.assertIn("usage: bmeet-ctl settings [general|features|languages|shortcuts|about]", err.getvalue())
+            log.unlink()
+            r = subprocess.run([sys.executable, "-I", str(CTL_PATH), "settings"], capture_output=True, text=True,
+                               timeout=30)                           # Linux: the folder
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(log.read_text().splitlines(), [str(BMEET_CONFIG)])
+        finally:
+            if saved is None:
+                os.environ.pop("BMEET_FILE_MANAGER", None)
+            else:
+                os.environ["BMEET_FILE_MANAGER"] = saved
+            log.unlink(missing_ok=True)
+
+    def test_z_mac_preferences_untouched(self):
+        """No test wrote QSettings' native place on a Mac (a run before bmeet.conf once did)."""
+        now = os.stat(MAC_PREFS).st_mtime_ns if MAC_PREFS.exists() else None
+        self.assertEqual(now, MAC_PREFS_BEFORE)
 
 
 if __name__ == "__main__":

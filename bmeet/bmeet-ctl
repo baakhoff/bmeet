@@ -2,7 +2,7 @@
 """bmeet-ctl - one JSON interface to voxtype + npu-transcribe for the BMeet
 panel widget and app. Stdlib only, runs on the system python3.
 
-  bmeet-ctl status                     JSON: dictation/meeting state, language, ...
+  bmeet-ctl status                     JSON: dictation/meeting state, language, features, ...
   bmeet-ctl recent [--limit N]         JSON list: meetings + transcribed files, newest first
   bmeet-ctl dictate [--clipboard]      toggle dictation (paste at cursor, or clipboard only); with
                                        ~/.config/bmeet/live-dictation "on" or "panel": BMeet's own,
@@ -12,16 +12,25 @@ panel widget and app. Stdlib only, runs on the system python3.
   bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]
                                        (--in-person: microphone only, split by voice)
   bmeet-ctl open [meetings|files|transcribe] [--id ID] [--file PATH]   open the app
+  bmeet-ctl settings [general|features|languages|shortcuts|about]
+                                       BMeet's Settings window on that page (BMeet.app's, on a Mac);
+                                       on Linux, or when BMeet.app does not answer: ~/.config/bmeet
   bmeet-ctl update [-- OPTIONS]        install the newest release for this system: its installer,
                                        with the options BMeet was installed with (and OPTIONS)
   bmeet-ctl update --check [--json]    only look for a newer release (asks GitHub)
   bmeet-ctl update --terminal          `update` in a new terminal window (the apps' Update button)
   bmeet-ctl version
 
+Features that are off (~/.config/bmeet/dictation, meetings, in-person-meetings saying "off"):
+`dictate` and `lang` refuse while dictation is off, and `meeting start` (or a `toggle` that would
+start one) while that kind of meeting is off; stopping, pausing and resuming a meeting still work.
+A refusal says so on stderr and exits with status 3. Other statuses: 0 done, 1 failed, 2 usage.
+
 Data sources (read-only): $XDG_RUNTIME_DIR/voxtype/{state,meeting_state,pid,meeting-toggle.started},
 $XDG_RUNTIME_DIR/bmeet/meeting-audio/*/{speaker-pass,live.md},
 ~/.config/voxtype/config.toml, ~/.config/bmeet/languages (the languages
-`lang toggle` cycles through, e.g. "en de"), ~/.local/share/voxtype/meetings/index.db,
+`lang toggle` cycles through, e.g. "en de"), the feature switches and interface-language in
+~/.config/bmeet, ~/.local/share/voxtype/meetings/index.db,
 ~/Documents/Meetings/*.md, ~/.local/share/npu-transcribe/history.jsonl.
 Actions that can take long (meeting stop waits for the last chunk) run detached.
 
@@ -35,7 +44,8 @@ Path overrides for testing (env): BMEET_RUN_DIR, BMEET_AUDIO_DIR, BMEET_MEETING_
 VOXTYPE_MEETING_DIR, NPU_TRANSCRIBE_HISTORY, BMEET_APP, BMEET_RUNTIME_DIR (bmeet-dictate's),
 BMEET_DICTATE_START (how to start bmeet-dictate when it is not running), BMEET_RELEASES_URL,
 BMEET_INSTALL_URL ({tag} in it: the release's tag), BMEET_TERMINAL (the terminal for
-`update --terminal`, e.g. "kitty -e").
+`update --terminal`, e.g. "kitty -e"), BMEET_FILE_MANAGER (what opens ~/.config/bmeet for
+`settings`; default open on a Mac, xdg-open on Linux).
 
 On macOS there is no voxtype: BMeet.app (macos/BMeetApp) dictates, and macos/bmeet-meeting
 records meetings. bmeet-ctl reads their state from the same file names in
@@ -44,6 +54,7 @@ $XDG_RUNTIME_DIR/bmeet (your temp folder; see macos/bmeetmac.py), the meetings f
 ~/Documents/Meetings are in that folder too), the dictation language from
 ~/.config/bmeet/language, and sends its actions to BMeet.app. It runs on BMeet's venv Python there.
 """
+
 import json
 import os
 import re
@@ -64,6 +75,11 @@ if MAC:
     import bmeetmac  # noqa: E402
     bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder
     __version__ = bmeetmac.VERSION   # BMeet for macOS has its own release line (macos/VERSION)
+try:   # (the window's texts module: which interface language is in effect, for `status`)
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
+    import bmeettext  # noqa: E402
+except ImportError:   # (a partial copy of bmeet-ctl alone: English)
+    bmeettext = None
 
 HOME = Path.home()
 RUN = Path(os.environ.get("BMEET_RUN_DIR")
@@ -99,6 +115,11 @@ VERSION_FILE = Path(__file__).resolve().parents[1] / ("macos/VERSION" if MAC els
 UPDATE_FILE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "bmeet/update.json"   # the last check
 UPDATE_SWITCH = XDG_CONFIG / "bmeet/update-check"   # "off": no automatic checks
 INSTALL_OPTIONS = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "bmeet/install-options"
+# Features that can be turned off ("off" in the file; missing: on), by their key in `status`
+FEATURES = {"dictation": "dictation", "meetings": "meetings", "in_person_meetings": "in-person-meetings",
+            "file_transcription": "file-transcription"}
+TURNED_OFF = 3   # the exit status of a command refused because its feature is off
+SETTINGS_PAGES = ("general", "features", "languages", "shortcuts", "about")   # BMeet.app's Settings window
 
 
 def read_first_line(path: Path, default: str = "") -> str:
@@ -109,8 +130,41 @@ def read_first_line(path: Path, default: str = "") -> str:
 
 
 def live_dictation() -> str:
-    word = read_first_line(LIVE_DICTATION, "off").lower()
+    """on, panel or off; missing: on on a Mac (as BMeet.app reads it), off on Linux."""
+    word = read_first_line(LIVE_DICTATION, "on" if MAC else "off").lower()
     return word if word in ("on", "panel") else "off"
+
+
+def features() -> dict[str, bool]:
+    """Which features are on: ~/.config/bmeet/dictation, meetings, in-person-meetings and
+    file-transcription, read each time (the Settings window may change them any time)."""
+    return {key: read_first_line(XDG_CONFIG / "bmeet" / name, "on").lower() != "off"
+            for key, name in FEATURES.items()}
+
+
+def refused(key: str) -> int | None:
+    """TURNED_OFF, with why on stderr, while feature `key` is off; None while it is on."""
+    if features()[key]:
+        return None
+    what = {"dictation": "dictation", "meetings": "online meetings",
+            "in_person_meetings": "in-person meetings"}.get(key, key)
+    print(f"bmeet-ctl: {what} {'is' if key == 'dictation' else 'are'} turned off in BMeet's settings "
+          f"(~/.config/bmeet/{FEATURES[key]})", file=sys.stderr)
+    return TURNED_OFF
+
+
+def meeting_refused(action: str, in_person: bool) -> int | None:
+    """`meeting start`, or a `toggle` that would start one, while that kind is off. Stopping,
+    pausing and resuming a running meeting always work."""
+    running = read_first_line(RUN / "meeting_state", "idle") in ("recording", "paused")
+    if action == "start" or (action == "toggle" and not running):
+        return refused("in_person_meetings" if in_person else "meetings")
+    return None
+
+
+def interface_language() -> str:
+    """The language BMeet's window and notifications speak: en or ru (bmeettext)."""
+    return bmeettext.interface_language() if bmeettext is not None else "en"
 
 
 def to_dictate(command: str, start: bool = True) -> dict | None:
@@ -177,10 +231,17 @@ def pid_running() -> bool:
         return False
 
 
+def mac_language() -> str:
+    """macOS: the dictation language, always one of `languages` (the first while the file names
+    none of them, or a language that was turned off)."""
+    langs = languages()
+    language = read_first_line(MAC_LANGUAGE, langs[0]).lower()
+    return language if language in langs else langs[0]
+
+
 def config() -> dict:
     if MAC:   # (voxtype's [openvino] section, for status())
-        return {"openvino": {"language": read_first_line(MAC_LANGUAGE, "en"), "model": "whisper-large-v3-turbo",
-                             "device": "ANE"}}
+        return {"openvino": {"language": mac_language(), "model": "whisper-large-v3-turbo", "device": "ANE"}}
     try:
         with CONFIG.open("rb") as f:
             return tomllib.load(f)
@@ -345,6 +406,8 @@ def status() -> dict:
         "device": ov.get("device"),
         "version": installed_version(),   # (newer than a running window's after an update)
         "update": update_info(),
+        "features": features(),
+        "interface_language": interface_language(),
     }
 
 
@@ -407,8 +470,7 @@ def to_app(command: dict, start: bool = True) -> dict | None:
 
 def set_mac_language(target: str) -> int:
     """macOS `lang`: the dictation language BMeet.app uses from the next dictation on."""
-    current = read_first_line(MAC_LANGUAGE, "en")
-    language = next_language(current) if target == "toggle" else target
+    language = next_language(mac_language()) if target == "toggle" else target
     if not language:
         return 0
     MAC_LANGUAGE.parent.mkdir(parents=True, exist_ok=True)
@@ -469,6 +531,8 @@ def window_usage() -> str:
 def mac_main(cmd: str, args: list[str]) -> int | None:
     """The actions on macOS (None: not one of them; status, recent, version are shared)."""
     if cmd == "dictate":
+        if (code := refused("dictation")) is not None:
+            return code
         return 0 if to_app({"op": "dictate", "clipboard": "--clipboard" in args}) else 1
     if cmd == "cancel":
         to_app({"op": "cancel"}, start=False)
@@ -478,6 +542,8 @@ def mac_main(cmd: str, args: list[str]) -> int | None:
         if target != "toggle" and not LANG_CODE.match(target):
             print(f"bmeet-ctl: not a language code: {target!r}", file=sys.stderr)
             return 2
+        if (code := refused("dictation")) is not None:
+            return code
         return set_mac_language(target)
     if cmd == "meeting":
         action = args[0] if args else "toggle"
@@ -486,6 +552,8 @@ def mac_main(cmd: str, args: list[str]) -> int | None:
                 or (extra and action in ("pause", "resume")):
             print("usage: bmeet-ctl meeting start|stop|toggle|pause|resume [--in-person]", file=sys.stderr)
             return 2
+        if (code := meeting_refused(action, bool(extra))) is not None:
+            return code
         return 0 if to_app({"op": "meeting", "action": action, "in_person": bool(extra)}) else 1
     if cmd == "open":   # (`bmeet`: what the window would print, and its files, are done here)
         if any(a in ("-h", "--help") for a in args):
@@ -498,6 +566,25 @@ def mac_main(cmd: str, args: list[str]) -> int | None:
             return 2
         return 0 if to_app({"op": "open", "args": window}) else 1
     return None
+
+
+def open_settings(args: list[str]) -> int:
+    """`settings [PAGE]`: BMeet.app's Settings window on that page (the control socket's
+    "settings" op, without starting BMeet.app); on Linux, or when BMeet.app does not answer (not
+    running, or a version without that window), the settings folder in the file manager."""
+    if len(args) > 1 or (args and args[0] not in SETTINGS_PAGES):
+        print(f"usage: bmeet-ctl settings [{'|'.join(SETTINGS_PAGES)}]", file=sys.stderr)
+        return 2
+    if MAC and (bmeetmac.agent({"op": "settings", "page": args[0] if args else "general"}) or {}).get("ok"):
+        return 0
+    folder = XDG_CONFIG / "bmeet"
+    folder.mkdir(parents=True, exist_ok=True)
+    opener = shlex.split(os.environ.get("BMEET_FILE_MANAGER", "")) or (["open"] if MAC else ["xdg-open"])
+    try:
+        return subprocess.call([*opener, str(folder)])
+    except OSError as exc:
+        print(f"bmeet-ctl: cannot open {folder}: {exc}", file=sys.stderr)
+        return 1
 
 
 class UpdateError(Exception):
@@ -707,6 +794,8 @@ def main(argv: list[str]) -> int:
         limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 10
         print(json.dumps(recent(limit)))
     elif cmd == "dictate":
+        if (code := refused("dictation")) is not None:
+            return code
         if live_dictation() != "off":
             return 0 if to_dictate("toggle" + (" --clipboard" if "--clipboard" in args else "")) else 1
         return subprocess.call(["voxtype", "record", "toggle"]
@@ -721,11 +810,15 @@ def main(argv: list[str]) -> int:
         if target != "toggle" and not LANG_CODE.match(target):
             print(f"bmeet-ctl: not a language code: {target!r}", file=sys.stderr)
             return 2
+        if (code := refused("dictation")) is not None:
+            return code
         detached(str(BIN / "voxtype-lang"), target)
     elif cmd == "meeting":
         action = args[0] if args else "toggle"
         extra = [a for a in args[1:] if a == "--in-person"]
         if action in ("start", "stop", "toggle") and len(extra) == len(args[1:]):
+            if (code := meeting_refused(action, bool(extra))) is not None:
+                return code
             detached(str(BIN / "voxtype-meeting-toggle"), action, *extra)
         elif action in ("pause", "resume") and not args[1:]:
             return subprocess.call(["voxtype", "meeting", action])
@@ -734,6 +827,8 @@ def main(argv: list[str]) -> int:
             return 2
     elif cmd == "open":
         detached(str(APP), *args)
+    elif cmd == "settings":
+        return open_settings(args)
     elif cmd == "update":
         return update_main(args)
     elif cmd in ("version", "--version"):

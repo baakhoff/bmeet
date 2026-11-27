@@ -4,6 +4,8 @@
 Prints the same stderr lines as the real tool without a terminal (log lines plus
 one progress line per block), writes NAME.srt/NAME.md next to the input, prints
 their paths on stdout and appends a history line like the real tool does.
+--engine as the real one chooses: GigaAM for gigaam, and for auto with Russian (not
+translated) when $NPU_MODELS_DIR/gigaam-v3-ctc-ru has its tokens.txt; Whisper otherwise.
 FAKE_TRANSCRIBE_DELAY: seconds per step (default 0.2); FAKE_TRANSCRIBE_FAIL=1: fail.
 Ctrl+C / SIGINT -> "interrupted", exit 130 (as the real tool).
 """
@@ -19,14 +21,21 @@ def log(msg: str) -> None:
 
 
 def main(argv: list[str]) -> int:
-    model, language, translate = "turbo", "auto", "--translate" in argv
+    model, language, translate, engine = "turbo", "auto", "--translate" in argv, "auto"
     if "--model" in argv:
         model = argv[argv.index("--model") + 1]
     if "--language" in argv:
         language = argv[argv.index("--language") + 1]
+    if "--engine" in argv:
+        engine = argv[argv.index("--engine") + 1]
     src = Path(argv[argv.index("--") + 1] if "--" in argv else argv[-1]).absolute()
     delay = float(os.environ.get("FAKE_TRANSCRIBE_DELAY", "0.2"))
     hist = Path(os.environ["NPU_TRANSCRIBE_HISTORY"])
+    gigaam = engine == "gigaam" or (engine == "auto" and language == "ru" and not translate and (
+        Path(os.environ.get("NPU_MODELS_DIR", "/nonexistent")) / "gigaam-v3-ctc-ru/tokens.txt").is_file())
+    if gigaam:   # (what the real one writes for GigaAM: its history model, its name in the done line)
+        model, language = "gigaam", "ru"
+    label = "gigaam-v3-ctc" if gigaam else f"whisper-{model}-int8-ov"
 
     def record(outputs: list[Path], status: str) -> None:
         hist.parent.mkdir(parents=True, exist_ok=True)
@@ -36,15 +45,16 @@ def main(argv: list[str]) -> int:
                                 "language": "en" if language == "auto" else language,
                                 "device": "NPU", "duration": 300.0, "status": status}) + "\n")
 
-    log(f"loading whisper-{model}-int8-ov on NPU (the first NPU run compiles the model: "
-        "~1 min small, ~4 min turbo; cached afterwards)")
+    log(f"loading {'GigaAM v3' if gigaam else f'whisper-{model}-int8-ov'} on NPU (the first NPU run compiles "
+        "the model: ~1 min small, ~4 min turbo; cached afterwards)")
     time.sleep(delay)
     log("model ready on NPU in 0.1 s")
     if os.environ.get("FAKE_TRANSCRIBE_FAIL"):
         log(f"ERROR: {src.name}: ffmpeg failed: Invalid data found when processing input")
         record([], "failed")
         return 1
-    log("language: en (auto-detected from the first block)")
+    if language == "auto":   # (detected only when not given, as the real one)
+        log("language: en (auto-detected from the first block)")
     for done in (120, 240, 300):
         time.sleep(delay)
         print(f"{src.name}: {done / 3:3.0f}%  00:{done // 60:02d}:{done % 60:02d}/00:05:00  "
@@ -58,7 +68,8 @@ def main(argv: list[str]) -> int:
         outputs.append(out)
         print(out, flush=True)
     record(outputs, "done")
-    log(f"done: {src.name}: 00:05:00 of audio in 1.0 s on NPU (300.0x realtime), 1 segment(s), language en")
+    log(f"done: {src.name}: 00:05:00 of audio in 1.0 s with {label} on NPU (300.0x realtime), 1 segment(s), "
+        f"language {'en (detected)' if language == 'auto' else language + ' (given)'}")
     return 0
 
 

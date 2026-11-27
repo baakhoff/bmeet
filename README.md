@@ -3,8 +3,8 @@
 Voice typing, meeting transcripts and file transcription for **KDE Plasma 6** and for
 **Macs with Apple silicon**. Whisper runs locally on the **Intel NPU** of Core Ultra laptops,
 or on the **Neural Engine** of an M1 or later. It's fast, it stays on your machine, and the
-CPU and GPU are left alone. On a Mac it is a menu bar app with ⌃⌥ shortcuts: see
-[docs/macos.md](docs/macos.md).
+CPU and GPU are left alone. On a Mac it is a menu bar app with ⌃⌥ shortcuts and a Settings
+window, in English or Russian: see [docs/macos.md](docs/macos.md).
 
 [![CI](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml/badge.svg)](https://github.com/baakhoff/bmeet/actions/workflows/ci.yml)
 [![Linux release](https://img.shields.io/github/v/release/baakhoff/bmeet?filter=v*&label=linux)](https://github.com/baakhoff/bmeet/releases/latest)
@@ -167,11 +167,12 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 - **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.
+- **On a Mac:** BMeet's Settings window (*Settings… ⌘,* in its menu) writes these files and a few more: it turns dictation, meetings, in-person meetings and file transcription off (each then leaves the menu and frees its shortcuts), turns dictation languages on and off, changes the shortcuts, sets how long a model stays in memory and the interface language (English or Russian). See [docs/macos.md](docs/macos.md#settings).
 
 ## Privacy
 
 - **Local only:** audio is transcribed on your machine, and nothing is uploaded.
-- **Update check:** once a day, BMeet asks GitHub for the list of its releases, a plain request with no data about you or your use of BMeet. GitHub sees your IP address, as with any website. To turn it off: `echo off > ~/.config/bmeet/update-check` (`bmeet-ctl update` still works).
+- **Update check:** once a day, BMeet asks GitHub for the list of its releases, a plain request with no data about you or your use of BMeet. GitHub sees your IP address, as with any website. To turn it off: `echo off > ~/.config/bmeet/update-check`, or on a Mac Settings → General (`bmeet-ctl update` still works).
 - **Meetings:** only the text is stored.
   - To tell the speakers apart, the meeting audio is recorded into RAM (`$XDG_RUNTIME_DIR`, a tmpfs; ~230 MB per hour) while the meeting runs. It is deleted as soon as the speaker pass ends, whether it succeeds, fails or is stopped. A logout or reboot clears it too.
   - Nothing is recorded while a meeting is paused.

@@ -725,6 +725,36 @@ class MeetingStandIns(unittest.TestCase):
         self.assertNotIn("Speaker pass", md.read_text())
         self.assertNotIn("Speakers not told apart", [title for title, _ in self.notes()])
 
+    def test_a_pass_that_ends_before_its_pid_is_seen_is_not_a_failure(self) -> None:
+        # unit_start says False for a unit that ran and ended before it saw the unit's pid (a fast
+        # pass on a busy Mac, as on CI): its `after` has run, so nothing is marked or notified.
+        # One that never started is: the transcript gets the line and a notification goes out.
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ.update(self.env)
+        bm = load(MACOS / "bmeet-meeting", "bmeet_meeting_fast_pass_test")
+        live = ("# M\n\n## Meeting Info\n\n- **Transcribed:** as people talked (live), fake\n\n"
+                "## Transcript\n\n### You\n\nhello\n")
+        for ran in (True, False):
+            folder, md = bm.AUDIO_ROOT / f"rec-{ran}", self.tmp / f"m-{ran}.md"
+            folder.mkdir(parents=True)
+            md.write_text(live)
+
+            def unit_start(name, cmd, after=None, nice=0, ran=ran):
+                if ran and name.startswith("bmeet-speakers-"):   # (it ran and ended at once, after and all)
+                    subprocess.run(after, env=dict(os.environ, BMEET_UNIT_STATUS="0"), check=True)
+                return False
+            bm.unit_start = unit_start
+            bm.speaker_pass(folder.name, folder, md)
+            self.assertFalse(folder.exists())
+            if ran:
+                self.assertNotIn("Speaker pass", md.read_text())
+                self.assertEqual(self.notes(), [])
+            else:
+                self.assertIn("- **Speaker pass:** the voices were not told apart: it could not be started",
+                              md.read_text())
+                self.assertEqual(self.notes(), [("Speakers not told apart", False)])
+
     def test_units(self) -> None:
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))

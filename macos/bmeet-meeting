@@ -524,7 +524,9 @@ def speaker_pass(name: str, folder: Path, file: Path) -> None:
     cmd = [PYTHON, "-I", str(TRANSCRIBE), "--meeting", str(folder), "--output", str(file), *voices, "--notify"]
     after = [PYTHON, "-I", str(Path(__file__).resolve()), "speakers-ended", name, str(file)]
     whisper_up()
-    if not unit_start(f"bmeet-speakers-{name}", cmd, after=after, nice=10):
+    # (unit_start also says False for a unit that ran and ended before it saw its pid, as a fast
+    # pass can: its `after` has run then, and has deleted the recording)
+    if not unit_start(f"bmeet-speakers-{name}", cmd, after=after, nice=10) and folder.exists():
         speakers_ended(name, file, None)
     # (a separate unit drops the RAM disk when the pass is over)
     unit_start(f"bmeet-cleanup-{name}", [PYTHON, "-I", str(Path(__file__).resolve()), "wait-and-cleanup", name])

@@ -37,14 +37,30 @@ def setting() -> str:
     return word if word in LANGUAGES else "system"
 
 
+MAC_APP_ID = "io.github.baakhoff.bmeet"   # BMeet.app: a language chosen for it alone is in its domain
+
+
 def _mac_languages() -> list[str]:
-    """The Mac's preferred languages, most preferred first ("ru-RU" -> "ru"); [] if unknown."""
+    """The Mac's preferred languages as BMeet.app sees them, most preferred first ("ru-RU" ->
+    "ru"); [] if unknown. That is AppleLanguages in BMeet.app's domain (System Settings → General →
+    Language & Region → Applications), else the global list, as Swift's Locale.preferredLanguages
+    gives it there: the window, a helper app of its own, and bmeet-meeting would otherwise see only
+    their own (CFLocaleCopyPreferredLanguages)."""
     import ctypes
     try:
         cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
     except OSError:
         return []
+    utf8 = 0x08000100   # (kCFStringEncodingUTF8)
     cf.CFLocaleCopyPreferredLanguages.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFPreferencesCopyAppValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cf.CFPreferencesCopyAppValue.restype = ctypes.c_void_p
+    cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+    cf.CFGetTypeID.restype = ctypes.c_ulong
+    cf.CFArrayGetTypeID.restype = ctypes.c_ulong
+    cf.CFStringGetTypeID.restype = ctypes.c_ulong
     cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
     cf.CFArrayGetCount.restype = ctypes.c_long
     cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
@@ -52,14 +68,25 @@ def _mac_languages() -> list[str]:
     cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
     cf.CFStringGetCString.restype = ctypes.c_bool
     cf.CFRelease.argtypes = [ctypes.c_void_p]
-    array = cf.CFLocaleCopyPreferredLanguages()
+    array = None
+    key, app = cf.CFStringCreateWithCString(None, b"AppleLanguages", utf8), cf.CFStringCreateWithCString(
+        None, MAC_APP_ID.encode(), utf8)
+    if key and app:   # (the app's domain, then the global one: CFPreferences searches both)
+        array = cf.CFPreferencesCopyAppValue(key, app)
+        if array and (cf.CFGetTypeID(array) != cf.CFArrayGetTypeID() or cf.CFArrayGetCount(array) == 0):
+            cf.CFRelease(array)
+            array = None
+    for ref in (key, app):
+        if ref:
+            cf.CFRelease(ref)
+    array = array or cf.CFLocaleCopyPreferredLanguages()
     if not array:
         return []
     try:
         codes, buf = [], ctypes.create_string_buffer(64)
         for i in range(cf.CFArrayGetCount(array)):
             item = cf.CFArrayGetValueAtIndex(array, i)
-            if item and cf.CFStringGetCString(item, buf, len(buf), 0x08000100):   # (kCFStringEncodingUTF8)
+            if item and cf.CFGetTypeID(item) == cf.CFStringGetTypeID() and cf.CFStringGetCString(item, buf, len(buf), utf8):
                 codes.append(re.split(r"[-_]", buf.value.decode())[0].lower())
         return codes
     finally:

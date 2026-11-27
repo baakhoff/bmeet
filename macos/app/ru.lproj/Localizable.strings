@@ -104,7 +104,7 @@
 "60 minutes" = "60 минут";
 /* a number of minutes written in the file by hand */
 "%d min" = "%d мин";
-"How long a speech model stays in memory after it was last used. Loading Whisper turbo again takes a few seconds, and about a minute the first time after an update." = "Сколько модель распознавания речи остается в памяти после последнего использования. Загрузка Whisper turbo заново занимает несколько секунд, а в первый раз после обновления около минуты.";
+"How long a speech model stays in memory after it was last used. Loading Whisper turbo again takes a few seconds; the first time after an update, while macOS compiles it, a few minutes." = "Сколько модель распознавания речи остается в памяти после последнего использования. Загрузка Whisper turbo заново занимает несколько секунд; в первый раз после обновления, пока macOS компилирует модель, несколько минут.";
 "Pasting:" = "Вставка:";
 "Allowed" = "Разрешена";
 "Not allowed yet" = "Пока не разрешена";

@@ -331,7 +331,7 @@ final class SettingsWindow: NSObject, NSToolbarDelegate, NSWindowDelegate, NSTab
         }
         unloadPopup.target = self
         unloadPopup.action = #selector(unloadChanged)
-        let unloadNote = caption(L("How long a speech model stays in memory after it was last used. Loading Whisper turbo again takes a few seconds, and about a minute the first time after an update."), width: second)
+        let unloadNote = caption(L("How long a speech model stays in memory after it was last used. Loading Whisper turbo again takes a few seconds; the first time after an update, while macOS compiles it, a few minutes."), width: second)
 
         pasteStatus = NSTextField(labelWithString: "")
         pasteButton = button(L("Allow Pasting…"), #selector(allowPasting))

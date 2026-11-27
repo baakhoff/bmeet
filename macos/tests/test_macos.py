@@ -565,6 +565,9 @@ class MeetingStandIns(unittest.TestCase):
                   "FAKE_PASS_FAIL"):
             self.env.pop(k, None)
         self.env = sealed(self.env, self.tmp / "notes.jsonl")
+        # (the notifications below are checked in English, whatever this Mac's language is)
+        (self.tmp / "config/bmeet").mkdir(parents=True, exist_ok=True)
+        (self.tmp / "config/bmeet/interface-language").write_text("en\n")
 
     def tearDown(self) -> None:
         subprocess.run(self.cmd("cleanup"), env=self.env, capture_output=True, timeout=60)

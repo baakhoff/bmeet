@@ -53,6 +53,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bmeetmac  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bmeet/app"))
+from bmeettext import tr  # noqa: E402  (the notifications in the interface language: the BMeet window's table)
 
 bmeetmac.setup()
 HOME = Path.home()
@@ -348,7 +350,7 @@ def start(in_person: bool) -> int:
                                        time.localtime(now)))
     with ramdisk_lock():   # (a speaker pass that has just ended may be detaching it)
         if not ensure_ramdisk():
-            notify("Meeting NOT started", "BMeet could not make the RAM disk for the meeting audio", ok=False)
+            notify(tr("Meeting NOT started"), tr("BMeet could not make the RAM disk for the meeting audio"), ok=False)
             return 1
         cleanup_stale()
         name = recording_name(time.strftime("%Y-%m-%d_%H%M", time.localtime(now)))
@@ -356,7 +358,7 @@ def start(in_person: bool) -> int:
         folder.mkdir(mode=0o700)
         if os.environ.get("BMEET_NO_RAMDISK") != "1" and not bmeetmac.audio_in_ram(folder):
             subprocess.run(["rm", "-rf", str(folder)], check=False)
-            notify("Meeting NOT started", "The meeting audio would not be in RAM", ok=False)
+            notify(tr("Meeting NOT started"), tr("The meeting audio would not be in RAM"), ok=False)
             return 1
     (folder / "meeting.json").write_text(json.dumps({"title": title, "started": int(now), "in_person": in_person}) + "\n")
     mid = str(uuid.uuid4())
@@ -375,14 +377,14 @@ def start(in_person: bool) -> int:
         with db() as con:
             con.execute("DELETE FROM meetings WHERE id = ?", (mid,))
         subprocess.run(["rm", "-rf", str(folder)], check=False)
-        notify("Meeting NOT started", "The meeting recorder did not start", ok=False)
+        notify(tr("Meeting NOT started"), tr("The meeting recorder did not start"), ok=False)
         return 1
     whisper_up()
     unit_start("bmeet-live", [PYTHON, "-I", str(TRANSCRIBE), "--live", str(folder)], nice=5)
     if in_person:
-        notify("In-person meeting started", "Microphone only; the voices are told apart when you stop.")
+        notify(tr("In-person meeting started"), tr("Microphone only; the voices are told apart when you stop."))
     else:
-        notify("Meeting recording started", "Microphone + system audio. Press ⌃⌥M again to stop.")
+        notify(tr("Meeting recording started"), tr("Microphone + system audio. Press ⌃⌥M again to stop."))
     return 0
 
 
@@ -484,14 +486,14 @@ def stop() -> int:
         except (sqlite3.Error, OSError) as exc:
             log(f"the meeting index was not updated: {exc}")
     STAMP_FILE.unlink(missing_ok=True)
-    where = f"\n(not in {OUT_DIR}: {why})" if file is not None and why else ""
+    where = "\n" + tr("(not in {folder}: {why})", folder=OUT_DIR, why=why) if file is not None and why else ""
     if speakers:
         if saved:
-            notify("Meeting transcript saved",
-                   f"{file}\nTelling the speakers apart; the file is updated in a few minutes.{where}")
+            notify(tr("Meeting transcript saved"),
+                   tr("{file}\nTelling the speakers apart; the file is updated in a few minutes.", file=file) + where)
         else:
-            notify("Meeting stopped",
-                   f"Telling the speakers apart; the transcript goes to {file} in a few minutes.{where}")
+            notify(tr("Meeting stopped"),
+                   tr("Telling the speakers apart; the transcript goes to {file} in a few minutes.", file=file) + where)
         print(file)
         speaker_pass(name, folder, file)
     else:
@@ -499,12 +501,13 @@ def stop() -> int:
             subprocess.run(["rm", "-rf", str(folder)], check=False)
         drop_ramdisk()
         if saved:
-            notify("Meeting transcript saved", f"{file}{where}")
+            notify(tr("Meeting transcript saved"), f"{file}{where}")
             print(file)
         elif text or file is None:
-            notify("Meeting transcript NOT saved", f"BMeet could not write in {OUT_DIR}: {why}", ok=False)
+            notify(tr("Meeting transcript NOT saved"), tr("BMeet could not write in {folder}: {why}", folder=OUT_DIR,
+                                                          why=why), ok=False)
         else:
-            notify("Meeting stopped", "Nothing was transcribed")
+            notify(tr("Meeting stopped"), tr("Nothing was transcribed"))
     return 0
 
 
@@ -542,7 +545,7 @@ def speakers_ended(name: str, file: Path, status: int | None) -> int:
     its Meeting Info says the voices were not told apart, and why. npu-transcribe reports its own
     errors (status 1, with a notification); one that crashed or was killed cannot, so this does."""
     if status is None:
-        how = "could not be started"
+        how, why = "could not be started", tr("The speaker pass could not be started.")
     elif status < 0:
         try:
             sig = signal.Signals(-status).name
@@ -550,8 +553,10 @@ def speakers_ended(name: str, file: Path, status: int | None) -> int:
             sig = f"signal {-status}"
         crash = sig in ("SIGSEGV", "SIGBUS", "SIGILL", "SIGABRT", "SIGFPE", "SIGTRAP")
         how = f"{'crashed' if crash else 'was ended'} ({sig})"
+        why = (tr("The speaker pass crashed ({signal}).", signal=sig) if crash
+               else tr("The speaker pass was ended ({signal}).", signal=sig))
     else:
-        how = f"ended with status {status}"
+        how, why = f"ended with status {status}", tr("The speaker pass ended with status {status}.", status=status)
     if status != 0:
         log(f"the speaker pass of {name} {how}")
         try:
@@ -567,10 +572,9 @@ def speakers_ended(name: str, file: Path, status: int | None) -> int:
                 tmp.replace(file)
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-        if status != 1:
-            notify("Speakers not told apart",
-                   f"The speaker pass {how}. The transcript stays as it was written during the meeting: {file}",
-                   ok=False)
+        if status != 1:   # (the transcript's line stays English; the notification is in the interface language)
+            notify(tr("Speakers not told apart"),
+                   why + " " + tr("The transcript stays as it was written during the meeting: {file}", file=file), ok=False)
     if name:
         subprocess.run(["rm", "-rf", str(AUDIO_ROOT / name)], check=False)
     return 0
@@ -613,8 +617,8 @@ def recorder_ended(name: str) -> int:
                 or unit_active("bmeet-meeting-audio"):
             return 0
         log(f"the recorder of {name} ended while the meeting was on: stopping it")
-        notify("Meeting recording stopped unexpectedly",
-               "BMeet stops the meeting and saves what was recorded. Start a new one to go on.", ok=False)
+        notify(tr("Meeting recording stopped unexpectedly"),
+               tr("BMeet stops the meeting and saves what was recorded. Start a new one to go on."), ok=False)
         return stop()
 
 
@@ -732,7 +736,7 @@ def main(argv: list[str]) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             log("a meeting start or stop is already running")
-            notify("Meeting start or stop already running", "Press again in a moment if you meant another one.")
+            notify(tr("Meeting start or stop already running"), tr("Press again in a moment if you meant another one."))
             return 0
         if cmd == "start":
             return start(in_person)

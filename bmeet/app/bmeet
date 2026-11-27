@@ -56,6 +56,10 @@ if MAC:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "macos"))
     import bmeetmac  # noqa: E402
     bmeetmac.setup()   # $XDG_RUNTIME_DIR: your user's temp folder; Homebrew in PATH
+# The texts a person sees, in the interface language (one table for the window and bmeet-meeting)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bmeettext as texts  # noqa: E402
+from bmeettext import N_  # noqa: E402
 
 from PyQt6.QtCore import (QDateTime, QFile, QLocale, QMimeDatabase, QObject,  # noqa: E402
                           QProcess, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal)
@@ -79,10 +83,17 @@ APP_ID = "bmeet"
 APP_NAME = "BMeet"
 APP_FILE = Path(__file__).resolve()
 HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet"
 PAGES = ("meetings", "files", "transcribe")
-PAGE_TITLES = {"meetings": "Meetings", "files": "Transcribed files", "transcribe": "Transcribe a file"}
+PAGE_TITLES = {"meetings": N_("Meetings"), "files": N_("Transcribed files"), "transcribe": N_("Transcribe a file")}
 PAGE_ICONS = {"meetings": "meeting-attending", "files": "view-media-lyrics",
               "transcribe": "document-import"}
+# bmeet-ctl status's states of dictation, in the dictation label's tooltip
+DICTATION_STATES = {"idle": N_("idle"), "recording": N_("recording"), "transcribing": N_("transcribing"),
+                    "off": N_("off")}
+# the banner after the interface language changed (MainWindow.show_language), by the new one
+LANGUAGE_CHANGED = {"en": N_("This window switches to English when it opens again."),
+                    "ru": N_("This window switches to Russian when it opens again.")}
 DEBUG = bool(os.environ.get("BMEET_DEBUG"))
 DRY_RUN = bool(os.environ.get("BMEET_DRY_RUN"))
 CTL_PATH = Path(os.environ.get("BMEET_CTL") or APP_FILE.parent.parent / "bmeet-ctl")
@@ -106,17 +117,37 @@ def mac_words(text: str) -> str:
         for linux, mac in MAC_WORDS:
             text = text.replace(linux, mac)
     return text
+
+
+def tr(text: str, **values) -> str:
+    """`text` in the interface language (bmeettext), the Mac's words first: on a Mac the
+    table has the text with ⌃⌥ and Finder as a line of its own."""
+    return texts.tr(mac_words(text), **values)
+
+
+def ntr(n: int, one: str, many: str, **values) -> str:
+    """"{n} file" / "{n} files" in the interface language (Russian has three forms)."""
+    return texts.ntr(n, mac_words(one), mac_words(many), **values)
+
+
 KEY_ROLE = Qt.ItemDataRole.UserRole
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
-MEDIA_FILTER = ("Audio and video files (*.mp3 *.m4a *.aac *.ogg *.oga *.opus *.wav *.flac *.wma"
-                " *.amr *.mka *.mp4 *.m4v *.mkv *.webm *.mov *.avi *.wmv *.3gp *.mpg *.mpeg *.ts)"
-                ";;All files (*)")
+MEDIA_PATTERNS = ("*.mp3 *.m4a *.aac *.ogg *.oga *.opus *.wav *.flac *.wma *.amr *.mka *.mp4 *.m4v *.mkv"
+                  " *.webm *.mov *.avi *.wmv *.3gp *.mpg *.mpeg *.ts")
+
+
+def media_filter() -> str:
+    return tr("Audio and video files") + f" ({MEDIA_PATTERNS});;" + tr("All files") + " (*)"
 # Matched by audio/* but no audio inside (same list as npu-transcribe's Dolphin menu).
 NOT_MEDIA = {"audio/x-mpegurl", "audio/mpegurl", "audio/x-scpls", "audio/x-ms-asx", "audio/midi"}
 EXTRA_MEDIA = {"application/ogg", "application/x-matroska", "application/vnd.rn-realmedia",
                "application/mxf"}
-EXPORT_FORMATS = (("Markdown (*.md)", "markdown", ".md"), ("Plain text (*.txt)", "text", ".txt"),
-                  ("JSON (*.json)", "json", ".json"))
+EXPORT_FORMATS = (("Markdown", "markdown", ".md"), (N_("Plain text"), "text", ".txt"), ("JSON", "json", ".json"))
+
+
+def export_filter(f: tuple[str, str, str]) -> str:
+    """A save dialog's name filter for one of EXPORT_FORMATS: "Plain text (*.txt)"."""
+    return f"{tr(f[0])} (*{f[2]})"
 
 
 def debug(*args) -> None:
@@ -133,6 +164,15 @@ def _find_transcribe() -> str:
 
 
 TRANSCRIBE = os.environ.get("BMEET_TRANSCRIBE") or _find_transcribe()
+# npu-transcribe's models (its MODELS_DIR): GigaAM v3 is there unless BMeet was installed --no-gigaam
+MODELS_DIR = Path(os.environ.get("NPU_MODELS_DIR")
+                  or Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "npu-models")
+
+
+def gigaam_installed() -> bool:
+    """GigaAM v3 for Russian is installed: the files npu-transcribe's gigaam_ready() looks for."""
+    files = ("model.mlmodelc", "tokens.txt") if MAC else ("model.xml", "model.bin", "tokens.txt")
+    return all((MODELS_DIR / "gigaam-v3-ctc-ru" / f).exists() for f in files)
 
 
 # ============================================================================ bmeet-ctl
@@ -196,8 +236,25 @@ def configured_languages() -> list[str]:
     return ["en"]
 
 
-def language_name(code: str) -> str:
-    """English name of a Whisper language code ("de" -> "German"), else the code."""
+FEATURES = ("dictation", "meetings", "in_person_meetings", "file_transcription")
+
+
+def configured_features() -> dict[str, bool]:
+    """Which features are on (~/.config/bmeet/dictation, meetings, ..., via bmeet-ctl). A
+    feature that is off disappears from the window; what it made stays listed."""
+    if ctl is not None and hasattr(ctl, "features"):
+        try:
+            return ctl.features()
+        except Exception as exc:  # (all on, as with no files)
+            debug("features:", exc)
+    return dict.fromkeys(FEATURES, True)
+
+
+def language_name(code: str, sentence: bool = False) -> str:
+    """The name of a Whisper language code in the interface language ("de" -> "German",
+    "Немецкий"; in a sentence "немецкий"), else the code."""
+    if (name := texts.language_name(code, sentence)) is not None:   # (Russian: BMeet's own table; Qt has none)
+        return name
     loc = QLocale(code)
     if loc.language() in (QLocale.Language.C, QLocale.Language.AnyLanguage) \
             or loc.name().split("_")[0] != code:
@@ -580,13 +637,13 @@ def name_problem(name: str, you_allowed: bool = False) -> str | None:
     """Why `name` cannot be a speaker's name, or None. you_allowed: "You" is a name too
     (yourself, in a meeting whose microphone was split by voice)."""
     if not name:
-        return "empty"
+        return tr("empty")
     if name == YOU and you_allowed:
         return None
     if len(name) > 40:
-        return "longer than 40 characters"
+        return tr("longer than 40 characters")
     if NOT_A_NAME.search(name):
-        return "reserved, or contains one of # * , [ ] ` < > |"
+        return tr("reserved, or contains one of # * , [ ] ` < > |")
     return None
 
 
@@ -771,8 +828,8 @@ class HistoryEntry:
 
     def state(self) -> str:
         if self.status != "done":
-            return "Failed"
-        return "Done" if self.existing_outputs() else "Files missing"
+            return tr("Failed")
+        return tr("Done") if self.existing_outputs() else tr("Files missing")
 
     def matches_path(self, path: str) -> bool:
         p = os.path.abspath(path)
@@ -1035,6 +1092,29 @@ if MAC:
     QIcon.fromTheme = staticmethod(_theme_or_standard)
 
 
+STANDARD_BUTTONS = {"Ok": N_("OK"), "Cancel": N_("Cancel"), "Close": N_("Close"), "Yes": N_("Yes"), "No": N_("No")}
+
+
+def standard_texts(box: QDialogButtonBox | QMessageBox) -> None:
+    """BMeet's own words on a dialog's standard buttons in another language than English
+    (Qt's translations of them may not be installed: a Linux package of their own)."""
+    if texts.current() == "en":
+        return
+    for button in box.buttons():
+        if (name := box.standardButton(button).name) in STANDARD_BUTTONS:
+            button.setText(tr(STANDARD_BUTTONS[name]))
+
+
+def ask(parent: QWidget, title: str, text: str) -> bool:
+    """A Yes / No question (No by default): True for Yes."""
+    box = QMessageBox(QMessageBox.Icon.Question, title, text,
+                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    standard_texts(box)
+    box.exec()
+    return box.clickedButton() is box.button(QMessageBox.StandardButton.Yes)
+
+
 def message_html(title: str, body: str = "", kind: str = "info") -> str:
     color = {"error": COLORS["red"], "busy": COLORS["blue"]}.get(kind)
     style = f' style="color:{color}"' if color else ""
@@ -1131,12 +1211,12 @@ class DropZone(QFrame):
         pic = QLabel()
         pic.setPixmap(icon("document-import").pixmap(48, 48))
         pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        text = QLabel("Drop audio or video files here")
+        text = QLabel(tr("Drop audio or video files here"))
         text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         f = text.font()
         f.setPointSizeF(f.pointSizeF() * 1.15)
         text.setFont(f)
-        btn = QPushButton(QIcon.fromTheme("document-open"), "Choose files…")
+        btn = QPushButton(QIcon.fromTheme("document-open"), tr("Choose files…"))
         btn.clicked.connect(self.browse)
         row = QHBoxLayout()
         row.addStretch()
@@ -1294,8 +1374,7 @@ class SortItem(QTreeWidgetItem):
 
 class ListDetailPage(QWidget):
     """List (top) and detail (bottom) in a splitter, like KMail's message list + preview."""
-    COLUMNS: tuple[str, ...] = ()
-    EMPTY = ""
+    COLUMNS: tuple[str, ...] = ()   # (N_: translated when shown)
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__()
@@ -1304,7 +1383,7 @@ class ListDetailPage(QWidget):
         self.current_text = ""  # what Copy copies
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(self.COLUMNS)
+        self.tree.setHeaderLabels([tr(c) for c in self.COLUMNS])
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
         self.tree.setAllColumnsShowFocus(True)
@@ -1414,9 +1493,9 @@ class ListDetailPage(QWidget):
         key = self.current_key()
         if key is None:
             shown, total = self.counts()
-            self.placeholder.setText(self.EMPTY if total == 0 else
-                                     "Nothing matches the search." if shown == 0 else
-                                     "Select an item to see its transcript.")
+            self.placeholder.setText(self.empty_text() if total == 0 else
+                                     tr("Nothing matches the search.") if shown == 0 else
+                                     tr("Select an item to see its transcript."))
             self.detail_stack.setCurrentIndex(0)
             self.current_text = ""
             return
@@ -1455,6 +1534,10 @@ class ListDetailPage(QWidget):
         self.tree.blockSignals(False)
 
     # -- overridden
+    def empty_text(self) -> str:
+        """The placeholder of an empty list (it names what starts something only while that is on)."""
+        return ""
+
     def item_matches(self, key: str, terms: list[str]) -> bool:
         return True
 
@@ -1464,7 +1547,7 @@ class ListDetailPage(QWidget):
     def copy_text(self) -> None:
         if self.current_text:
             QGuiApplication.clipboard().setText(self.current_text)
-            self.main.message("Copied the transcript to the clipboard")
+            self.main.message(tr("Copied the transcript to the clipboard"))
 
 
 class NameSpeakersDialog(QDialog):
@@ -1473,12 +1556,12 @@ class NameSpeakersDialog(QDialog):
     def __init__(self, parent: QWidget, speakers: list[tuple[str, str]], has_fingerprints: bool,
                  you_allowed: bool = False) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Name speakers")
+        self.setWindowTitle(tr("Name speakers"))
         self.you_allowed = you_allowed
         layout = QVBoxLayout(self)
-        intro = QLabel("Who is who? Leave a field empty to keep the label. Give two labels the "
-                       "same name when they are one person."
-                       + (" This meeting was in person: write You for yourself." if you_allowed else ""))
+        intro = QLabel(tr("Who is who? Leave a field empty to keep the label. Give two labels the "
+                          "same name when they are one person.")
+                       + (" " + tr("This meeting was in person: write You for yourself.") if you_allowed else ""))
         intro.setWordWrap(True)
         layout.addWidget(intro)
         grid = QGridLayout()
@@ -1486,7 +1569,7 @@ class NameSpeakersDialog(QDialog):
         for row, (label, said) in enumerate(speakers):
             grid.addWidget(QLabel(f"<b>{html.escape(label)}</b>"), row * 2, 0)
             edit = QLineEdit("" if NOT_A_NAME.search(label) else label)
-            edit.setPlaceholderText("Name")
+            edit.setPlaceholderText(tr("Name"))
             grid.addWidget(edit, row * 2, 1)
             sample = QLabel(html.escape(said[:140] + ("…" if len(said) > 140 else "")) or "–")
             sample.setWordWrap(True)
@@ -1494,12 +1577,12 @@ class NameSpeakersDialog(QDialog):
             grid.addWidget(sample, row * 2 + 1, 1)
             self.fields[label] = edit
         layout.addLayout(grid)
-        self.remember = QCheckBox("Recognise them by voice in later meetings")
+        self.remember = QCheckBox(tr("Recognise them by voice in later meetings"))
         self.remember.setChecked(remember_voices_on())
-        self.remember.setToolTip(
+        self.remember.setToolTip(tr(
             "Keeps a voice fingerprint of each person you name on this computer "
-            f"({tilde(VOICES_DIR)}), and later meetings call them by name.\n"
-            "Unticking it forgets all fingerprints.")
+            "({folder}), and later meetings call them by name.\n"
+            "Unticking it forgets all fingerprints.", folder=tilde(VOICES_DIR)))
         self.remember.toggled.connect(self._remember_toggled)
         layout.addWidget(self.remember)
         self.note = QLabel()
@@ -1511,10 +1594,11 @@ class NameSpeakersDialog(QDialog):
         self.error.hide()
         layout.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.voices_btn = buttons.addButton("Remembered voices…", QDialogButtonBox.ButtonRole.ResetRole)
+        self.voices_btn = buttons.addButton(tr("Remembered voices…"), QDialogButtonBox.ButtonRole.ResetRole)
         self.voices_btn.clicked.connect(lambda: VoicesDialog(self).exec())
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        standard_texts(buttons)
         layout.addWidget(buttons)
         self._update_note()
 
@@ -1522,15 +1606,13 @@ class NameSpeakersDialog(QDialog):
         on = self.remember.isChecked()
         self.voices_btn.setVisible(on and bool(remembered_voices() or own_voice_meetings()))
         self.note.setText("" if not on or self.has_fingerprints else
-                          "Recognition starts with the next meeting: this one was transcribed "
-                          "before remembering voices was on, so it has no fingerprints.")
+                          tr("Recognition starts with the next meeting: this one was transcribed "
+                             "before remembering voices was on, so it has no fingerprints."))
         self.note.setVisible(bool(self.note.text()))
 
     def _remember_toggled(self, on: bool) -> None:
-        if not on and (remembered_voices() or own_voice_meetings()) and QMessageBox.question(
-                self, "Forget voices", "Forget all remembered voices?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+        if not on and (remembered_voices() or own_voice_meetings()) and not ask(
+                self, tr("Forget voices"), tr("Forget all remembered voices?")):
             self.remember.blockSignals(True)
             self.remember.setChecked(True)
             self.remember.blockSignals(False)
@@ -1547,7 +1629,7 @@ class NameSpeakersDialog(QDialog):
 
     def accept(self) -> None:
         if problems := self.problems():
-            self.error.setText("Not a name: " + "; ".join(problems))
+            self.error.setText(tr("Not a name: {problems}", problems="; ".join(problems)))
             self.error.show()
             return
         super().accept()
@@ -1558,31 +1640,33 @@ class VoicesDialog(QDialog):
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Remembered voices")
+        self.setWindowTitle(tr("Remembered voices"))
         layout = QVBoxLayout(self)
-        info = QLabel(f"Voice fingerprints kept in {tilde(VOICES_DIR)}. Later meetings call these "
-                      "people by name.")
+        info = QLabel(tr("Voice fingerprints kept in {folder}. Later meetings call these people by name.",
+                         folder=tilde(VOICES_DIR)))
         info.setWordWrap(True)
         layout.addWidget(info)
         self.list = QListWidget()
         layout.addWidget(self.list)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        self.forget_btn = buttons.addButton("Forget", QDialogButtonBox.ButtonRole.ActionRole)
+        self.forget_btn = buttons.addButton(tr("Forget"), QDialogButtonBox.ButtonRole.ActionRole)
         self.forget_btn.clicked.connect(self.forget)
         buttons.rejected.connect(self.reject)
+        standard_texts(buttons)
         layout.addWidget(buttons)
         self.fill()
 
     def fill(self) -> None:
         self.list.clear()
         if n := own_voice_meetings():  # (None: not a name, so it cannot clash with one)
-            item = QListWidgetItem(f"You: your own voice  ({n} meeting{'s' if n != 1 else ''})")
-            item.setToolTip("Learned from your microphone in online meetings; in-person "
-                            "meetings use it to tell you from the others in the room")
+            item = QListWidgetItem(tr("You: your own voice  ({meetings})",
+                                      meetings=ntr(n, "{n} meeting", "{n} meetings")))
+            item.setToolTip(tr("Learned from your microphone in online meetings; in-person "
+                               "meetings use it to tell you from the others in the room"))
             item.setData(Qt.ItemDataRole.UserRole, None)
             self.list.addItem(item)
         for name, n in sorted(remembered_voices().items(), key=lambda x: x[0].casefold()):
-            item = QListWidgetItem(f"{name}  ({n} meeting{'s' if n != 1 else ''})")
+            item = QListWidgetItem(f"{name}  ({ntr(n, '{n} meeting', '{n} meetings')})")
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.list.addItem(item)
         self.forget_btn.setEnabled(self.list.count() > 0)
@@ -1599,9 +1683,20 @@ class VoicesDialog(QDialog):
 
 
 class MeetingsPage(ListDetailPage):
-    COLUMNS = ("Title", "Date", "Duration", "Status")
-    EMPTY = mac_words("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
-             "microphone and the system audio. The transcript shows up here as people talk.")
+    COLUMNS = (N_("Title"), N_("Date"), N_("Duration"), N_("Status"))
+    # voxtype's (and bmeet-meeting's) states of a meeting
+    STATUSES = {"active": N_("Active"), "completed": N_("Completed"), "interrupted": N_("Interrupted"),
+                "recording": N_("Recording"), "paused": N_("Paused"), "failed": N_("Failed")}
+
+    def empty_text(self) -> str:
+        features = self.main.features
+        if features["meetings"]:
+            return tr("No meetings yet.\n\nPress “Start meeting” above (or Meta+Alt+M) to record the "
+                      "microphone and the system audio. The transcript shows up here as people talk.")
+        if features["in_person_meetings"]:
+            return tr("No meetings yet.\n\nPress “In person” above (or Meta+Alt+Shift+M) to record the "
+                      "microphone and tell the voices in the room apart.")
+        return tr("No meetings yet.")
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__(main)
@@ -1621,19 +1716,20 @@ class MeetingsPage(ListDetailPage):
         self._req = 0
         self._index_queue: list[str] = []
         self._index_busy = False
-        self.act_refresh = self.add_action("view-refresh", "Reload", lambda: self.show_current_force(),
-                                           f"Load the transcript again from {ENGINE}")
-        self.act_copy = self.add_action("edit-copy", "Copy all", self.copy_text,
-                                        "Copy the whole transcript (Markdown) to the clipboard")
-        self.act_export = self.add_action("document-export", "Export…", self.export,
-                                          "Save the transcript as Markdown, plain text or JSON")
-        self.act_folder = self.add_action("document-open-folder", "Open folder", self.open_folder,
-                                          "Show the Markdown copy in the file manager")
-        self.act_names = self.add_action("im-user", "Name speakers…", self.name_speakers,
-                                         "Put names on Person 1, Person 2, …; optionally recognise "
-                                         "them by voice in later meetings")
-        self.act_delete = self.add_action("edit-delete", "Delete…", self.delete,
-                                          f"Delete this meeting from {ENGINE}", QKeySequence.StandardKey.Delete)
+        self.act_refresh = self.add_action("view-refresh", tr("Reload"), lambda: self.show_current_force(),
+                                           tr("Load the transcript again from {engine}", engine=ENGINE))
+        self.act_copy = self.add_action("edit-copy", tr("Copy all"), self.copy_text,
+                                        tr("Copy the whole transcript (Markdown) to the clipboard"))
+        self.act_export = self.add_action("document-export", tr("Export…"), self.export,
+                                          tr("Save the transcript as Markdown, plain text or JSON"))
+        self.act_folder = self.add_action("document-open-folder", tr("Open folder"), self.open_folder,
+                                          tr("Show the Markdown copy in the file manager"))
+        self.act_names = self.add_action("im-user", tr("Name speakers…"), self.name_speakers,
+                                         tr("Put names on Person 1, Person 2, …; optionally recognise "
+                                            "them by voice in later meetings"))
+        self.act_delete = self.add_action("edit-delete", tr("Delete…"), self.delete,
+                                          tr("Delete this meeting from {engine}", engine=ENGINE),
+                                          QKeySequence.StandardKey.Delete)
 
     def is_live(self, m: Meeting) -> bool:
         return m.id == self.live_id and self.live_state in ("recording", "paused")
@@ -1648,7 +1744,7 @@ class MeetingsPage(ListDetailPage):
             meetings = load_meetings()
             self.error = None
         except sqlite3.Error as exc:
-            meetings, self.error = [], f"Cannot read {MEETING_DB}: {exc}"
+            meetings, self.error = [], tr("Cannot read {path}: {error}", path=MEETING_DB, error=exc)
         old = self.meetings
         self.meetings = {m.id: m for m in meetings}
         for mid in list(self.export_cache) + list(self.export_failed):  # meeting changed or gone:
@@ -1666,7 +1762,7 @@ class MeetingsPage(ListDetailPage):
             self.follow = None
         new_key = self.current_key()
         new_sig = self.meetings[new_key].signature() if new_key in self.meetings else None
-        if new_key != old_key or new_sig != old_sig:
+        if new_key != old_key or new_sig != old_sig or new_key is None:   # (None: the placeholder's text)
             self.show_current()
         if self.error:
             self.placeholder.setText(self.error)
@@ -1680,7 +1776,9 @@ class MeetingsPage(ListDetailPage):
 
     def status_text(self, m: Meeting) -> str:
         if self.is_live(m):
-            return "Recording" if self.live_state == "recording" else "Paused"
+            return tr("Recording") if self.live_state == "recording" else tr("Paused")
+        if m.status in self.STATUSES:
+            return tr(self.STATUSES[m.status])
         return m.status.replace("_", " ").capitalize() or "–"
 
     def set_live(self, meeting_id: str | None, state: str, elapsed: float | None,
@@ -1710,16 +1808,16 @@ class MeetingsPage(ListDetailPage):
     def meta_text(self, m: Meeting) -> str:
         parts = [fmt_date(m.started_at, long=True), self.duration_text(m), self.status_text(m)]
         if m.chunk_count:
-            parts.append(f"{m.chunk_count} chunk{'s' if m.chunk_count != 1 else ''}")
+            parts.append(ntr(m.chunk_count, "{n} chunk", "{n} chunks"))
         if m.model:
             parts.append(Path(m.model).name)
         text = " · ".join(parts)
-        text += "\n" + (f"Markdown copy: {tilde(m.md_path)}" if m.md_path
-                        else f"From {ENGINE}'s meeting database (no Markdown copy)")
+        text += "\n" + (tr("Markdown copy: {path}", path=tilde(m.md_path)) if m.md_path
+                        else tr("From {engine}'s meeting database (no Markdown copy)", engine=ENGINE))
         if self.pass_running(m):
-            text += "\nTelling the speakers apart… the transcript is replaced when that is done."
+            text += "\n" + tr("Telling the speakers apart… the transcript is replaced when that is done.")
         if self.is_live(m) and self.live_md:
-            text += "\nLive: transcribed as people talk; in italics, what is still being said"
+            text += "\n" + tr("Live: transcribed as people talk; in italics, what is still being said")
         return text
 
     def pass_running(self, m: Meeting) -> bool:
@@ -1744,9 +1842,9 @@ class MeetingsPage(ListDetailPage):
         has_people = bool(m.md_path and md_speakers(self.texts.get(m.md_path) or ""))
         self.act_names.setEnabled(has_people and not busy)
         self.act_names.setToolTip(
-            "Wait until the speakers are told apart" if busy and has_people else
-            "Put names on Person 1, Person 2, …; optionally recognise them by voice in later meetings"
-            if has_people else "This transcript has no speakers to name")
+            tr("Wait until the speakers are told apart") if busy and has_people else
+            tr("Put names on Person 1, Person 2, …; optionally recognise them by voice in later meetings")
+            if has_people else tr("This transcript has no speakers to name"))
 
     def ask_names(self, speakers: list[tuple[str, str]], has_fingerprints: bool,
                   you_allowed: bool = False) -> tuple[dict[str, str], bool] | None:
@@ -1780,12 +1878,13 @@ class MeetingsPage(ListDetailPage):
             os.chmod(tmp, path.stat().st_mode & 0o777)
             os.replace(tmp, path)
         except OSError as exc:
-            self.main.error_box("Could not rename the speakers", str(exc))
+            self.main.error_box(tr("Could not rename the speakers"), str(exc))
             return
         remembered = remember_named(m.md_path, names) if remember else []
-        self.main.message("Renamed " + ", ".join(f"{a} → {b}" for a, b in names.items())
-                          + (f"; {', '.join(remembered)} will be recognised in later meetings"
-                             if remembered else ""))
+        renamed = ", ".join(f"{a} → {b}" for a, b in names.items())
+        self.main.message(tr("Renamed {names}; {people} will be recognised in later meetings",
+                             names=renamed, people=", ".join(remembered)) if remembered
+                          else tr("Renamed {names}", names=renamed))
         self.reload()
 
     def show_detail(self, key: str) -> None:
@@ -1798,8 +1897,8 @@ class MeetingsPage(ListDetailPage):
         self.act_refresh.setVisible(live or not m.md_path)
         self.update_names_action(m)
         self.act_delete.setEnabled(not live)
-        self.act_delete.setToolTip("Stop the meeting before deleting it" if live
-                                   else f"Delete this meeting from {ENGINE}")
+        self.act_delete.setToolTip(tr("Stop the meeting before deleting it") if live
+                                   else tr("Delete this meeting from {engine}", engine=ENGINE))
         self.load_body(m, live)
 
     def show_current_force(self) -> None:
@@ -1824,7 +1923,8 @@ class MeetingsPage(ListDetailPage):
             return
         self.current_text = ""
         self.act_copy.setEnabled(False)
-        self.view.show_message(message_html("Loading the transcript…", f"{ENGINE} meeting export", "busy"))
+        self.view.show_message(message_html(tr("Loading the transcript…"),
+                                            tr("{engine} meeting export", engine=ENGINE), "busy"))
 
         def done(code: int, out: str, err: str) -> None:
             if code == 0:
@@ -1836,9 +1936,10 @@ class MeetingsPage(ListDetailPage):
                 self._show_text(out)
             else:
                 self.view.show_message(message_html(
-                    "Could not load the transcript",
-                    (err.strip() or f"{ENGINE} exited with status {code}")
-                    + (f"\n\nIs the {ENGINE} daemon running?" if code == -1 else ""), "error"))
+                    tr("Could not load the transcript"),
+                    (err.strip() or tr("{engine} exited with status {code}", engine=ENGINE, code=code))
+                    + ("\n\n" + tr("Is the {engine} daemon running?", engine=ENGINE) if code == -1 else ""),
+                    "error"))
         run_command(self, export_cmd(m.id), done, timeout_ms=60_000)
 
     def show_live(self, first: bool = False) -> None:
@@ -1850,10 +1951,10 @@ class MeetingsPage(ListDetailPage):
             self.current_text = ""
             self.act_copy.setEnabled(False)
             self.view.show_message(message_html(
-                "The transcript shows up here as people talk",
-                "If it does not, the live transcript is off, and the transcript shows up here when the "
-                "meeting stops. It needs telling speakers apart (on unless installed with "
-                "--no-speakers), and ~/.config/bmeet/live-transcript must not say “off”.", "busy"))
+                tr("The transcript shows up here as people talk"),
+                tr("If it does not, the live transcript is off, and the transcript shows up here when the "
+                   "meeting stops. It needs telling speakers apart (on unless installed with "
+                   "--no-speakers), and ~/.config/bmeet/live-transcript must not say “off”."), "busy"))
             return
         bar = self.view.verticalScrollBar()
         follow, pos = not self.terms and (first or bar.value() >= bar.maximum() - 4), bar.value()
@@ -1862,7 +1963,7 @@ class MeetingsPage(ListDetailPage):
         # The transcript only: the info above it changes with every line (word count, ...).
         body = text.split("\n## Transcript\n", 1)[-1]
         self.view.show_paragraphs([p.strip() for p in body.split("\n\n") if p.strip()]
-                                  or ["*(nothing said yet)*"])
+                                  or [tr("*(nothing said yet)*")])
         if self.terms and first:
             return  # (at the first search hit)
 
@@ -1874,7 +1975,7 @@ class MeetingsPage(ListDetailPage):
     def _show_text(self, text: str) -> None:
         self.current_text = text
         self.act_copy.setEnabled(bool(text.strip()))
-        self.view.show_markdown(text if text.strip() else "*(the transcript is empty)*")
+        self.view.show_markdown(text if text.strip() else tr("*(the transcript is empty)*"))
 
     # -- search: title + Markdown copy, else the exported transcript (fetched on demand)
     def content(self, m: Meeting) -> str | None:
@@ -1926,9 +2027,9 @@ class MeetingsPage(ListDetailPage):
             return
         start = Path(self.main.settings.value("meetings/exportDir", "") or
                      (MEETING_MD_DIR if MEETING_MD_DIR.is_dir() else HOME / "Documents"))
-        path, flt = QFileDialog.getSaveFileName(self, "Export meeting transcript",
+        path, flt = QFileDialog.getSaveFileName(self, tr("Export meeting transcript"),
                                                 str(start / f"{safe_filename(m.title)}.md"),
-                                                ";;".join(f[0] for f in EXPORT_FORMATS))
+                                                ";;".join(export_filter(f) for f in EXPORT_FORMATS))
         if path:
             self.main.settings.setValue("meetings/exportDir", str(Path(path).parent))
             self.export_to(m.id, path, flt)
@@ -1940,7 +2041,7 @@ class MeetingsPage(ListDetailPage):
         ext = Path(path).suffix.lower()
         fmt = next((f[1] for f in EXPORT_FORMATS if f[2] == ext), None)
         if fmt is None:
-            fmt, ext = next(((f[1], f[2]) for f in EXPORT_FORMATS if f[0] == name_filter),
+            fmt, ext = next(((f[1], f[2]) for f in EXPORT_FORMATS if export_filter(f) == name_filter),
                             ("markdown", ".md"))
             path += ext
         m = self.meetings.get(meeting_id)
@@ -1950,16 +2051,17 @@ class MeetingsPage(ListDetailPage):
             try:
                 Path(path).write_text(meeting_export(m, text, fmt), encoding="utf-8")
             except OSError as exc:
-                self.main.error_box("Export failed", str(exc))
+                self.main.error_box(tr("Export failed"), str(exc))
                 return path
-            self.main.message(f"Exported to {tilde(path)}")
+            self.main.message(tr("Exported to {path}", path=tilde(path)))
             return path
 
         def done(code: int, _out: str, err: str) -> None:
             if code == 0:
-                self.main.message(f"Exported to {tilde(path)}")
+                self.main.message(tr("Exported to {path}", path=tilde(path)))
             else:
-                self.main.error_box("Export failed", err.strip() or f"{ENGINE} exited with status {code}")
+                self.main.error_box(tr("Export failed"), err.strip()
+                                    or tr("{engine} exited with status {code}", engine=ENGINE, code=code))
         run_command(self, export_cmd(meeting_id, fmt, path), done, timeout_ms=60_000)
         return path
 
@@ -1974,17 +2076,18 @@ class MeetingsPage(ListDetailPage):
 
     def ask_delete(self, m: Meeting) -> tuple[bool, bool]:
         """(delete?, also trash the Markdown copy?)"""
-        box = QMessageBox(QMessageBox.Icon.Warning, "Delete meeting",
-                          f"Delete “{m.title}” ({fmt_date(m.started_at)})?", parent=self)
-        box.setInformativeText(f"The meeting and its transcript are removed from {ENGINE}'s "
-                               "database. This cannot be undone.")
+        box = QMessageBox(QMessageBox.Icon.Warning, tr("Delete meeting"),
+                          tr("Delete “{title}” ({date})?", title=m.title, date=fmt_date(m.started_at)), parent=self)
+        box.setInformativeText(tr("The meeting and its transcript are removed from {engine}'s "
+                                  "database. This cannot be undone.", engine=ENGINE))
         cb = None
         if m.md_path and os.path.isfile(m.md_path):
-            cb = QCheckBox(f"Also move the Markdown copy “{Path(m.md_path).name}” to the Trash")
+            cb = QCheckBox(tr("Also move the Markdown copy “{name}” to the Trash", name=Path(m.md_path).name))
             box.setCheckBox(cb)
-        delete_btn = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        delete_btn = box.addButton(tr("Delete"), QMessageBox.ButtonRole.DestructiveRole)
         delete_btn.setIcon(QIcon.fromTheme("edit-delete"))
         box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Cancel))
+        standard_texts(box)
         box.exec()
         return box.clickedButton() is delete_btn, bool(cb and cb.isChecked())
 
@@ -1998,17 +2101,18 @@ class MeetingsPage(ListDetailPage):
 
         def done(code: int, _out: str, err: str) -> None:
             if code != 0:
-                self.main.error_box("Delete failed", err.strip() or f"{ENGINE} exited with status {code}")
+                self.main.error_box(tr("Delete failed"), err.strip()
+                                    or tr("{engine} exited with status {code}", engine=ENGINE, code=code))
                 return
             self.export_cache.pop(m.id, None)
             if m.md_path:  # its voice fingerprints, if any (remembered names stay)
                 meeting_voices_path(m.md_path).unlink(missing_ok=True)
-            text = f"Deleted “{m.title}”"
+            text = tr("Deleted “{title}”", title=m.title)
             if trash_md and m.md_path:
                 if move_to_trash(m.md_path):
-                    text += "; its Markdown copy is in the Trash"
+                    text = tr("Deleted “{title}”; its Markdown copy is in the Trash", title=m.title)
                 else:
-                    self.main.error_box("Could not move to the Trash", m.md_path)
+                    self.main.error_box(tr("Could not move to the Trash"), m.md_path)
             self.main.message(text)
             self.reload()
             self.main.update_counts()
@@ -2025,26 +2129,30 @@ class MeetingsPage(ListDetailPage):
 
 
 class FilesPage(ListDetailPage):
-    COLUMNS = ("Name", "Date", "Duration", "Model", "Status")
-    EMPTY = mac_words("No transcribed files yet.\n\nUse “Transcribe a file”, or right-click a recording "
+    COLUMNS = (N_("Name"), N_("Date"), N_("Duration"), N_("Model"), N_("Status"))
+
+    def empty_text(self) -> str:
+        if self.main.features["file_transcription"]:
+            return tr("No transcribed files yet.\n\nUse “Transcribe a file”, or right-click a recording "
                       "in Dolphin → Transcribe (NPU).")
+        return tr("No transcribed files yet.")
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__(main)
         self.entries: dict[str, HistoryEntry] = {}
         self.texts = TextCache()
-        self.act_copy = self.add_action("edit-copy", "Copy", self.copy_text,
-                                        "Copy the transcript to the clipboard")
-        self.act_srt = self.add_action("media-view-subtitles-symbolic", "Open subtitles",
-                                       lambda: self._open(".srt"), "Open the .srt subtitles")
-        self.act_notes = self.add_action("document-open", "Open notes", lambda: self._open(".md"),
-                                         "Open the .md notes in your editor")
-        self.act_folder = self.add_action("document-open-folder", "Open folder", self.open_folder,
-                                          "Show the transcript in the file manager")
-        self.act_again = self.add_action("view-refresh", "Transcribe again", self.again,
-                                         "Queue the audio/video file on “Transcribe a file”")
-        self.act_remove = self.add_action("list-remove", "Remove from list…", self.remove,
-                                          "Remove from this list (files stay unless you choose otherwise)",
+        self.act_copy = self.add_action("edit-copy", tr("Copy"), self.copy_text,
+                                        tr("Copy the transcript to the clipboard"))
+        self.act_srt = self.add_action("media-view-subtitles-symbolic", tr("Open subtitles"),
+                                       lambda: self._open(".srt"), tr("Open the .srt subtitles"))
+        self.act_notes = self.add_action("document-open", tr("Open notes"), lambda: self._open(".md"),
+                                         tr("Open the .md notes in your editor"))
+        self.act_folder = self.add_action("document-open-folder", tr("Open folder"), self.open_folder,
+                                          tr("Show the transcript in the file manager"))
+        self.act_again = self.add_action("view-refresh", tr("Transcribe again"), self.again,
+                                         tr("Queue the audio/video file on “Transcribe a file”"))
+        self.act_remove = self.add_action("list-remove", tr("Remove from list…"), self.remove,
+                                          tr("Remove from this list (files stay unless you choose otherwise)"),
                                           QKeySequence.StandardKey.Delete)
 
     def current(self) -> HistoryEntry | None:
@@ -2060,12 +2168,12 @@ class FilesPage(ListDetailPage):
             if e.raw in self.entries:
                 continue
             self.entries[e.raw] = e
-            model = " · ".join(x for x in (e.model and Path(e.model).name, e.device) if x)
+            model = " · ".join(x for x in (e.model and engine_name(e.model), e.device) if x)
             rows.append((e.raw, [e.name, fmt_date(e.time), fmt_duration(e.duration or None), model, e.state()],
                          [e.name.casefold(), e.time, e.duration, None, None], e.input))
         self.repopulate(rows, old_key)
         new_key = self.current_key()
-        if new_key != old_key or self._sig(new_key) != old_sig:
+        if new_key != old_key or self._sig(new_key) != old_sig or new_key is None:   # (None: the placeholder's text)
             self.show_current()
 
     def _sig(self, key: str | None) -> tuple | None:
@@ -2086,9 +2194,10 @@ class FilesPage(ListDetailPage):
         self.title.setToolTip(e.input)
         parts = [fmt_date(e.time, long=True), fmt_duration(e.duration or None)]
         if e.model:
-            parts.append(f"{Path(e.model).name} on {e.device}" if e.device else Path(e.model).name)
+            parts.append(tr("{model} on {device}", model=engine_name(e.model), device=e.device) if e.device
+                         else engine_name(e.model))
         if e.language and e.language != "?":
-            parts.append(f"language {e.language}")
+            parts.append(tr("language {language}", language=e.language))
         parts.append(e.state())
         self.meta.setText(" · ".join(parts) + f"\n{tilde(e.input)}")
         srt, md = e.output(".srt"), e.output(".md")
@@ -2098,14 +2207,15 @@ class FilesPage(ListDetailPage):
         path = e.text_path()
         self.current_text = ""
         if e.status != "done":
+            again = self.main.features["file_transcription"]
             self.view.show_message(message_html(
-                "Transcription failed",
-                f"{e.input}\n\nUse “Transcribe again” to retry; the Transcribe page shows the "
-                "log of runs started from this window.", "error"))
+                tr("Transcription failed"),
+                f"{e.input}\n\n" + (tr("Use “Transcribe again” to retry; the Transcribe page shows the "
+                                       "log of runs started from this window.") if again else ""), "error"))
         elif path is None:
             self.view.show_message(message_html(
-                "The transcript files were moved or deleted",
-                "\n".join(e.outputs) or "(npu-transcribe recorded no output files)", "error"))
+                tr("The transcript files were moved or deleted"),
+                "\n".join(e.outputs) or tr("(npu-transcribe recorded no output files)"), "error"))
         else:
             text = self.texts.get(path) or ""
             self.current_text = text
@@ -2134,24 +2244,25 @@ class FilesPage(ListDetailPage):
 
     def again(self) -> None:
         e = self.current()
-        if e and os.path.isfile(e.input):
+        if e and os.path.isfile(e.input) and self.main.features["file_transcription"]:
             self.main.transcribe_page.add_files([e.input])
             self.main.set_page("transcribe")
 
     def ask_remove(self, e: HistoryEntry, outputs: list[str]) -> tuple[bool, bool]:
         """(remove from the list?, also trash the transcript files?)"""
-        box = QMessageBox(QMessageBox.Icon.Question, "Remove from list",
-                          f"Remove “{e.name}” from the list?", parent=self)
-        box.setInformativeText("Only the list entry is removed: the recording and its "
-                               "transcripts stay where they are, unless you tick the box.")
+        box = QMessageBox(QMessageBox.Icon.Question, tr("Remove from list"),
+                          tr("Remove “{name}” from the list?", name=e.name), parent=self)
+        box.setInformativeText(tr("Only the list entry is removed: the recording and its "
+                                  "transcripts stay where they are, unless you tick the box."))
         cb = None
         if outputs:
-            cb = QCheckBox("Also move the transcript files to the Trash: "
-                           + ", ".join(Path(o).name for o in outputs))
+            cb = QCheckBox(tr("Also move the transcript files to the Trash: {names}",
+                              names=", ".join(Path(o).name for o in outputs)))
             box.setCheckBox(cb)
-        remove_btn = box.addButton("Remove", QMessageBox.ButtonRole.AcceptRole)
+        remove_btn = box.addButton(tr("Remove"), QMessageBox.ButtonRole.AcceptRole)
         remove_btn.setIcon(QIcon.fromTheme("list-remove"))
         box.setDefaultButton(box.addButton(QMessageBox.StandardButton.Cancel))
+        standard_texts(box)
         box.exec()
         return box.clickedButton() is remove_btn, bool(cb and cb.isChecked())
 
@@ -2166,13 +2277,13 @@ class FilesPage(ListDetailPage):
         try:
             remove_history_entries({e.raw})
         except OSError as exc:
-            self.main.error_box("Could not update the list", f"{FILE_HISTORY}: {exc}")
+            self.main.error_box(tr("Could not update the list"), f"{FILE_HISTORY}: {exc}")
             return
         failed = [o for o in outputs if trash and not move_to_trash(o)]
         if failed:
-            self.main.error_box("Could not move to the Trash", "\n".join(failed))
-        self.main.message(f"Removed “{e.name}” from the list"
-                          + ("; its transcripts are in the Trash" if trash and not failed else ""))
+            self.main.error_box(tr("Could not move to the Trash"), "\n".join(failed))
+        self.main.message(tr("Removed “{name}” from the list; its transcripts are in the Trash", name=e.name)
+                          if trash and not failed else tr("Removed “{name}” from the list", name=e.name))
         self.reload()
         self.main.update_counts()
 
@@ -2193,17 +2304,43 @@ class FilesPage(ListDetailPage):
 
 # ============================================================================ transcribe page
 
+# The engines of "Transcribe a file", and what each passes to npu-transcribe: --engine and --model.
+# Automatic is npu-transcribe's own choice (GigaAM v3 for Russian when it is installed and nothing
+# is translated, Whisper otherwise); with Automatic and GigaAM, turbo is the Whisper that redoes
+# the Russian sentences with English terms in them (docs/npu-transcribe.md).
+ENGINES = {"auto": ("auto", "turbo"), "gigaam": ("gigaam", "turbo"), "turbo": ("whisper", "turbo"),
+           "small": ("whisper", "small")}
+ENGINE_TITLES = {"auto": N_("Automatic"), "gigaam": N_("GigaAM v3 (Russian)"), "turbo": "Whisper large-v3 turbo",
+                 "small": "Whisper small"}
+DONE_WITH = re.compile(r" with (\S+) on ")   # npu-transcribe's "done: NAME: ... with MODEL on DEVICE"
+
+
+def engine_name(model: str) -> str:
+    """What npu-transcribe ran, for people: a history line's model ("gigaam", "turbo", "small", a
+    folder) or its done line's ("gigaam-v3-ctc", "whisper-large-v3-turbo-int8-ov",
+    "openai_whisper-small_216MB") -> "GigaAM v3", "Whisper turbo", "Whisper small"."""
+    name = Path(model).name
+    if name.lower().startswith("gigaam"):
+        return "GigaAM v3"
+    if "small" in name.lower():
+        return "Whisper small"
+    if "turbo" in name.lower() or "large-v3" in name.lower():
+        return "Whisper turbo"
+    return name
+
+
 @dataclass
 class Job:
     path: str
     state: str = "ready"   # ready -> queued -> running -> done | failed | cancelled
-    model: str = "turbo"
+    engine: str = "auto"   # one of ENGINES
     language: str = "auto"
     translate: bool = False
     phase: str = ""
     fraction: float | None = None
     remaining: float | None = None
     language_found: str = ""
+    ran: str = ""          # the model its done line names (DONE_WITH): what did run
     error: str = ""
     log: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
@@ -2219,22 +2356,38 @@ class Job:
         return os.path.basename(self.path)
 
     def args(self) -> list[str]:
-        return (["--model", self.model, "--language", self.language]
+        engine, model = ENGINES.get(self.engine, ENGINES["auto"])
+        return (["--engine", engine, "--model", model, "--language", self.language]
                 + (["--translate"] if self.translate else []) + ["--", self.path])
 
+    def runs(self) -> str:
+        """The model that will run (or runs), as far as is known before it is done: Automatic
+        takes GigaAM for Russian, so with a detected language only once it is detected."""
+        if self.ran:
+            return engine_name(self.ran)
+        language = self.language_found or self.language
+        if self.engine == "gigaam" or (self.engine == "auto" and language == "ru" and not self.translate
+                                       and gigaam_installed()):
+            return "GigaAM v3"
+        if self.engine == "auto" and language == "auto":
+            return tr("Automatic")
+        return "Whisper small" if self.engine == "small" else "Whisper turbo"
+
     def options_text(self) -> str:
+        """The Options column: what will run or ran, its language, and → English when translated."""
         if self.state == "ready":
             return "–"
-        lang = {"auto": "auto language"}.get(self.language, self.language)
-        return f"{self.model} · {lang}" + (" → English" if self.translate else "")
+        language = self.language_found if self.ran and self.language_found else self.language
+        return (f"{self.runs()} · {tr('auto') if language == 'auto' else language}"
+                + (" → " + tr("English") if self.translate else ""))
 
     def status_text(self) -> str:
         if self.state == "running":
             if self.fraction is not None:
                 return f"{self.fraction * 100:.0f} %"
-            return self.phase or "Starting…"
-        return {"ready": "Ready", "queued": "Waiting", "done": "Done",
-                "cancelled": "Cancelled"}.get(self.state, f"Failed: {self.error}")
+            return self.phase or tr("Starting…")
+        return {"ready": tr("Ready"), "queued": tr("Waiting"), "done": tr("Done"),
+                "cancelled": tr("Cancelled")}.get(self.state) or tr("Failed: {error}", error=self.error)
 
 
 class TranscribePage(QWidget):
@@ -2246,8 +2399,8 @@ class TranscribePage(QWidget):
         self.jobs: list[Job] = []
 
         self.missing = Banner("error")
-        self.missing.text.setText(f"npu-transcribe was not found ({TRANSCRIBE}). Run the "
-                                  "BMeet installer again to set it up.")
+        self.missing.text.setText(tr("npu-transcribe was not found ({path}). Run the "
+                                     "BMeet installer again to set it up.", path=TRANSCRIBE))
         if os.access(TRANSCRIBE, os.X_OK):
             self.missing.hide()  # (never show() a widget before it has a parent: it becomes a window)
 
@@ -2255,22 +2408,19 @@ class TranscribePage(QWidget):
         self.drop.files_dropped.connect(self.add_files)
         self.drop.browse.connect(self.browse)
 
-        self.model = QComboBox()
-        self.model.addItem("Accurate (Whisper large-v3 turbo)", "turbo")
-        self.model.addItem("Fast (Whisper small)", "small")
-        self.model.setToolTip("turbo is more accurate and on the NPU about as fast; small needs less "
-                              "memory and is faster on the CPU")
+        self.engine = QComboBox()
+        self.engine.setToolTip(tr("The speech model. Whisper turbo is more accurate and on the NPU about as "
+                                  "fast; small needs less memory and is faster on the CPU."))
         self.language = QComboBox()
-        self.language.addItem("Detect automatically", "auto")
-        for code in dict.fromkeys(["en", *configured_languages()]):
-            self.language.addItem(language_name(code), code)
-        self.language.setToolTip("Spoken language. Auto-detection listens to the first ~2 minutes.")
-        self.translate = QCheckBox("Translate to English")
-        self.translate.setToolTip("Write English text whatever the spoken language")
+        self.language.setToolTip(tr("Spoken language. Auto-detection listens to the first ~2 minutes."))
+        self._choices: tuple | None = None   # (languages, GigaAM offered) the lists were made for
+        self.translate = QCheckBox(tr("Translate to English"))
+        self.translate.setToolTip(tr("Write English text whatever the spoken language"))
         self.translate.toggled.connect(self._translate_toggled)
-        self.model.currentIndexChanged.connect(lambda _: self._update_hint())
+        self.engine.currentIndexChanged.connect(self._engine_changed)
+        self.language.currentIndexChanged.connect(self._language_changed)
         opts = QHBoxLayout()
-        for label, widget in (("Model:", self.model), ("Language:", self.language)):
+        for label, widget in ((tr("Engine:"), self.engine), (tr("Language:"), self.language)):
             lbl = QLabel(label)
             lbl.setBuddy(widget)
             opts.addWidget(lbl)
@@ -2285,7 +2435,7 @@ class TranscribePage(QWidget):
         self.hint.setPalette(pal)
 
         self.queue = QTreeWidget()
-        self.queue.setHeaderLabels(("File", "Options", "Status"))
+        self.queue.setHeaderLabels((tr("File"), tr("Options"), tr("Status")))
         self.queue.setRootIsDecorated(False)
         self.queue.setUniformRowHeights(True)
         self.queue.setAllColumnsShowFocus(True)
@@ -2299,14 +2449,14 @@ class TranscribePage(QWidget):
         self.queue.itemSelectionChanged.connect(self._selection_changed)
         self.queue.itemDoubleClicked.connect(lambda *_: self.show_result())
 
-        self.start_btn = QPushButton(icon("media-playback-start"), "Transcribe")
+        self.start_btn = QPushButton(icon("media-playback-start"), tr("Transcribe"))
         self.start_btn.setDefault(True)
         self.start_btn.clicked.connect(self.start_ready)
-        self.remove_btn = QPushButton(icon("list-remove"), "Remove")
+        self.remove_btn = QPushButton(icon("list-remove"), tr("Remove"))
         self.remove_btn.clicked.connect(self.remove_selected)
-        self.clear_btn = QPushButton(icon("edit-clear-history"), "Clear finished")
+        self.clear_btn = QPushButton(icon("edit-clear-history"), tr("Clear finished"))
         self.clear_btn.clicked.connect(self.clear_finished)
-        self.result_btn = QPushButton(icon("view-media-lyrics"), "Show transcript")
+        self.result_btn = QPushButton(icon("view-media-lyrics"), tr("Show transcript"))
         self.result_btn.clicked.connect(self.show_result)
         buttons = QHBoxLayout()
         for b in (self.start_btn, self.remove_btn, self.clear_btn):
@@ -2325,8 +2475,8 @@ class TranscribePage(QWidget):
         self.progress.setRange(0, 1000)
         self.progress.setTextVisible(False)
         self.run_phase = QLabel()
-        self.cancel_btn = QPushButton(icon("process-stop"), "Cancel")
-        self.cancel_btn.setToolTip("Stop this transcription (nothing is written for it)")
+        self.cancel_btn = QPushButton(icon("process-stop"), tr("Cancel"))
+        self.cancel_btn.setToolTip(tr("Stop this transcription (nothing is written for it)"))
         self.cancel_btn.clicked.connect(self.cancel_current)
         row = QHBoxLayout()
         row.addWidget(self.progress, 1)
@@ -2337,7 +2487,7 @@ class TranscribePage(QWidget):
         self.run_frame.hide()
 
         self.log_toggle = QToolButton()
-        self.log_toggle.setText("Log")
+        self.log_toggle.setText(tr("Log"))
         self.log_toggle.setCheckable(True)
         self.log_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.log_toggle.setArrowType(Qt.ArrowType.RightArrow)
@@ -2347,7 +2497,7 @@ class TranscribePage(QWidget):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        self.log_view.setPlaceholderText("npu-transcribe's messages for the selected file appear here.")
+        self.log_view.setPlaceholderText(tr("npu-transcribe's messages for the selected file appear here."))
         self.log_view.hide()
         self._log_job: Job | None = None
 
@@ -2365,38 +2515,102 @@ class TranscribePage(QWidget):
 
         self.ticker = QTimer(self, interval=1000)
         self.ticker.timeout.connect(self._tick)
-        self._update_hint()
+        self.set_choices(configured_languages())
         self._update_buttons()
 
     # -- options
+    def set_choices(self, languages: list[str]) -> None:
+        """The engines and languages offered: Detect automatically and the languages that are on
+        (~/.config/bmeet/languages), and GigaAM v3 only while it is installed and Russian is on.
+        Called on every status poll: the lists change only when one of those did."""
+        gigaam = gigaam_installed() and "ru" in languages
+        key = (tuple(languages), gigaam)
+        if key == self._choices:
+            return
+        self._choices = key
+        engine, language = self.engine.currentData() or "auto", self.language.currentData() or "auto"
+
+        def fill() -> None:
+            self.engine.clear()
+            for value, title in ENGINE_TITLES.items():
+                if value != "gigaam" or gigaam:
+                    self.engine.addItem(tr(title), value)
+            self.language.clear()
+            self.language.addItem(tr("Detect automatically"), "auto")
+            for code in languages:
+                self.language.addItem(language_name(code), code)
+            self._select(self.engine, engine)
+            self._select(self.language, language)
+        self._quietly(fill)
+        self._language_changed()   # (GigaAM, if it is still the choice, needs Russian)
+
+    @staticmethod
+    def _select(combo: QComboBox, value: str) -> None:
+        combo.setCurrentIndex(max(0, combo.findData(value)))
+
+    def _quietly(self, change) -> None:
+        """Change the options without their own reactions (each rule below sets all it needs)."""
+        widgets = (self.engine, self.language, self.translate)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            change()
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._update_hint()
+
+    def _engine_changed(self, _index: int = 0) -> None:
+        if self.engine.currentData() == "gigaam":   # (Russian only, and it does not translate)
+            self._quietly(lambda: (self._select(self.language, "ru"), self.translate.setChecked(False)))
+        self._update_hint()
+
+    def _language_changed(self, _index: int = 0) -> None:
+        if self.engine.currentData() == "gigaam" and self.language.currentData() != "ru":
+            self._quietly(lambda: self._select(self.engine, "auto"))
+        self._update_hint()
+
     def _translate_toggled(self, on: bool) -> None:
-        if on and self.model.currentData() == "turbo":
-            self.model.setCurrentIndex(self.model.findData("small"))
+        if on and self.engine.currentData() != "small":   # (turbo was not trained to translate; GigaAM can't)
+            self._quietly(lambda: self._select(self.engine, "small"))
         self._update_hint()
 
     def _update_hint(self) -> None:
-        text = "Transcripts are saved next to each file: NAME.srt (subtitles) and NAME.md (notes)."
+        """The caption under the options: what the engine choice means, and where the files go."""
+        engine, parts = self.engine.currentData(), []
         if self.translate.isChecked():
-            text += (" Translation works best with the small model (turbo was not trained to translate)."
-                     if self.model.currentData() == "turbo" else
-                     " Translation uses the small model (turbo was not trained to translate).")
-        self.hint.setText(text)
+            parts.append(tr("Translation works best with the small model (turbo was not trained to translate).")
+                         if engine != "small" else
+                         tr("Translation uses the small model (turbo was not trained to translate)."))
+        elif engine == "gigaam":
+            parts.append(tr("GigaAM v3 transcribes the Russian speech, and Whisper turbo redoes the sentences "
+                            "with English terms in them."))
+        elif engine == "auto":
+            parts.append(tr("Automatic: GigaAM v3 for Russian, with Whisper turbo redoing the sentences with "
+                            "English terms in them; Whisper turbo for other languages.") if gigaam_installed()
+                         else tr("Automatic: Whisper turbo (GigaAM v3 for Russian is not installed)."))
+        parts.append(tr("Transcripts are saved next to each file: NAME.srt (subtitles) and NAME.md (notes)."))
+        self.hint.setText(" ".join(parts))
 
     def options(self) -> dict:
-        return {"model": self.model.currentData(), "language": self.language.currentData(),
+        return {"engine": self.engine.currentData(), "language": self.language.currentData(),
                 "translate": self.translate.isChecked()}
 
-    def set_options(self, model: str, language: str, translate: bool) -> None:
-        self.translate.setChecked(bool(translate))
-        if (i := self.model.findData(model)) >= 0:
-            self.model.setCurrentIndex(i)
-        if (i := self.language.findData(language)) >= 0:
-            self.language.setCurrentIndex(i)
+    def set_options(self, engine: str, language: str, translate: bool) -> None:
+        """Choose these options (restored ones); one that is not offered falls back to its first
+        choice, and GigaAM keeps its rules (Russian, no translation)."""
+        def choose() -> None:
+            self.translate.setChecked(bool(translate))
+            self._select(self.engine, engine)
+            self._select(self.language, language)
+        self._quietly(choose)
+        if self.engine.currentData() == "gigaam":
+            self._engine_changed()
 
     # -- queue
     def browse(self) -> None:
         start = self.main.settings.value("transcribe/lastDir", "") or str(HOME)
-        paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio or video files", start, MEDIA_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(self, tr("Choose audio or video files"), start, media_filter())
         if paths:
             self.main.settings.setValue("transcribe/lastDir", os.path.dirname(paths[0]))
             self.add_files(paths)
@@ -2406,11 +2620,11 @@ class TranscribePage(QWidget):
         for p in paths:
             p = os.path.abspath(os.path.expanduser(p))
             if not os.path.isfile(p):
-                skipped.append(f"{os.path.basename(p)} (not found)")
+                skipped.append(tr("{name} (not found)", name=os.path.basename(p)))
             elif not is_media(p):
-                skipped.append(f"{os.path.basename(p)} (not audio or video)")
+                skipped.append(tr("{name} (not audio or video)", name=os.path.basename(p)))
             elif any(j.path == p and j.state in ("ready", "queued", "running") for j in self.jobs):
-                skipped.append(f"{os.path.basename(p)} (already in the queue)")
+                skipped.append(tr("{name} (already in the queue)", name=os.path.basename(p)))
             else:
                 job = Job(p)
                 job.item = QTreeWidgetItem([job.name, "", ""])
@@ -2422,10 +2636,11 @@ class TranscribePage(QWidget):
                 added += 1
         if added:
             self.queue.setCurrentItem(self.jobs[-1].item)
-            self.main.message(f"Added {added} file{'s' if added > 1 else ''}: choose the options "
-                              "and press Transcribe" + (f" (skipped: {', '.join(skipped)})" if skipped else ""))
+            self.main.message(tr("Added {files}: choose the options and press Transcribe",
+                                 files=ntr(added, "{n} file", "{n} files"))
+                              + (" " + tr("(skipped: {names})", names=", ".join(skipped)) if skipped else ""))
         elif skipped:
-            self.main.message("Not added: " + ", ".join(skipped))
+            self.main.message(tr("Not added: {names}", names=", ".join(skipped)))
         self._update_buttons()
         return added
 
@@ -2435,11 +2650,12 @@ class TranscribePage(QWidget):
             self.browse()
             return
         opts = self.options()
-        self.main.settings.setValue("transcribe/model", opts["model"])
+        self.main.settings.setValue("transcribe/engine", opts["engine"])
         self.main.settings.setValue("transcribe/language", opts["language"])
         self.main.settings.setValue("transcribe/translate", opts["translate"])
+        self.main.settings.remove("transcribe/model")   # (before the engine choice: turbo or small)
         for job in ready:
-            job.model, job.language, job.translate = opts["model"], opts["language"], opts["translate"]
+            job.engine, job.language, job.translate = opts["engine"], opts["language"], opts["translate"]
             job.state = "queued"
             self._update_item(job)
         self._pump()
@@ -2459,7 +2675,7 @@ class TranscribePage(QWidget):
         self.main.update_counts()
 
     def _start(self, job: Job) -> None:
-        job.state, job.phase, job.started = "running", "Starting…", time.monotonic()
+        job.state, job.phase, job.started = "running", tr("Starting…"), time.monotonic()
         job.log.append(f"$ npu-transcribe {shlex.join(job.args())}")
         proc = QProcess(self)
         proc.setProgram(TRANSCRIBE)
@@ -2501,17 +2717,19 @@ class TranscribePage(QWidget):
         info = parse_transcribe_line(line)
         kind = info["kind"]
         if kind == "loading":
-            job.phase = ("Preparing the model (the first NPU run compiles it, up to a few minutes)…"
-                         if info["compile"] else "Loading the model…")
+            job.phase = (tr("Preparing the model (the first NPU run compiles it, up to a few minutes)…")
+                         if info["compile"] else tr("Loading the model…"))
         elif kind == "ready":
-            job.phase = "Transcribing…"
+            job.phase = tr("Transcribing…")
         elif kind == "language":
             job.language_found = info["language"]
         elif kind == "progress":
             job.fraction = info["fraction"]
-            job.phase = "Transcribing…"
+            job.phase = tr("Transcribing…")
             if info["speed"] and info["total"]:
                 job.remaining = max(0.0, (info["total"] - info["done"]) / info["speed"])
+        elif kind == "done" and (m := DONE_WITH.search(info["text"])):
+            job.ran = m[1]
         elif kind == "error":
             job.error = info["text"]
             if job.error.startswith(job.name + ": "):
@@ -2521,7 +2739,7 @@ class TranscribePage(QWidget):
 
     def _proc_error(self, job: Job, error: QProcess.ProcessError) -> None:
         if error == QProcess.ProcessError.FailedToStart:
-            job.error = f"could not start {TRANSCRIBE}"
+            job.error = tr("could not start {program}", program=TRANSCRIBE)
             job.log.append(job.error)
             self._finished(job, -1, QProcess.ExitStatus.CrashExit)
 
@@ -2545,7 +2763,7 @@ class TranscribePage(QWidget):
             job.state, job.fraction = "done", 1.0
         else:
             job.state = "failed"
-            job.error = job.error or (f"exit status {code}" if code >= 0 else "crashed")
+            job.error = job.error or (tr("exit status {code}", code=code) if code >= 0 else tr("crashed"))
         job.log.append(f"[{job.state}, exit status {code}]")
         if self._log_job is job:
             self.log_view.appendPlainText(job.log[-1])
@@ -2562,7 +2780,7 @@ class TranscribePage(QWidget):
         if job is None or job.proc is None:
             return
         job.cancel_requested = True
-        job.phase = "Cancelling…"
+        job.phase = tr("Cancelling…")
         self._update_run_panel()
         proc = job.proc
         pid = proc.processId()
@@ -2636,7 +2854,8 @@ class TranscribePage(QWidget):
         if job is None:
             return
         waiting = sum(j.state == "queued" for j in self.jobs)
-        self.run_title.setText(f"Transcribing {job.name}" + (f"  (+{waiting} waiting)" if waiting else ""))
+        self.run_title.setText(tr("Transcribing {name}", name=job.name)
+                               + ("  " + tr("(+{n} waiting)", n=waiting) if waiting else ""))
         if job.fraction is None:
             self.progress.setRange(0, 0)  # busy indicator while the model loads
         else:
@@ -2648,17 +2867,18 @@ class TranscribePage(QWidget):
         job = self.running()
         if job is None:
             return
-        parts = [job.phase or "Starting…", f"{fmt_duration(time.monotonic() - job.started)} elapsed"]
+        parts = [job.phase or tr("Starting…"), tr("{time} elapsed", time=fmt_duration(time.monotonic() - job.started))]
         if job.remaining and job.fraction is not None and job.fraction < 1:
-            parts.append(f"about {fmt_duration(job.remaining)} left")
+            parts.append(tr("about {time} left", time=fmt_duration(job.remaining)))
         if job.language_found:
-            parts.append(f"language {job.language_found}")
+            parts.append(tr("language {language}", language=job.language_found))
         self.run_phase.setText(" · ".join(parts))
 
     def _update_buttons(self) -> None:
         ready = sum(j.state == "ready" for j in self.jobs)
-        self.start_btn.setText(f"Transcribe {ready} file{'s' if ready != 1 else ''}" if ready else "Transcribe…")
-        self.start_btn.setToolTip("Start with the options above" if ready else "Choose files to transcribe")
+        self.start_btn.setText(tr("Transcribe {files}", files=ntr(ready, "{n} file", "{n} files")) if ready
+                               else tr("Transcribe…"))
+        self.start_btn.setToolTip(tr("Start with the options above") if ready else tr("Choose files to transcribe"))
         sel = self.selected_jobs()
         self.remove_btn.setEnabled(any(j.state != "running" for j in sel))
         self.clear_btn.setEnabled(any(j.state in ("done", "failed", "cancelled") for j in self.jobs))
@@ -2691,10 +2911,14 @@ def is_video(path: str) -> bool:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        # (on a Mac too in ~/.config/bmeet/bmeet.conf, as on Linux, not in ~/Library/Preferences)
-        self.settings = QSettings(str(Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / APP_ID
-                                      / f"{APP_ID}.conf"), QSettings.Format.IniFormat) \
-            if sys.platform == "darwin" else QSettings(APP_ID, APP_ID)
+        # The interface language, from ~/.config/bmeet/interface-language, for this window's life:
+        # when it changes, the window offers Restart (show_language).
+        self.ui_language = texts.use(texts.interface_language())
+        # ~/.config/bmeet/bmeet.conf on a Mac too, never ~/Library/Preferences (QSettings' native place
+        # there); $XDG_CONFIG_HOME first, which the tests point at a folder of their own
+        self.settings = QSettings(str(CONFIG_DIR / f"{APP_ID}.conf"), QSettings.Format.IniFormat)
+        # the features that are on (dictation, meetings, ...): apply_features, on every poll
+        self.features = configured_features()
         self.force_quit = False
         self.status: dict | None = None
         self._status_error = CTL_ERROR
@@ -2710,36 +2934,42 @@ class MainWindow(QMainWindow):
 
         self._build_toolbar()
         self.daemon_banner = Banner("warning")
-        self.daemon_banner.text.setText(f"{ENGINE_TITLE} is not running: dictation and meeting "
-                                        "recording are unavailable.")
-        self.start_daemon_btn = self.daemon_banner.add_button(f"Start {ENGINE}", self.start_daemon,
-                                                              "media-playback-start")
+        self.daemon_banner.text.setText(tr("{engine} is not running: dictation and meeting recording are "
+                                           "unavailable.", engine=ENGINE_TITLE))
+        self.start_daemon_btn = self.daemon_banner.add_button(tr("Start {engine}", engine=ENGINE),
+                                                              self.start_daemon, "media-playback-start")
         self.ctl_banner = Banner("error")
-        self.ctl_banner.text.setText(f"Live status is unavailable: {CTL_ERROR}" if CTL_ERROR else "")
+        self.ctl_banner.text.setText(tr("Live status is unavailable: {error}", error=CTL_ERROR) if CTL_ERROR else "")
         # a newer release (bmeet-ctl's last check), or a newer version installed while this runs
         self.update_banner = Banner("info")
         self._update_key: tuple | None = None    # ("update" | "restart", version) shown
         self._update_hidden: tuple | None = None  # the one "Later" hid
         self._update_url = ""
         self._restart = False
-        self.update_news_btn = self.update_banner.add_button("What's New", self.update_news, "help-about")
-        self.update_btn = self.update_banner.add_button("Update…", self.start_update, "system-software-update")
-        self.restart_btn = self.update_banner.add_button("Restart", self.restart_window, "view-refresh")
-        self.update_banner.add_button("Later", self.hide_update, "")
+        self.update_news_btn = self.update_banner.add_button(tr("What's New"), self.update_news, "help-about")
+        self.update_btn = self.update_banner.add_button(tr("Update…"), self.start_update, "system-software-update")
+        self.restart_btn = self.update_banner.add_button(tr("Restart"), self.restart_window, "view-refresh")
+        self.update_banner.add_button(tr("Later"), self.hide_update, "")
+        # another interface language was chosen while this runs: it is used from the next start
+        self.language_banner = Banner("info")
+        self._language_shown: str | None = None    # the language it names
+        self._language_hidden: str | None = None   # the language whose banner "Later" hid
+        self.language_banner.add_button(tr("Restart"), self.restart_window, "view-refresh")
+        self.language_banner.add_button(tr("Later"), self.hide_language, "")
 
         # sidebar: search + pages
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search titles and text…")
+        self.search.setPlaceholderText(tr("Search titles and text…"))
         self.search.setClearButtonEnabled(True)
         self.search.addAction(QIcon.fromTheme("edit-find"), QLineEdit.ActionPosition.LeadingPosition)
-        self.search.setToolTip("Filter meetings and transcribed files by title and transcript text (Ctrl+F)")
+        self.search.setToolTip(tr("Filter meetings and transcribed files by title and transcript text (Ctrl+F)"))
         self._search_timer = QTimer(self, singleShot=True, interval=250)
         self._search_timer.timeout.connect(self.apply_search)
         self.search.textChanged.connect(lambda _: self._search_timer.start())
         self.nav = QListWidget()
         self.nav.setIconSize(QSize(22, 22))
         for name in PAGES:
-            item = QListWidgetItem(icon(PAGE_ICONS[name]), PAGE_TITLES[name])
+            item = QListWidgetItem(icon(PAGE_ICONS[name]), tr(PAGE_TITLES[name]))
             item.setSizeHint(QSize(0, 34))
             self.nav.addItem(item)
         self.nav.currentRowChanged.connect(self._page_changed)
@@ -2773,7 +3003,7 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
         for banner, visible in ((self.ctl_banner, bool(CTL_ERROR)), (self.daemon_banner, False),
-                                (self.update_banner, False)):
+                                (self.update_banner, False), (self.language_banner, False)):
             wrap = QWidget()  # the margins around the banner hide with it
             wl = QVBoxLayout(wrap)
             wl.setContentsMargins(8, 6, 8, 0)
@@ -2785,15 +3015,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.statusBar()
 
+        # what starts a file transcription (Ctrl+O here, ⌘O and ⌘3 in a Mac's menus): apply_features
+        self.transcribe_shortcuts: list[QShortcut | QAction] = []
         for keys, slot in ((QKeySequence.StandardKey.Find, self.focus_search),
                            (QKeySequence.StandardKey.Quit, self.close),
                            (QKeySequence.StandardKey.Refresh, self.reload_all),
                            (QKeySequence.StandardKey.Open, self.open_files)):
             if not MAC:   # (on a Mac the menus have them: apply_mac_look)
-                QShortcut(QKeySequence(keys), self, activated=slot)
+                shortcut = QShortcut(QKeySequence(keys), self, activated=slot)
+                if keys == QKeySequence.StandardKey.Open:
+                    self.transcribe_shortcuts.append(shortcut)
 
         if MAC:
             apply_mac_look(self, side)
+        self.apply_features(self.features, force=True)
         self._restore_settings()
         self.reload_all()
         self.poll()
@@ -2808,7 +3043,7 @@ class MainWindow(QMainWindow):
 
     # -- toolbar ---------------------------------------------------------------
     def _build_toolbar(self) -> None:
-        tb = QToolBar("Controls")
+        tb = QToolBar(tr("Controls"))
         tb.setObjectName("controls")
         tb.setMovable(False)
         tb.setFloatable(False)
@@ -2820,13 +3055,14 @@ class MainWindow(QMainWindow):
         w, self.dict_dot, self.dict_label = state_widget()
         fm = self.dict_label.fontMetrics()  # fixed width: the bar must not jump when the state changes
         self.dict_label.setMinimumWidth(max(fm.horizontalAdvance(t) for t in (
-            "Ready to dictate", "Listening…", "Transcribing…", f"{ENGINE_TITLE} is off", "Status unavailable")) + 4)
-        tb.addWidget(w)
-        self.act_dictate = QAction(icon("audio-input-microphone"), "Dictate to clipboard", self)
+            tr("Ready to dictate"), tr("Listening…"), tr("Transcribing…"),
+            tr("{engine} is off", engine=ENGINE_TITLE), tr("Status unavailable"))) + 4)
+        self.act_dict_state = tb.addWidget(w)
+        self.act_dictate = QAction(icon("audio-input-microphone"), tr("Dictate to clipboard"), self)
         self.act_dictate.setCheckable(True)
         self.act_dictate.triggered.connect(self.toggle_dictation)
-        self.act_cancel = QAction(icon("process-stop"), "Cancel", self)
-        self.act_cancel.setToolTip("Discard the current dictation")
+        self.act_cancel = QAction(icon("process-stop"), tr("Cancel"), self)
+        self.act_cancel.setToolTip(tr("Discard the current dictation"))
         self.act_cancel.triggered.connect(self.cancel_dictation)
         self.act_lang = QAction(icon("preferences-desktop-locale"), "EN", self)
         self.act_lang.triggered.connect(self.toggle_language)
@@ -2837,27 +3073,66 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
-        tb.addSeparator()
+        self.act_meet_separator = tb.addSeparator()
 
         w, self.meet_dot, self.meet_label = state_widget()
-        self.meet_label.setMinimumWidth(self.meet_label.fontMetrics().horizontalAdvance("Saving transcript…  "))
-        tb.addWidget(w)
-        self.act_meet_start = QAction(icon("media-record"), "Start meeting", self)
-        self.act_meet_start.setToolTip("Record the microphone + system audio and transcribe it as people "
-                                       "talk; select the meeting to follow along (also Meta+Alt+M)")
+        self.meet_label.setMinimumWidth(self.meet_label.fontMetrics().horizontalAdvance(
+            tr("Saving transcript…") + "  "))
+        self.act_meet_state = tb.addWidget(w)
+        self.act_meet_start = QAction(icon("media-record"), tr("Start meeting"), self)
+        self.act_meet_start.setToolTip(tr("Record the microphone + system audio and transcribe it as people "
+                                          "talk; select the meeting to follow along (also Meta+Alt+M)"))
         self.act_meet_start.triggered.connect(lambda: self.start_meeting())
-        self.act_meet_room = QAction(icon("group"), "In person", self)
-        self.act_meet_room.setToolTip("Start an in-person meeting: record only the microphone and tell "
-                                      "the voices in the room apart (also Meta+Alt+Shift+M)")
+        self.act_meet_room = QAction(icon("group"), tr("In person"), self)
+        self.act_meet_room.setToolTip(tr("Start an in-person meeting: record only the microphone and tell "
+                                         "the voices in the room apart (also Meta+Alt+Shift+M)"))
         self.act_meet_room.triggered.connect(lambda: self.start_meeting(in_person=True))
-        self.act_meet_pause = QAction(icon("media-playback-pause"), "Pause", self)
+        self.act_meet_pause = QAction(icon("media-playback-pause"), tr("Pause"), self)
         self.act_meet_pause.triggered.connect(self.pause_meeting)
-        self.act_meet_stop = QAction(icon("media-playback-stop"), "Stop", self)
-        self.act_meet_stop.setToolTip("Stop the meeting: the last chunk is transcribed and a Markdown "
-                                      f"copy is saved to {tilde(MEETING_MD_DIR)}")
+        self.act_meet_stop = QAction(icon("media-playback-stop"), tr("Stop"), self)
+        self.act_meet_stop.setToolTip(tr("Stop the meeting: the last chunk is transcribed and a Markdown "
+                                         "copy is saved to {folder}", folder=tilde(MEETING_MD_DIR)))
         self.act_meet_stop.triggered.connect(self.stop_meeting)
         for act in (self.act_meet_start, self.act_meet_room, self.act_meet_pause, self.act_meet_stop):
             tb.addAction(act)
+
+    # -- features (~/.config/bmeet: dictation, meetings, in-person-meetings, file-transcription) --------
+    def apply_features(self, features: dict[str, bool], force: bool = False) -> None:
+        """A feature that is off disappears: its controls, menu items and shortcuts. What it
+        made stays: the Meetings and Transcribed files pages keep listing it. Called on every
+        poll (bmeet-ctl status), so a change shows while the window is open."""
+        features = {name: bool(features.get(name, True)) for name in FEATURES}
+        if features == self.features and not force:
+            return
+        changed = {name for name in FEATURES if features[name] != self.features.get(name)}
+        self.features = features
+        dictation = features["dictation"]
+        for act in (self.act_dict_state, self.act_dictate, self.act_lang):
+            act.setVisible(dictation)
+        self.act_cancel.setVisible(dictation and self.act_cancel.isVisible())   # (apply_status: while dictating)
+        self.act_meet_start.setVisible(features["meetings"])
+        self.act_meet_room.setVisible(features["in_person_meetings"])
+        self.show_meeting_controls()
+        transcribe = features["file_transcription"]
+        self.nav.item(PAGES.index("transcribe")).setHidden(not transcribe)
+        for shortcut in self.transcribe_shortcuts:
+            (shortcut.setEnabled if isinstance(shortcut, QShortcut) else shortcut.setVisible)(transcribe)
+        self.files_page.act_again.setVisible(transcribe)
+        if not transcribe and self.page() == "transcribe" and self.nav.currentRow() >= 0:
+            self.set_page("files")   # (a transcription that runs goes on; its result is listed there)
+        if changed & {"meetings", "in_person_meetings"} and self.meetings_page.current_key() is None:
+            self.meetings_page.show_current()   # (the empty list names what starts a meeting)
+        if changed & {"file_transcription"}:
+            self.files_page.show_current()
+
+    def show_meeting_controls(self) -> None:
+        """The meeting's state, Pause and Stop: while a kind of meeting is on, or one is running
+        (stopping it always works)."""
+        running = (self.status or {}).get("meeting") in ("recording", "paused") \
+            or pid_alive(self._stop_pid) or bool(self._meeting_pending)
+        shown = self.features["meetings"] or self.features["in_person_meetings"] or running
+        for act in (self.act_meet_separator, self.act_meet_state, self.act_meet_pause, self.act_meet_stop):
+            act.setVisible(shown)
 
     def createPopupMenu(self):  # the control bar cannot be hidden
         return None
@@ -2878,13 +3153,17 @@ class MainWindow(QMainWindow):
         self.status = st
         if st is None:
             self.dict_dot.set_color(COLORS["gray"])
-            self.dict_label.setText("Status unavailable")
+            self.dict_label.setText(tr("Status unavailable"))
             self.dict_label.setToolTip(error or "")
             for act in (self.act_dictate, self.act_cancel, self.act_lang, self.act_meet_start,
                         self.act_meet_room, self.act_meet_pause, self.act_meet_stop):
                 act.setEnabled(False)
             self.meet_label.setText("")
             return
+        if isinstance(st.get("features"), dict):
+            self.apply_features(st["features"])
+        self.transcribe_page.set_choices(st.get("languages") or configured_languages())
+        self.show_language(st.get("interface_language"))
         daemon_on = st.get("daemon") == "active"
         dictation = st.get("dictation") or "off"
         if dictation == "streaming":
@@ -2894,32 +3173,34 @@ class MainWindow(QMainWindow):
 
         # dictation
         if not daemon_on:
-            color, text = COLORS["gray"], f"{ENGINE_TITLE} is off"
+            color, text = COLORS["gray"], tr("{engine} is off", engine=ENGINE_TITLE)
         elif dictation == "recording":
-            color, text = COLORS["red"], "Listening…"
+            color, text = COLORS["red"], tr("Listening…")
         elif dictation == "transcribing":
-            color, text = COLORS["orange"], "Transcribing…"
+            color, text = COLORS["orange"], tr("Transcribing…")
         else:
-            color, text = COLORS["green"], "Ready to dictate"
+            color, text = COLORS["green"], tr("Ready to dictate")
         self.dict_dot.set_color(color)
         self.dict_label.setText(text)
-        self.dict_label.setToolTip(f"Dictation: {dictation} · model {st.get('model') or '?'} "
-                                   f"on {st.get('device') or '?'}")
+        self.dict_label.setToolTip(tr("Dictation: {state} · model {model} on {device}",
+                                      state=tr(DICTATION_STATES[dictation]) if dictation in DICTATION_STATES
+                                      else dictation, model=st.get("model") or "?", device=st.get("device") or "?"))
         if self._dictating_here and self._last_dictation == "transcribing" and dictation == "idle":
-            self.message("Dictated text copied to the clipboard: paste it with Ctrl+V")
+            self.message(tr("Dictated text copied to the clipboard: paste it with Ctrl+V"))
             self._dictating_here = False
         self._last_dictation = dictation
         recording = dictation == "recording"
         self.act_dictate.setEnabled(daemon_on and dictation in ("idle", "recording"))
         self.act_dictate.setChecked(recording)
-        self.act_dictate.setText("Stop dictation" if recording else "Dictate to clipboard")
+        self.act_dictate.setText(tr("Stop dictation") if recording else tr("Dictate to clipboard"))
         self.act_dictate.setIcon(icon("media-playback-stop" if recording else "audio-input-microphone"))
-        self.act_dictate.setToolTip(mac_words(
-            "Stop listening; the text is transcribed and copied to the clipboard" if recording else
-            "Listen until you click again, then copy the text to the clipboard (paste with Ctrl+V).\n"
-            "To type straight into another app at its cursor, press Meta+H in that app "
-            "(Meta+Alt+H dictates to the clipboard from anywhere)."))
-        self.act_cancel.setVisible(daemon_on and dictation in ("recording", "transcribing"))
+        self.act_dictate.setToolTip(
+            tr("Stop listening; the text is transcribed and copied to the clipboard") if recording else
+            tr("Listen until you click again, then copy the text to the clipboard (paste with Ctrl+V).\n"
+               "To type straight into another app at its cursor, press Meta+H in that app "
+               "(Meta+Alt+H dictates to the clipboard from anywhere)."))
+        self.act_cancel.setVisible(self.features["dictation"] and daemon_on
+                                   and dictation in ("recording", "transcribing"))
         self.act_cancel.setEnabled(True)
 
         # meeting
@@ -2931,7 +3212,7 @@ class MainWindow(QMainWindow):
             self._stop_pid = None
             self.meetings_page.reload()
             self.meetings_page.select_newest()
-            self.message("Meeting saved")
+            self.message(tr("Meeting saved"))
         if self._meeting_pending and (meeting != "idle" or now > self._meeting_pending[1]):
             self._meeting_pending = None
         if meeting == "idle":
@@ -2949,15 +3230,15 @@ class MainWindow(QMainWindow):
             started = st.get("meeting_started") or self._meeting_seen
             elapsed = max(0.0, (self._pause_began or now) - started - self._paused_total)
         if stopping:
-            color, text = COLORS["blue"], "Saving transcript…"
+            color, text = COLORS["blue"], tr("Saving transcript…")
         elif self._meeting_pending:
-            color, text = COLORS["gray"], "Starting…"
+            color, text = COLORS["gray"], tr("Starting…")
         elif meeting == "recording":
-            color, text = COLORS["red"], f"Meeting {fmt_duration(elapsed)}"
+            color, text = COLORS["red"], tr("Meeting {time}", time=fmt_duration(elapsed))
         elif meeting == "paused":
-            color, text = COLORS["orange"], f"Paused {fmt_duration(elapsed)}"
+            color, text = COLORS["orange"], tr("Paused {time}", time=fmt_duration(elapsed))
         else:
-            color, text = COLORS["gray"], "No meeting"
+            color, text = COLORS["gray"], tr("No meeting")
         self.meet_dot.set_color(color)
         self.meet_label.setText(text)
         self.meet_label.setToolTip(st.get("meeting_title") or "")
@@ -2965,11 +3246,12 @@ class MainWindow(QMainWindow):
         self.act_meet_start.setEnabled(daemon_on and meeting == "idle" and not busy)
         self.act_meet_room.setEnabled(self.act_meet_start.isEnabled())
         self.act_meet_pause.setEnabled(daemon_on and meeting != "idle" and not busy)
-        self.act_meet_pause.setText("Resume" if meeting == "paused" else "Pause")
+        self.act_meet_pause.setText(tr("Resume") if meeting == "paused" else tr("Pause"))
         self.act_meet_pause.setIcon(icon("media-playback-start" if meeting == "paused" else "media-playback-pause"))
-        self.act_meet_pause.setToolTip("Continue recording" if meeting == "paused"
-                                       else "Pause recording (nothing is recorded until you resume)")
+        self.act_meet_pause.setToolTip(tr("Continue recording") if meeting == "paused"
+                                       else tr("Pause recording (nothing is recorded until you resume)"))
         self.act_meet_stop.setEnabled(daemon_on and meeting != "idle" and not busy)
+        self.show_meeting_controls()
         self.meetings_page.set_live(st.get("meeting_id"), meeting, elapsed, st.get("meeting_live"))
         pending = set(st.get("speakers_pending") or [])
         if pending != self.meetings_page.speakers_pending:
@@ -2977,7 +3259,7 @@ class MainWindow(QMainWindow):
             self.meetings_page.set_speakers_pending(pending)
             if finished:  # its Markdown copy was replaced: show the new one
                 self.meetings_page.reload()
-                self.message("Speakers told apart: the meeting transcript was updated")
+                self.message(tr("Speakers told apart: the meeting transcript was updated"))
 
         # language
         lang = (st.get("language") or "en").lower()
@@ -2986,17 +3268,24 @@ class MainWindow(QMainWindow):
         other = st.get("next_language") or ""
         self.act_lang.setText("…" if self._lang_pending else lang.upper())
         if meeting != "idle":
-            why = "Stop the meeting to switch the language"
+            why = tr("Stop the meeting to switch the language")
         elif dictation in ("recording", "transcribing"):
-            why = "Wait for the dictation to finish to switch the language"
+            why = tr("Wait for the dictation to finish to switch the language")
         elif not other:
-            why = (f"Dictation language: {language_name(lang)}. To switch here, list more languages "
-                   "in ~/.config/bmeet/languages (e.g. \"en de\").")
+            why = tr("Dictation language: {language}. To switch here, turn on more dictation languages "
+                     "in BMeet's settings.", language=language_name(lang, True)) if MAC else \
+                tr("Dictation language: {language}. To switch here, list more languages "
+                   "in ~/.config/bmeet/languages (e.g. \"en de\").", language=language_name(lang, True))
         else:
             why = ""
         self.act_lang.setEnabled(not why and not self._lang_pending)
-        self.act_lang.setToolTip(why or f"Dictation language: {language_name(lang)}. Click to switch to "
-                                 f"{language_name(other)} (" + ("from the next dictation; also ⌃⌥⇧H" if MAC else "restarts voxtype, ~3 s; also Meta+Shift+H") + ").")
+        # (texts.tr: each text is already the one of its platform)
+        names = {"language": language_name(lang, True), "other": language_name(other, True)}
+        self.act_lang.setToolTip(why or (
+            texts.tr("Dictation language: {language}. Click to switch to {other} (from the next dictation; "
+                     "also ⌃⌥⇧H).", **names) if MAC else
+            texts.tr("Dictation language: {language}. Click to switch to {other} (restarts voxtype, ~3 s; also "
+                     "Meta+Shift+H).", **names)))
 
     @staticmethod
     def _set_banner(banner: Banner, visible: bool) -> None:
@@ -3013,10 +3302,12 @@ class MainWindow(QMainWindow):
         installed, upd = st.get("version"), st.get("update")
         if installed and installed != __version__:   # updated while this window ran: it is the old one
             key = ("restart", installed)
-            text = f"BMeet {installed} is installed. Restart this window to use it (it is still {__version__})."
+            text = tr("BMeet {version} is installed. Restart this window to use it (it is still {running}).",
+                      version=installed, running=__version__)
         elif isinstance(upd, dict) and upd.get("version"):
             key = ("update", upd["version"])
-            text = f"BMeet {upd['version']} is available (you have {upd.get('installed') or __version__})."
+            text = tr("BMeet {version} is available (you have {installed}).", version=upd["version"],
+                      installed=upd.get("installed") or __version__)
         else:
             key, text = None, ""
         if key != self._update_key:
@@ -3025,8 +3316,8 @@ class MainWindow(QMainWindow):
             self.update_banner.text.setText(text)
             self.update_news_btn.setVisible(bool(self._update_url))
             self.update_btn.setVisible(bool(key) and key[0] == "update")
-            self.update_btn.setToolTip("Opens a terminal window that installs it: the installer of the new "
-                                       "release, with the options BMeet was installed with (bmeet-ctl update)")
+            self.update_btn.setToolTip(tr("Opens a terminal window that installs it: the installer of the new "
+                                          "release, with the options BMeet was installed with (bmeet-ctl update)"))
             self.restart_btn.setVisible(bool(key) and key[0] == "restart")
         self._set_banner(self.update_banner, key is not None and key != self._update_hidden)
 
@@ -3036,16 +3327,36 @@ class MainWindow(QMainWindow):
 
     def start_update(self) -> None:
         run_detached([sys.executable, "-I", str(CTL_PATH), "update", "--terminal"])
-        self.message("The update runs in a terminal window")
+        self.message(tr("The update runs in a terminal window"))
 
     def hide_update(self) -> None:
         self._update_hidden = self._update_key
         self._set_banner(self.update_banner, False)
 
+    # -- interface language --------------------------------------------------------
+    def show_language(self, language: str | None) -> None:
+        """Another interface language than this window's (bmeet-ctl status: the effective one):
+        the window says it speaks it from its next start, with Restart. (Its texts are set
+        where each widget is made, so they are not redone in place.)"""
+        other = language if language in LANGUAGE_CHANGED and language != self.ui_language else None
+        if other and other != self._language_shown:
+            self.language_banner.text.setText(tr(LANGUAGE_CHANGED[other]))
+        self._language_shown = other
+        self._set_banner(self.language_banner, bool(other) and other != self._language_hidden)
+
+    def hide_language(self) -> None:
+        self._language_hidden = self._language_shown
+        self._set_banner(self.language_banner, False)
+
     def restart_window(self) -> None:
         self._restart = True
         if not self.close():   # (a transcription is running and you kept it)
             self._restart = False
+
+    def open_settings(self, page: str | None = None) -> None:
+        """BMeet's Settings window on a page (BMeet.app's, through bmeet-ctl settings), or the
+        settings folder where BMeet.app does not answer."""
+        run_detached([sys.executable, "-I", str(CTL_PATH), "settings", *([page] if page else [])])
 
     def check_data(self) -> None:
         """Reload a list when its source changed (cheap stat calls, every poll)."""
@@ -3074,16 +3385,16 @@ class MainWindow(QMainWindow):
         self.act_dictate.setChecked(recording)  # the daemon's state decides, not the click
         self._dictating_here = True
         if MAC:   # (BMeet.app dictates; from the window the text goes to the clipboard, as on Linux)
-            self._side_effect([sys.executable, "-I", str(CTL_PATH), "dictate", "--clipboard"], "Dictation")
+            self._side_effect([sys.executable, "-I", str(CTL_PATH), "dictate", "--clipboard"], tr("Dictation"))
             return
-        self._side_effect([VOXTYPE, "record", "toggle", "--clipboard"], "Dictation")
+        self._side_effect([VOXTYPE, "record", "toggle", "--clipboard"], tr("Dictation"))
 
     def cancel_dictation(self) -> None:
         self._dictating_here = False
         if MAC:
-            self._side_effect([sys.executable, "-I", str(CTL_PATH), "cancel"], "Cancel")
+            self._side_effect([sys.executable, "-I", str(CTL_PATH), "cancel"], tr("Cancel"))
             return
-        self._side_effect([VOXTYPE, "record", "cancel"], "Cancel")
+        self._side_effect([VOXTYPE, "record", "cancel"], tr("Cancel"))
 
     def toggle_language(self) -> None:
         lang = ((self.status or {}).get("language") or "en").lower()
@@ -3111,7 +3422,7 @@ class MainWindow(QMainWindow):
     def pause_meeting(self) -> None:
         action = "resume" if (self.status or {}).get("meeting") == "paused" else "pause"
         cmd = [sys.executable, "-I", str(CTL_PATH), "meeting"] if MAC else [VOXTYPE, "meeting"]
-        self._side_effect(cmd + [action], action.capitalize())
+        self._side_effect(cmd + [action], tr("Resume") if action == "resume" else tr("Pause"))
 
     def start_daemon(self) -> None:
         if MAC:   # BMeet.app (the menu bar app) dictates and records
@@ -3119,18 +3430,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2000, self.poll)
             return
         self.start_daemon_btn.setEnabled(False)
-        self.daemon_banner.text.setText("Starting voxtype…")
+        self.daemon_banner.text.setText(tr("Starting voxtype…"))
 
         def done(code: int, _out: str, err: str) -> None:
             self.start_daemon_btn.setEnabled(True)
             if code == 0:
                 self.daemon_banner.set_kind("warning")
-                self.daemon_banner.text.setText("Voxtype is not running: dictation and meeting "
-                                                "recording are unavailable.")
+                self.daemon_banner.text.setText(tr("{engine} is not running: dictation and meeting recording are "
+                                                   "unavailable.", engine=ENGINE_TITLE))
             else:
                 self.daemon_banner.set_kind("error")
-                self.daemon_banner.text.setText("Could not start voxtype: " + (err.strip() or f"status {code}")
-                                                + "\nDetails: journalctl --user -u voxtype")
+                self.daemon_banner.text.setText(tr("Could not start voxtype: {error}",
+                                                   error=err.strip() or tr("status {code}", code=code))
+                                                + "\n" + tr("Details: journalctl --user -u voxtype"))
             self.poll()
         if DRY_RUN:
             debug("run (dry run)", "systemctl --user start voxtype")
@@ -3146,12 +3458,15 @@ class MainWindow(QMainWindow):
 
         def done(code: int, _out: str, err: str) -> None:
             if code != 0:
-                self.message(f"{what} failed: {err.strip() or f'status {code}'}")
+                self.message(tr("{what} failed: {error}", what=what,
+                                error=err.strip() or tr("status {code}", code=code)))
             self.poll()
         run_command(self, cmd, done, timeout_ms=15_000)
 
     # -- pages, search -------------------------------------------------------------
     def set_page(self, name: str) -> None:
+        if name == "transcribe" and not self.features["file_transcription"]:
+            name = "files"   # (turned off: its history instead)
         if name in PAGES:
             self.nav.setCurrentRow(PAGES.index(name))
 
@@ -3162,7 +3477,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         self.stack.setCurrentIndex(row)
-        self.setWindowTitle(PAGE_TITLES[PAGES[row]])
+        self.setWindowTitle(tr(PAGE_TITLES[PAGES[row]]))
         self.settings.setValue("page", PAGES[row])
 
     def focus_search(self) -> None:
@@ -3170,6 +3485,8 @@ class MainWindow(QMainWindow):
         self.search.selectAll()
 
     def open_files(self) -> None:
+        if not self.features["file_transcription"]:
+            return
         self.set_page("transcribe")
         self.transcribe_page.browse()
 
@@ -3182,11 +3499,11 @@ class MainWindow(QMainWindow):
     def update_counts(self) -> None:
         for row, page in ((0, self.meetings_page), (1, self.files_page)):
             shown, total = page.counts()
-            base = PAGE_TITLES[PAGES[row]]
+            base = tr(PAGE_TITLES[PAGES[row]])
             self.nav.item(row).setText(base if not total else
                                        f"{base} ({shown}/{total})" if shown != total else f"{base} ({total})")
         pending = self.transcribe_page.pending()
-        self.nav.item(2).setText(PAGE_TITLES["transcribe"] + (f" ({pending})" if pending else ""))
+        self.nav.item(2).setText(tr(PAGE_TITLES["transcribe"]) + (f" ({pending})" if pending else ""))
 
     def message(self, text: str, ms: int = 8000) -> None:
         text = mac_words(text)
@@ -3195,22 +3512,24 @@ class MainWindow(QMainWindow):
 
     def error_box(self, title: str, text: str) -> None:
         debug("error:", title, "-", text)
-        QMessageBox.warning(self, title, text)
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Ok, self)
+        standard_texts(box)
+        box.exec()
 
     # -- transcription results ---------------------------------------------------------
     def _job_finished(self, job: Job) -> None:
         self.files_page.reload()
         self.update_counts()
         if job.state == "done":
-            self.message(f"Transcribed {job.name}")
+            self.message(tr("Transcribed {name}", name=job.name))
             if not self.transcribe_page.pending():
                 self.show_job_result(job)
             if not self.isActiveWindow():
-                notify("Transcription finished", job.name)
+                notify(tr("Transcription finished"), job.name)
         elif job.state == "failed":
-            self.message(f"Transcription of {job.name} failed: {job.error}")
+            self.message(tr("Transcription of {name} failed: {error}", name=job.name, error=job.error))
             if not self.isActiveWindow():
-                notify("Transcription failed", f"{job.name}: {job.error}", "dialog-error")
+                notify(tr("Transcription failed"), f"{job.name}: {job.error}", "dialog-error")
 
     def show_job_result(self, job: Job) -> None:
         key = self.files_page.find_for_job(job)
@@ -3243,15 +3562,19 @@ class MainWindow(QMainWindow):
             elif is_media(f):
                 queue.append(f)
             else:
-                self.message(f"Not a recording or a transcript from the lists: {f}")
-        if queue:
+                self.message(tr("Not a recording or a transcript from the lists: {path}", path=f))
+        if queue and not self.features["file_transcription"]:
+            self.message(tr("File transcription is turned off: not added {names}",
+                            names=", ".join(os.path.basename(f) for f in queue)))
+            target = "files" if target in (None, "transcribe") else target
+        elif queue:
             self.transcribe_page.add_files(queue)
             target = "transcribe"
         if mid:
             if self.meetings_page.select_key(mid):
                 target = target or "meetings"
             else:
-                self.message(f"Meeting {mid} not found")
+                self.message(tr("Meeting {id} not found", id=mid))
                 target = target or "meetings"
         if target:
             self.set_page(target)
@@ -3289,8 +3612,9 @@ class MainWindow(QMainWindow):
         for key, tree in (("header/meetings", self.meetings_page.tree), ("header/files", self.files_page.tree)):
             if s.value(key) is not None:
                 tree.header().restoreState(s.value(key))
-        self.transcribe_page.set_options(s.value("transcribe/model", "turbo"),
-                                         s.value("transcribe/language", "auto"),
+        # (before the engine choice, the page saved a Whisper size: turbo was Automatic, which it passed on)
+        engine = s.value("transcribe/engine") or {"small": "small"}.get(s.value("transcribe/model"), "auto")
+        self.transcribe_page.set_options(engine, s.value("transcribe/language", "auto"),
                                          s.value("transcribe/translate", False, type=bool))
         self.transcribe_page.log_toggle.setChecked(s.value("transcribe/log", False, type=bool))
         self.nav.blockSignals(True)
@@ -3310,15 +3634,10 @@ class MainWindow(QMainWindow):
         s.sync()
 
     def closeEvent(self, event) -> None:
-        if not self.force_quit and self.transcribe_page.pending():
-            answer = QMessageBox.question(
-                self, "Transcription running",
-                "A transcription is still running. Quit and cancel it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
+        if not self.force_quit and self.transcribe_page.pending() and not ask(
+                self, tr("Transcription running"), tr("A transcription is still running. Quit and cancel it?")):
+            event.ignore()
+            return
         self.shutdown()
         event.accept()
 
@@ -3548,8 +3867,9 @@ def apply_mac_look(w: "MainWindow", side: QWidget) -> None:
             act.setToolTip(mac_words(act.toolTip()))
 
     bar = w.menuBar()
-    def menu(title: str, items) -> None:
+    def menu(title: str, items) -> list[QAction]:
         m = bar.addMenu(title)
+        made = []
         for item in items:
             if item is None:
                 m.addSeparator()
@@ -3562,38 +3882,48 @@ def apply_mac_look(w: "MainWindow", side: QWidget) -> None:
             if role:
                 a.setMenuRole(role[0])
             m.addAction(a)
+            made.append(a)
+        return made
     pages = {name: (lambda _=False, n=name: w.set_page(n)) for name in PAGES}
-    menu("File", [("Transcribe Files…", "Ctrl+O", w.open_files), None,
-                  ("Close Window", "Ctrl+W", w.close),
-                  ("About BMeet", "", lambda: about_mac(w), QAction.MenuRole.AboutRole),
-                  ("Settings…", "Ctrl+,", lambda: open_path(str(CONFIG_DIR)), QAction.MenuRole.PreferencesRole),
-                  ("Quit BMeet Window", "Ctrl+Q", w.close, QAction.MenuRole.QuitRole)])
-    menu("Edit", [("Find", "Ctrl+F", w.focus_search)])
-    menu("View", [("Meetings", "Ctrl+1", pages["meetings"]), ("Transcribed Files", "Ctrl+2", pages["files"]),
-                  ("Transcribe a File", "Ctrl+3", pages["transcribe"]), None,
-                  ("Reload", "Ctrl+R", w.reload_all)])
-    controls = bar.addMenu("Controls")
+    # Settings and About are BMeet.app's window (bmeet-ctl settings; without BMeet.app: the folder)
+    file_menu = menu(tr("File"), [
+        (tr("Transcribe Files…"), "Ctrl+O", w.open_files), None,
+        (tr("Close Window"), "Ctrl+W", w.close),
+        (tr("About BMeet"), "", lambda: w.open_settings("about"), QAction.MenuRole.AboutRole),
+        (tr("Settings…"), "Ctrl+,", lambda: w.open_settings(), QAction.MenuRole.PreferencesRole),
+        (tr("Quit BMeet Window"), "Ctrl+Q", w.close, QAction.MenuRole.QuitRole)])
+    menu(tr("Edit"), [(tr("Find"), "Ctrl+F", w.focus_search)])
+    view_menu = menu(tr("View"), [
+        (tr("Meetings"), "Ctrl+1", pages["meetings"]), (tr("Transcribed Files"), "Ctrl+2", pages["files"]),
+        (tr("Transcribe a File"), "Ctrl+3", pages["transcribe"]), None,
+        (tr("Reload"), "Ctrl+R", w.reload_all)])
+    w.transcribe_shortcuts += [file_menu[0], view_menu[2]]   # (gone while file transcription is off)
+    w.mac_menus = {"about": file_menu[2], "settings": file_menu[3]}
+    controls = bar.addMenu(tr("Controls"))
     for act in (w.act_dictate, w.act_cancel, None, w.act_meet_start, w.act_meet_room, w.act_meet_pause,
                 w.act_meet_stop):
         if act is None:
             controls.addSeparator()
         else:
             controls.addAction(act)
-    menu("Window", [("Minimize", "Ctrl+M", w.showMinimized), ("Zoom", "", lambda: w.showNormal()
-                                                                 if w.isMaximized() else w.showMaximized())])
-    menu("Help", [("BMeet on a Mac", "", lambda: open_url(QUrl(
+    menu(tr("Window"), [(tr("Minimize"), "Ctrl+M", w.showMinimized),
+                        (tr("Zoom"), "", lambda: w.showNormal() if w.isMaximized() else w.showMaximized())])
+    menu(tr("Help"), [(tr("BMeet on a Mac"), "", lambda: open_url(QUrl(
         "https://github.com/baakhoff/bmeet/blob/main/docs/macos.md"))),
-                  ("BMeet on GitHub", "", lambda: open_url(QUrl("https://github.com/baakhoff/bmeet")))])
+                      (tr("BMeet on GitHub"), "", lambda: open_url(QUrl("https://github.com/baakhoff/bmeet")))])
 
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "bmeet"
-
-
-def about_mac(parent: QWidget) -> None:
-    QMessageBox.about(parent, "About BMeet", f"<h3>BMeet {__version__}</h3>"
-                      "<p>Dictation, meeting transcripts and file transcription, on this Mac's "
-                      "Neural Engine. Nothing is uploaded.</p>"
-                      "<p><a href='https://github.com/baakhoff/bmeet'>github.com/baakhoff/bmeet</a> · MIT</p>")
+def install_qt_translations(app: QApplication, language: str) -> None:
+    """Qt's own texts (its dialogs' buttons, a Mac's application menu) in the interface language,
+    from Qt's translations where they are installed (on Linux a package of their own)."""
+    from PyQt6.QtCore import QLibraryInfo, QTranslator
+    if language == "en":
+        return
+    translator = QTranslator(app)
+    if translator.load(f"qtbase_{language}", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+        app.installTranslator(translator)
+    else:
+        debug(f"no Qt translations for {language}")
 
 
 def main(argv: list[str]) -> int:
@@ -3617,6 +3947,7 @@ def main(argv: list[str]) -> int:
     app.setWindowIcon(QIcon.fromTheme("audio-input-microphone"))
     if MAC:
         setup_mac(app)
+    install_qt_translations(app, texts.use(texts.interface_language()))
 
     instance = SingleInstance(socket_path())
     if instance.forward(request):

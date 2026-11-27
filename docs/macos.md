@@ -93,8 +93,11 @@ While you dictate, a small panel at the bottom of the screen shows the words as 
   - Its icons are SF Symbols, drawn on your Mac by the installer (`macos/tools/make-symbols.swift`), in light and dark versions.
   - A Finder-style sidebar, Apple's system colors for the states.
   - Transcripts in macOS's type: small gray section labels, the speakers in accent blue, the times in gray.
-  - The menus a Mac app has: *View* → Meetings ⌘1, Transcribed Files ⌘2, Transcribe a File ⌘3; ⌘F to search, ⌘O to transcribe files, ⌘, for the settings folder; *Controls* for dictation and meetings.
+  - The menus a Mac app has: *View* → Meetings ⌘1, Transcribed Files ⌘2, Transcribe a File ⌘3; ⌘F to search, ⌘O to transcribe files; *Controls* for dictation and meetings. *Settings…* (⌘,) and *About BMeet* open BMeet's Settings window (`bmeet-ctl settings`, `bmeet-ctl settings about`); a BMeet.app that does not answer gets the settings folder instead.
   - Its texts name ⌃⌥ and Finder where Linux's name Meta and Dolphin.
+  - It speaks BMeet's interface language, English or Russian, and so do the meeting notifications; after a change, the open window offers **Restart**.
+  - A feature turned off in the settings (dictation, online or in-person meetings, file transcription) leaves the window while it is open, with its menu items and shortcuts (⌘3, ⌘O). The Meetings and Transcribed Files pages keep listing what was made.
+  - *Transcribe a File* offers the engine: *Automatic* (GigaAM v3 for Russian), *GigaAM v3*, *Whisper turbo*, *Whisper small* ([npu-transcribe.md](npu-transcribe.md)).
 - **The menu bar:** each item has an SF Symbol, and the shortcuts show the Mac way, from the same `hotkeys` file. The first line shows the state with a colored dot.
 - **The dictation panel:** a red dot pulses while BMeet listens, next to the language.
 - **The Settings window:** a toolbar with five pages, as in Apple's own apps (below).
@@ -105,7 +108,7 @@ While you dictate, a small panel at the bottom of the screen shows the words as 
 
 ![The Settings window: Features](macos-settings.png)
 
-**Settings… ⌘,** in BMeet's menu opens BMeet's Settings window; *About BMeet* opens it on the About page. Each control saves at once, into its file in `~/.config/bmeet` (the same files as on Linux, one value per file, a missing file meaning the default), and BMeet follows it at once: a shortcut is registered again, a menu item comes or goes, without a restart. BMeet also follows changes made to those files by hand, within two seconds. The BMeet window and `bmeet-ctl` read the same files.
+**Settings… ⌘,** in BMeet's menu opens BMeet's Settings window; *About BMeet* opens it on the About page, and `bmeet-ctl settings [general|features|languages|shortcuts|about]` on the page it names. Each control saves at once, into its file in `~/.config/bmeet` (the same files as on Linux, one value per file, a missing file meaning the default), and BMeet follows it at once: a shortcut is registered again, a menu item comes or goes, without a restart. BMeet also follows changes made to those files by hand, within two seconds. The BMeet window and `bmeet-ctl` read the same files.
 
 | Page | What is on it |
 |---|---|

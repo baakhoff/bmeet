@@ -250,21 +250,29 @@ def _refcount(address: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def _refcounts_readable() -> bool:
-    """Is the reference count where _refcount() reads it (CPython with the GIL: ob_refcnt first)?"""
+    """Is the reference count where _refcount() reads it (CPython with the GIL: ob_refcnt first)?
+    One more reference must show as one more there (whatever sys.getrefcount counts itself)."""
     probe = object()
-    keep = [probe]   # noqa: F841  (a second reference, so the count is not a constant)
-    return _refcount(id(probe)) == sys.getrefcount(probe) - 1
+    before = _refcount(id(probe))
+    keep = [probe]   # noqa: F841  (a second reference)
+    return _refcount(id(probe)) == before + 1
+
+
+# What coreml_predict() hands Core ML for each numpy dtype: int64 as int32 (Core ML takes no
+# int64), and float16 as float32 here, because coremltools would otherwise replace a float16
+# array in the dict by a float32 copy of its own (MLModel._update_float16_multiarray_input_to_float32),
+# which Core ML would then hold without _HELD knowing of it.
+_FED_AS = {"int64": "int32", "float16": "float32"}
 
 
 def coreml_predict(model, inputs: dict) -> dict:
     """model.predict(inputs) for a coremltools model, with inputs that Core ML may let go of on
-    any thread (see above). int64 arrays are given as int32 (Core ML takes no int64)."""
+    any thread (see above). int64 arrays are given as int32 and float16 as float32 (_FED_AS)."""
     import numpy as np
     feed = {}
     for name, value in inputs.items():
         given = np.asarray(value)
-        feed[name] = np.array(given, dtype=np.int32 if given.dtype == np.int64 else given.dtype,
-                              order="C", copy=True)
+        feed[name] = np.array(given, dtype=_FED_AS.get(given.dtype.name, given.dtype), order="C", copy=True)
     entry = [feed, tuple(id(a) for a in feed.values()), False]
     with _HELD_LOCK:
         _drop_released()

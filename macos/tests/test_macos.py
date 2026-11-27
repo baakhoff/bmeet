@@ -989,6 +989,41 @@ class WhisperServer(unittest.TestCase):
         self.assertIn("no model loaded or used for 1 s: exiting", self.logged())
 
 
+@unittest.skipUnless(importlib.util.find_spec("coremltools") and importlib.util.find_spec("numpy"),
+                     "coremltools and numpy (the Mac venv's)")
+class CoreMLPredict(unittest.TestCase):
+    """bmeetmac.coreml_predict through coremltools' own predict() code, with a stand-in for Core ML
+    that keeps the arrays it was given, as Core ML keeps a prediction's inputs (no model needed)."""
+
+    def test_core_ml_holds_only_inputs_that_are_watched(self) -> None:
+        # coremltools replaces a float16 array in the dict by a float32 copy of its own: had that
+        # copy reached Core ML, nothing would have watched it, and Core ML's release on its own
+        # thread could have been its last reference (the crash of 2026-11-27)
+        import types
+        import numpy as np
+        from coremltools.models._compiled_model import CompiledMLModel
+        mac = load(MACOS / "bmeetmac.py", "bmeetmac_coreml_test")
+
+        class CoreML:   # (the proxy coremltools hands the inputs to)
+            held: list = []
+
+            def predict(self, data, state=None):
+                CoreML.held = list(data.values())
+                return {}
+        model = types.SimpleNamespace(_proxy=CoreML())
+        model.predict = lambda feed: CompiledMLModel.predict(model, feed)
+        given = {"x": np.ones((2, 3), np.float16), "n": np.array([3], np.int64),
+                 "y": np.arange(8, dtype=np.float32)[::2]}
+        mac.coreml_predict(model, given)
+        self.assertEqual([a.dtype.name for a in CoreML.held], ["float32", "int32", "float32"])
+        self.assertTrue(all(a.flags.c_contiguous for a in CoreML.held))
+        self.assertFalse(any(np.shares_memory(a, b) for a in CoreML.held for b in given.values()))   # (copies)
+        self.assertEqual(sorted(id(a) for a in CoreML.held), sorted(mac._HELD[-1][1]))
+        self.assertEqual(mac.release_coreml_inputs(), 1)   # (Core ML still holds them: kept)
+        CoreML.held = []
+        self.assertEqual(mac.release_coreml_inputs(), 0)   # (let go of: freed, by Python)
+
+
 INSTALLED_MODELS = Path(os.environ.get("NPU_MODELS_DIR") or Path.home() / ".local/share/npu-models")
 
 

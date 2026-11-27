@@ -314,6 +314,9 @@ main() {
     sed "s/@VERSION@/$VERSION/g" "$src/macos/app/Info.plist" > "$stage_app/Contents/Info.plist"
     sed "s/@VERSION@/$VERSION/g" "$src/macos/app/Window-Info.plist" > "$window/Contents/Info.plist"
     install -m 0755 "$out/BMeet" "$stage_app/Contents/MacOS/BMeet"
+    # its texts in Russian, and the titles of Finder's services on a Russian Mac (ru.lproj)
+    bash "$src/macos/app/lproj.sh" "$stage_app/Contents/Resources" >> "$LOG" 2>&1 \
+        || die "BMeet.app's translations do not read (macos/app/*.lproj)"
     local cfg="$py-config"
     [ -x "$cfg" ] || cfg="$(dirname "$py")/python3.13-config"
     # shellcheck disable=SC2046

@@ -1,0 +1,8 @@
+/* The titles of BMeet's services in Finder (right-click → Quick Actions or Services) on a Mac
+   whose language is Russian: macOS picks them by the Mac's language, not by BMeet's interface
+   language. The key is the title in macos/app/Info.plist (NSServices); macos/tools/
+   check-strings.py checks that every service has one. */
+"Transcribe with BMeet" = "Расшифровать в BMeet";
+"Transcribe with Speakers (BMeet)" = "Расшифровать с собеседниками (BMeet)";
+"Translate Speech to English (BMeet)" = "Перевести речь на английский (BMeet)";
+"Open in BMeet" = "Открыть в BMeet";

@@ -1,0 +1,186 @@
+/* BMeet.app in Russian. The key is the English text as macos/Sources/BMeet has it in L("…");
+   keep %@ and %d in the translation (%1$@, %2$@ to change their order). macos/tools/
+   check-strings.py checks this file against the source, in CI.
+
+   The words are the ones the BMeet window uses too (docs/macos.md): диктовка, встреча,
+   онлайн-встреча, очная встреча, расшифровка, собеседники, сочетание клавиш, настройки. No «ё».
+   What goes into transcript files stays English (You, Remote, Person 1), and so do the names
+   BMeet, Whisper, GigaAM and Neural Engine. */
+
+/* The menu */
+"Listening…" = "Слушаю…";
+"Transcribing…" = "Расшифровка…";
+"Recording a meeting" = "Идет запись встречи";
+/* %@: the meeting's title, or "meeting" below */
+"Paused: %@" = "Пауза: %@";
+"meeting" = "встреча";
+"Ready" = "Готово";
+"Every feature is off" = "Все функции выключены";
+/* %@: the dictation language's code, EN */
+"%@ · on the Neural Engine" = "%@ · на Neural Engine";
+"On the Neural Engine" = "На Neural Engine";
+"Telling speakers apart…" = "Различаю собеседников…";
+"Update to BMeet %@…" = "Обновить до BMeet %@…";
+"Stop Dictation" = "Остановить диктовку";
+"Dictate" = "Диктовать";
+"Dictate to Clipboard" = "Диктовать в буфер обмена";
+"Cancel Dictation" = "Отменить диктовку";
+"Stop Meeting" = "Остановить встречу";
+"Resume Meeting" = "Продолжить встречу";
+"Pause Meeting" = "Приостановить встречу";
+"Show Live Transcript" = "Показать расшифровку по ходу встречи";
+"Start Meeting" = "Начать встречу";
+"Start In-Person Meeting" = "Начать очную встречу";
+"Dictation Language" = "Язык диктовки";
+"Next Language" = "Следующий язык";
+"Recent Transcripts" = "Последние расшифровки";
+"Nothing yet" = "Пока ничего нет";
+"Open BMeet…" = "Открыть BMeet…";
+"Transcribe a File…" = "Расшифровать файл…";
+"Settings…" = "Настройки…";
+"Check for Updates…" = "Проверить обновления…";
+"About BMeet" = "О программе BMeet";
+"Quit BMeet" = "Выйти из BMeet";
+
+/* Quitting during a meeting */
+"Stop the meeting and quit?" = "Остановить встречу и выйти?";
+"BMeet is recording a meeting. Quitting BMeet would not stop the recording." = "BMeet записывает встречу. Если выйти из BMeet, запись не остановится.";
+"Stop Meeting and Quit" = "Остановить встречу и выйти";
+"Cancel" = "Отменить";
+
+/* Notifications */
+"Meeting not started: BMeet cannot use the microphone" = "Встреча не начата: BMeet не может использовать микрофон";
+"BMeet cannot hear your microphone" = "BMeet не слышит ваш микрофон";
+"Allow BMeet in System Settings → Privacy & Security → Microphone." = "Разрешите BMeet в Системных настройках → Конфиденциальность и безопасность → Микрофон.";
+"Only the other side of the call is recorded. Allow BMeet in System Settings → Privacy & Security → Microphone." = "Записывается только другая сторона звонка. Разрешите BMeet в Системных настройках → Конфиденциальность и безопасность → Микрофон.";
+/* %@: the language's name, Русский */
+"Dictation language: %@" = "Язык диктовки: %@";
+"The BMeet window is missing" = "Окно BMeet не найдено";
+"Run the installer again." = "Запустите установщик еще раз.";
+"File transcription is off" = "Расшифровка файлов выключена";
+"Turn it on in BMeet's Settings → Features." = "Включите ее в настройках BMeet → Функции.";
+/* %@: a file's name */
+"Transcribing %@" = "Расшифровка: %@";
+"Transcribing files: %d" = "Расшифровка файлов: %d";
+"You get a notification when it is done; the transcript goes next to the file." = "Когда она закончится, придет уведомление; расшифровка сохранится рядом с файлом.";
+"Dictation needs the microphone" = "Для диктовки нужен микрофон";
+"Dictation stopped" = "Диктовка остановлена";
+"The speech engine ended (see ~/Library/Logs/BMeet/dictation.log)." = "Распознавание речи завершилось (см. ~/Library/Logs/BMeet/dictation.log).";
+"Dictation failed" = "Диктовка не удалась";
+"Could not start npu-transcribe: %@" = "Не удалось запустить npu-transcribe: %@";
+"Dictation copied" = "Диктовка скопирована";
+"Dictation copied: press ⌘V" = "Диктовка скопирована: нажмите ⌘V";
+"To paste by itself, allow BMeet in System Settings → Privacy & Security → Accessibility." = "Чтобы текст вставлялся сам, разрешите BMeet в Системных настройках → Конфиденциальность и безопасность → Универсальный доступ.";
+/* %@: a version, 0.10.0 */
+"BMeet %@ is available" = "Доступна версия BMeet %@";
+"Update from BMeet's menu (the microphone in the menu bar)." = "Обновите BMeet из его меню (микрофон в строке меню).";
+"Choose Update to BMeet %@… in BMeet's menu." = "Выберите «Обновить до BMeet %@…» в меню BMeet.";
+"BMeet is up to date" = "Установлена последняя версия BMeet";
+"BMeet %@ is the newest release." = "BMeet %@ — последняя версия.";
+"Could not look for updates" = "Не удалось проверить обновления";
+"bmeet-ctl did not answer" = "bmeet-ctl не ответил";
+
+/* Settings: the pages */
+"General" = "Основные";
+"Features" = "Функции";
+"Languages" = "Языки";
+"Shortcuts" = "Сочетания клавиш";
+"About" = "О программе";
+
+/* Settings → General */
+"Language:" = "Язык:";
+/* %@: the language "System" stands for, in itself: English, Русский */
+"System (%@)" = "Как в системе (%@)";
+"The language of BMeet's menu, its Settings and its notifications. The BMeet window follows it too." = "Язык меню BMeet, его настроек и уведомлений. Окно BMeet тоже следует ему.";
+"Start BMeet at login" = "Открывать BMeet при входе в систему";
+"Check for updates automatically" = "Проверять обновления автоматически";
+"Once a day BMeet asks GitHub for its list of releases. Nothing about you or your use of BMeet is sent." = "Раз в день BMeet запрашивает у GitHub список своих версий. Ничего о вас и о том, как вы пользуетесь BMeet, не отправляется.";
+"Free memory after:" = "Освобождать память через:";
+"Right after use" = "Сразу после использования";
+"1 minute" = "1 минуту";
+"5 minutes" = "5 минут";
+"15 minutes" = "15 минут";
+"30 minutes" = "30 минут";
+"60 minutes" = "60 минут";
+/* a number of minutes written in the file by hand */
+"%d min" = "%d мин";
+"How long a speech model stays in memory after it was last used. Loading Whisper turbo again takes a few seconds, and about a minute the first time after an update." = "Сколько модель распознавания речи остается в памяти после последнего использования. Загрузка Whisper turbo заново занимает несколько секунд, а в первый раз после обновления около минуты.";
+"Pasting:" = "Вставка:";
+"Allowed" = "Разрешена";
+"Not allowed yet" = "Пока не разрешена";
+"Allow Pasting…" = "Разрешить вставку…";
+"BMeet pastes what you dictate with ⌘V, which macOS allows in Privacy & Security → Accessibility. Without it the text stays on the clipboard." = "BMeet вставляет надиктованное нажатием ⌘V, а macOS разрешает это в разделе «Конфиденциальность и безопасность» → «Универсальный доступ». Без этого текст остается в буфере обмена.";
+"Settings files:" = "Файлы настроек:";
+"Open in Finder" = "Открыть в Finder";
+"~/.config/bmeet, one file for each setting. BMeet follows changes made there too." = "~/.config/bmeet, по файлу на каждую настройку. BMeet следует и изменениям, сделанным там.";
+
+/* Settings → Features */
+"Dictation" = "Диктовка";
+"Speak, and the text is pasted where you were typing or put on the clipboard. A small panel at the bottom of the screen shows that BMeet listens." = "Говорите, и текст вставится туда, где вы печатали, или попадет в буфер обмена. Небольшая панель внизу экрана показывает, что BMeet слушает.";
+"Show the words while you speak" = "Показывать слова, пока вы говорите";
+"Online meetings" = "Онлайн-встречи";
+"Records your microphone and what your Mac plays, and saves a transcript of the call with who said what." = "Записывает ваш микрофон и звук Mac и сохраняет расшифровку звонка с тем, кто что сказал.";
+"In-person meetings" = "Очные встречи";
+"Records only your microphone, for a meeting in the room, and tells the voices on it apart." = "Записывает только ваш микрофон, для встречи в комнате, и различает голоса на записи.";
+"Tell speakers apart" = "Различать собеседников";
+/* Person 1, You and Remote stay English: they are what the transcript files say */
+"Meeting transcripts get Person 1, Person 2, … instead of only You and Remote. The meeting audio stays in memory until that is done." = "В расшифровках встреч появляются Person 1, Person 2, … вместо одних You и Remote. Звук встречи до тех пор хранится в памяти.";
+"Remember voices" = "Запоминать голоса";
+"Later meetings call the people you named by their names. BMeet keeps a voice fingerprint of each: biometric data about other people, so turn it on only where that is fine. Turning it off forgets them all." = "В следующих встречах названные вами люди получают свои имена. BMeet хранит отпечаток голоса каждого, а это биометрические данные других людей: включайте это, только где это допустимо. Если выключить, BMeet забудет все голоса.";
+"File transcription" = "Расшифровка файлов";
+"Turns audio and video files into text: Transcribe a File… in the menu, the BMeet window and Finder's Quick Actions." = "Превращает аудио- и видеофайлы в текст: «Расшифровать файл…» в меню, окно BMeet и Быстрые действия в Finder.";
+"A feature that is off leaves BMeet's menu and shortcuts. The transcripts you have stay in the BMeet window." = "Выключенная функция исчезает из меню BMeet и сочетаний клавиш. Готовые расшифровки остаются в окне BMeet.";
+"Remember voices?" = "Запоминать голоса?";
+"BMeet will keep a voice fingerprint of each person in your meetings, 192 numbers from which no audio or words can be recovered, and later meetings call the people you named by their names. Fingerprints are biometric data about other people: turn this on only where that is fine." = "BMeet будет хранить отпечаток голоса каждого участника ваших встреч, 192 числа, по которым нельзя восстановить ни звук, ни слова, и в следующих встречах названные вами люди получат свои имена. Отпечатки голоса — биометрические данные других людей: включайте это, только где это допустимо.";
+"Remember Voices" = "Запоминать голоса";
+"Forget all remembered voices?" = "Забыть все запомненные голоса?";
+"BMeet deletes every voice fingerprint it keeps, your own too. Later meetings number the people again." = "BMeet удалит все отпечатки голосов, которые хранит, и ваш тоже. В следующих встречах люди снова будут пронумерованы.";
+"Forget Voices" = "Забыть голоса";
+
+/* Settings → Languages */
+"Dictation language:" = "Язык диктовки:";
+"The language you dictate in now. The language shortcut goes to the next language that is on." = "Язык, на котором вы диктуете сейчас. Сочетание клавиш для языка переключает на следующий включенный язык.";
+"Search languages" = "Поиск языка";
+/* next to the dictation language in the list */
+"dictation language" = "язык диктовки";
+"Russian is transcribed with GigaAM v3 (Sber), which makes about 20 % fewer errors than Whisper on Russian speech. Whisper takes the other languages." = "Русский расшифровывает модель GigaAM v3 (Сбер): на русской речи у нее примерно на 20 % меньше ошибок, чем у Whisper. Остальные языки расшифровывает Whisper.";
+"Russian is transcribed with Whisper here: GigaAM v3 is not installed (the installer's --no-gigaam)." = "Здесь русский расшифровывает Whisper: GigaAM v3 не установлена (--no-gigaam у установщика).";
+"At least one language stays on." = "Хотя бы один язык остается включенным.";
+
+/* Settings → Shortcuts */
+"Click a shortcut and press the new keys. ⌫ turns it off, Esc leaves it as it was. The shortcuts work in every app while BMeet runs." = "Нажмите на сочетание, а затем новые клавиши. ⌫ выключает его, Esc оставляет как было. Сочетания работают в любой программе, пока BMeet запущен.";
+"Dictate to the clipboard" = "Диктовать в буфер обмена";
+"Next dictation language" = "Следующий язык диктовки";
+"Start or stop a meeting" = "Начать или остановить встречу";
+"Start or stop an in-person meeting" = "Начать или остановить очную встречу";
+"Press the keys…" = "Нажмите клавиши…";
+"Off" = "Выкл.";
+"Off on the Features page" = "Выключено на странице «Функции»";
+"Taken by another app" = "Занято другой программой";
+"Use ⌃, ⌥ or ⌘ with a letter, a digit or Space, or an F key." = "Используйте ⌃, ⌥ или ⌘ с буквой, цифрой или пробелом либо клавишу F.";
+/* the first %@: the keys, ⌃⌥H; the second: what they do now, Диктовать */
+"%@ is already the shortcut for “%@”." = "%@ уже назначено для «%@».";
+"Restore Defaults" = "Вернуть стандартные";
+"A feature's shortcuts are off while the feature is off on the Features page. ⌃⌥ with a letter is rarely taken by other apps." = "Сочетания функции не работают, пока она выключена на странице «Функции». ⌃⌥ с буквой редко бывает занято другими программами.";
+
+/* Settings → About */
+"Version %@" = "Версия %@";
+"Dictation, meeting transcripts and file transcription on this Mac's Neural Engine. What you say stays on this Mac." = "Диктовка, расшифровка встреч и файлов на Neural Engine этого Mac. Сказанное вами остается на этом Mac.";
+"Check Now" = "Проверить";
+"Update…" = "Обновить…";
+"What's New" = "Что нового";
+"Looking for a newer release…" = "Ищу новую версию…";
+"BMeet %@ is available." = "Доступна версия BMeet %@.";
+/* %@: bmeet-ctl's reason, in English */
+"Could not look for updates: %@" = "Не удалось проверить обновления: %@";
+/* %@: a date, "сегодня, 14:05" */
+"BMeet is up to date. Last checked: %@." = "Установлена последняя версия BMeet. Последняя проверка: %@.";
+"BMeet has not looked for a newer release yet." = "BMeet еще не проверял новые версии.";
+"Models and licences" = "Модели и лицензии";
+"Whisper large-v3-turbo (speech recognition)" = "Whisper large-v3-turbo (распознавание речи)";
+"Whisper small (translation into English)" = "Whisper small (перевод на английский)";
+"GigaAM v3 by Sber (Russian)" = "GigaAM v3 от Сбера (русский)";
+"Nemotron 3 Diarization by NVIDIA (who speaks when)" = "Nemotron 3 Diarization от NVIDIA (кто когда говорит)";
+"TitaNet-small by NVIDIA (voice fingerprints)" = "TitaNet-small от NVIDIA (отпечатки голосов)";
+"WhisperKit by Argmax (Whisper on the Neural Engine)" = "WhisperKit от Argmax (Whisper на Neural Engine)";
+"Open Log Folder" = "Открыть папку журналов";

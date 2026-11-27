@@ -3,38 +3,57 @@
 // dictations, notifications, and Finder's right-click "Transcribe". Everything that records or
 // pastes runs as its child, so macOS asks for the microphone, the system audio and Accessibility
 // once, for BMeet. The BMeet window (meetings, transcribed files) is the Qt app of Linux, in
-// Contents/Helpers/BMeet Window.app.
+// Contents/Helpers/BMeet Window.app. Its own Settings window is SettingsWindow.swift.
 
 import AppKit
 import ServiceManagement
 import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    private var item: NSStatusItem!
+    private var item: NSStatusItem?
     private let menu = NSMenu()
-    private var hotKeys: HotKeys!
-    private let dictation = Dictation()
+    private(set) var hotKeys: HotKeys!
+    let dictation = Dictation()
     private var server: ControlServer!
-    private var status: [String: Any] = [:]
+    var status: [String: Any] = [:]
     private var recent: [[String: Any]] = []
     private weak var recentMenu: NSMenu?    // the Recent Transcripts submenu of the menu last shown
     private var timer: Timer?
     private var updateTimer: Timer?
+    private var settingsTimer: Timer?
     private var pidWritten = Date.distantPast
+    private var settingsWindow: SettingsWindow?
+    /// The settings as BMeet last followed them (settingsChanged).
+    private var seen = Settings.Snapshot()
+    private var hotKeysPaused = false
+    /// A look for updates that runs now, and why the last one asked for failed (the About page).
+    private(set) var updateChecking = false
+    private(set) var updateError: String?
     /// Quit without asking about a meeting: SIGTERM (main.swift), logging out, a second BMeet.app.
     var quitWithoutAsking = false
+    /// A check (Checks.swift): no menu bar icon, no shortcuts taken from the running BMeet, no
+    /// notifications, nothing on the screen; the control socket is a test's own.
+    let checking: Bool
+
+    init(checking: Bool = false) {
+        self.checking = checking
+        super.init()
+        hotKeys = HotKeys { [weak self] action in self?.hotKey(action) }
+        hotKeys.dryRun = checking
+        seen = Settings.Snapshot.read()
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let runtime = Paths.runtime
         try? FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
         // One BMeet.app at a time: a second one hands over to the first and quits.
-        if let answer = sendToRunning(["op": "open", "args": []]), answer["ok"] as? Bool == true {
+        if !checking, let answer = sendToRunning(["op": "open", "args": []]), answer["ok"] as? Bool == true {
             quitWithoutAsking = true
             NSApp.terminate(nil)
             return
         }
-        writePid()
+        if !checking { writePid() }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil,
                                                           queue: .main) { [weak self] _ in
             self?.quitWithoutAsking = true
@@ -45,18 +64,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self?.control(req) ?? ["ok": false]
         })
         if !server.start() { NSLogLine("cannot listen on \(runtime.appendingPathComponent("agent.sock").path)") }
+        dictation.onChange = { [weak self] _ in self?.refresh(); self?.schedulePoll() }
+        dictation.notify = { [weak self] title, body in self?.post(title, body) }
+        seen = Settings.Snapshot.read()
+        hotKeys.register()
+        // Settings → the files in ~/.config/bmeet; BMeet follows them within 2 s, whoever wrote them
+        settingsTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.settingsChanged() }
+        if checking {
+            Checks.ready()
+            return
+        }
 
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = symbol("mic")
         item.button?.imagePosition = .imageLeading
         menu.delegate = self
         item.menu = menu
-        dictation.onChange = { [weak self] _ in self?.refresh(); self?.schedulePoll() }
-        dictation.notify = { [weak self] title, body in self?.post(title, body) }
-
-        hotKeys = HotKeys { [weak self] action in self?.hotKey(action) }
-        hotKeys.register()
-        NSLogLine("started (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")); "
+        self.item = item
+        NSLogLine("started (\(version)); "
                   + "shortcuts: " + hotKeys.labels.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", "))
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
@@ -64,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             UNUserNotificationCenter.current().delegate = self
             loginItem()
         }
+        refresh()
         schedulePoll()
         poll()
         loadRecent()
@@ -75,18 +101,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    /// BMeet for macOS's version: the bundle's, or macos/VERSION of the program files.
+    var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? Paths.read(Paths.src.appendingPathComponent("macos/VERSION"), default: "?")
+    }
+
     /// Quitting BMeet does not stop a meeting: its recorder would go on, without the menu bar
     /// icon that shows it. So BMeet asks first, and stops the meeting (its transcript is saved;
     /// the speaker pass goes on by itself) before it quits.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let meeting = Paths.read(Paths.runtime.appendingPathComponent("meeting_state"), default: "idle")
-        guard !quitWithoutAsking, meeting == "recording" || meeting == "paused" else { return .terminateNow }
+        guard !quitWithoutAsking, !checking, meeting == "recording" || meeting == "paused" else { return .terminateNow }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Stop the meeting and quit?"
-        alert.informativeText = "BMeet is recording a meeting. Quitting BMeet would not stop the recording."
-        alert.addButton(withTitle: "Stop Meeting and Quit")
-        alert.addButton(withTitle: "Cancel")
+        alert.messageText = L("Stop the meeting and quit?")
+        alert.informativeText = L("BMeet is recording a meeting. Quitting BMeet would not stop the recording.")
+        alert.addButton(withTitle: L("Stop Meeting and Quit"))
+        alert.addButton(withTitle: L("Cancel"))
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
         run(Paths.python, ["-I", Paths.meeting.path, "stop"], log: "meetings.log") { _ in
             DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -101,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         dictation.stopEngine()
         server?.stop()
         let pid = Paths.runtime.appendingPathComponent("pid")
-        if Paths.read(pid) == "\(getpid())" { try? FileManager.default.removeItem(at: pid) }
+        if !checking, Paths.read(pid) == "\(getpid())" { try? FileManager.default.removeItem(at: pid) }
     }
 
     /// Opening BMeet.app again (Finder, Spotlight, the Dock): the window.
@@ -110,13 +142,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return false
     }
 
+    /// Finder's Open With: the window's Transcribe page with the files.
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard filesAllowed() else { return }
         openWindow(["transcribe"] + urls.flatMap { ["--file", $0.path] })
+    }
+
+    // MARK: settings
+
+    /// Follows the files in ~/.config/bmeet: called every 2 s, and by the Settings window after
+    /// each change. A feature turned off loses its shortcuts at once (and a dictation that runs
+    /// is cancelled); another interface language rebuilds an open Settings window.
+    func settingsChanged() {
+        let now = Settings.Snapshot.read()
+        guard now != seen else { return }
+        let was = seen
+        seen = now
+        let newLanguage = now.interfaceLanguage != was.interfaceLanguage && Interface.reload()
+        if (now.features != was.features || now.hotkeys != was.hotkeys) && !hotKeysPaused {
+            hotKeys.register()
+        }
+        if was.features[.dictation] == true && now.features[.dictation] == false {
+            dictation.cancel()
+            dictation.stopEngine()
+        }
+        if now.unloadAfter != was.unloadAfter { dictation.scheduleIdle() }
+        if now.startAtLogin != was.startAtLogin && inBundle { loginItem() }
+        if now.language != was.language { dictation.languageChanged(now.language) }
+        refresh()
+        if let window = settingsWindow {
+            if newLanguage {
+                DispatchQueue.main.async { window.rebuild() }   // (not from inside the control that changed it)
+            } else {
+                window.fill()
+            }
+        }
+    }
+
+    /// The Settings window on `page` (the menu, About BMeet, the control socket's "settings").
+    func showSettings(_ page: SettingsWindow.Page) {
+        let window = settingsWindow ?? SettingsWindow(app: self)
+        settingsWindow = window
+        window.show(page)
+    }
+
+    /// The Settings window as it is now, built if it is not (a check).
+    var settings: SettingsWindow {
+        let window = settingsWindow ?? SettingsWindow(app: self)
+        settingsWindow = window
+        return window
+    }
+
+    /// While Settings → Shortcuts records keys, BMeet's own shortcuts must not go off.
+    func pauseHotKeys(_ paused: Bool) {
+        hotKeysPaused = paused
+        if paused { hotKeys.unregister() } else { hotKeys.register() }
     }
 
     // MARK: actions
 
     private func hotKey(_ action: String) {
+        guard Feature.of(hotKey: action)?.isOn != false else { return }   // (turned off in the last 2 s)
+        guard !checking else { return }   // (--hotkey-check's shortcuts only test the registering)
         switch action {
         case "dictate": dictation.toggle(clipboard: false)
         case "dictate-clipboard": dictation.toggle(clipboard: true)
@@ -127,14 +214,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    /// Why this meeting action may not run now, or nil: a kind of meeting that is off is not
+    /// started; one that runs can always be stopped, paused and resumed.
+    private func meetingRefusal(_ action: String, inPerson: Bool) -> String? {
+        let idle = Paths.read(Paths.runtime.appendingPathComponent("meeting_state"), default: "idle") == "idle"
+        guard idle, action == "start" || action == "toggle" else { return nil }
+        let feature: Feature = inPerson ? .inPersonMeetings : .meetings
+        return feature.isOn ? nil : (inPerson ? "in-person meetings are off" : "meetings are off") + " (BMeet's Settings → Features)"
+    }
+
     private func meeting(_ action: String, inPerson: Bool) {
+        if let why = meetingRefusal(action, inPerson: inPerson) {
+            NSLogLine("meeting \(action): \(why)")
+            return
+        }
         // Without the microphone macOS records silence: say so when a meeting starts. In person
         // there would be nothing at all to record.
         let idle = Paths.read(Paths.runtime.appendingPathComponent("meeting_state"), default: "idle") == "idle"
         if idle, action == "start" || action == "toggle", Microphone.denied {
-            post(inPerson ? "Meeting not started: BMeet cannot use the microphone" : "BMeet cannot hear your microphone",
-                 (inPerson ? "" : "Only the other side of the call is recorded. ")
-                 + "Allow BMeet in System Settings → Privacy & Security → Microphone.")
+            post(inPerson ? L("Meeting not started: BMeet cannot use the microphone") : L("BMeet cannot hear your microphone"),
+                 inPerson ? L("Allow BMeet in System Settings → Privacy & Security → Microphone.")
+                     : L("Only the other side of the call is recorded. Allow BMeet in System Settings → Privacy & Security → Microphone."))
             if inPerson { return }
         }
         // (bmeet-meeting takes one start or stop at a time itself)
@@ -150,7 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard let self else { return }
             let now = Settings.language
             self.dictation.languageChanged(now)
-            self.post("Dictation language: \(now)", "")
+            self.post(L("Dictation language: %@", Interface.languageName(now)), "")
             self.poll()
         }
     }
@@ -158,7 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func openWindow(_ args: [String]) {
         let app = Paths.windowApp
         guard FileManager.default.fileExists(atPath: app.path) else {
-            post("The BMeet window is missing", "Run the installer again")
+            post(L("The BMeet window is missing"), L("Run the installer again."))
             return
         }
         let config = NSWorkspace.OpenConfiguration()
@@ -175,30 +275,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         !NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.baakhoff.bmeet.window").isEmpty
     }
 
+    /// File transcription is on; else a notification says it is off (Finder's services and Open
+    /// With stay in Finder: macOS takes them from BMeet.app's Info.plist, see docs/macos.md).
+    private func filesAllowed() -> Bool {
+        guard !Feature.fileTranscription.isOn else { return true }
+        post(L("File transcription is off"), L("Turn it on in BMeet's Settings → Features."))
+        return false
+    }
+
     private func transcribe(_ files: [String], _ extra: [String]) {
-        guard !files.isEmpty else { return }
+        guard !files.isEmpty, filesAllowed() else { return }
         run(Paths.python, ["-I", Paths.transcribe.path, "--notify"] + extra + files, log: "transcribe.log") { _ in }
-        post("Transcribing \(files.count == 1 ? URL(fileURLWithPath: files[0]).lastPathComponent : "\(files.count) files")",
-             "You get a notification when it is done; the transcript goes next to the file.")
+        post(files.count == 1 ? L("Transcribing %@", URL(fileURLWithPath: files[0]).lastPathComponent)
+                              : L("Transcribing files: %d", files.count),
+             L("You get a notification when it is done; the transcript goes next to the file."))
     }
 
     // MARK: the control socket
 
-    private func control(_ req: [String: Any]) -> [String: Any] {
+    func control(_ req: [String: Any]) -> [String: Any] {
+        let answer = handle(req)
+        if checking { Checks.handled(req, answer, by: self) }
+        return answer
+    }
+
+    private func handle(_ req: [String: Any]) -> [String: Any] {
         switch req["op"] as? String ?? "" {
         case "ping":
             return ["ok": true, "pid": Int(getpid())]
         case "dictate":
+            guard Feature.dictation.isOn else { return ["ok": false, "error": "dictation is off (BMeet's Settings → Features)"] }
             dictation.toggle(clipboard: req["clipboard"] as? Bool ?? false)
         case "cancel":
             dictation.cancel()
         case "meeting":
-            meeting(req["action"] as? String ?? "toggle", inPerson: req["in_person"] as? Bool ?? false)
+            let action = req["action"] as? String ?? "toggle", inPerson = req["in_person"] as? Bool ?? false
+            if let why = meetingRefusal(action, inPerson: inPerson) { return ["ok": false, "error": why] }
+            meeting(action, inPerson: inPerson)
         case "language":
             dictation.languageChanged(req["language"] as? String ?? Settings.language)
             poll()
         case "open":
             openWindow(req["args"] as? [String] ?? [])
+        case "settings":
+            showSettings(SettingsWindow.Page(rawValue: req["page"] as? String ?? "") ?? .general)
         case "notify":
             post(req["title"] as? String ?? "BMeet", req["body"] as? String ?? "")
         case "status":
@@ -237,6 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// Every 2 s while something happens (a dictation, a meeting, a speaker pass: the menu bar
     /// shows it), else every 15 s: each look runs bmeet-ctl, a Python process.
     private func schedulePoll() {
+        guard !checking else { return }
         let meeting = status["meeting"] as? String ?? "idle"
         let pending = (status["speakers_pending"] as? [Any])?.isEmpty == false
         let busy = dictation.state != .idle || meeting != "idle" || pending
@@ -247,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func poll() {
+        guard !checking else { return }
         writePid()
         run(Paths.python, ["-I", Paths.ctl.path, "status"], capture: true) { [weak self] out in
             guard let self, let data = out?.data(using: .utf8),
@@ -256,10 +378,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let passes: Int? = (s["speakers_pending"] as? [Any])?.count
             let passesChanged = passes != (self.status["speakers_pending"] as? [Any])?.count
             let ended = !self.status.isEmpty && (meetingChanged || passesChanged)
+            let updateChanged = (s["update"] as? [String: Any])?["version"] as? String
+                != (self.status["update"] as? [String: Any])?["version"] as? String
             self.status = s
             self.refresh()
             self.schedulePoll()
             if ended { self.loadRecent() }
+            if updateChanged { self.settingsWindow?.fillAbout() }
         }
     }
 
@@ -273,11 +398,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         pidWritten = Date()
     }
 
-    private func refresh() {
-        guard let button = item?.button else { return }
+    /// The menu bar icon's symbol, color and text (the meeting's time).
+    func icon() -> (name: String, tint: NSColor?, title: String) {
         let meeting = status["meeting"] as? String ?? "idle"
         let pending = (status["speakers_pending"] as? [Any])?.isEmpty == false
-        var name = "mic", tint: NSColor? = nil, title = ""
+        // (the microphone while anything that records is on; with file transcription alone, a waveform)
+        let records = Feature.dictation.isOn || Feature.meetings.isOn || Feature.inPersonMeetings.isOn
+        var name = records ? "mic" : "waveform", tint: NSColor? = nil, title = ""
         switch dictation.state {
         case .recording: name = "mic.fill"; tint = .systemRed
         case .transcribing: name = "waveform"; tint = .systemBlue
@@ -296,6 +423,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 title = String(format: " %d:%02d", s / 60, s % 60)
             }
         }
+        return (name, tint, title)
+    }
+
+    private func refresh() {
+        guard let button = item?.button else { return }
+        let (name, tint, title) = icon()
         button.image = symbol(name)
         button.contentTintColor = tint
         button.title = title
@@ -310,113 +443,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: the menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        build(menu)
+        loadRecent()
+    }
+
+    /// The menu as the settings and the state have it now: a feature that is off has no items.
+    func build(_ menu: NSMenu) {
         menu.removeAllItems()
         let meeting = status["meeting"] as? String ?? "idle"
         let language = (status["language"] as? String ?? Settings.language).uppercased()
+        let dictationOn = Feature.dictation.isOn, meetingsOn = Feature.meetings.isOn
+        let inPersonOn = Feature.inPersonMeetings.isOn, filesOn = Feature.fileTranscription.isOn
         let line: String, dot: NSColor
         switch (dictation.state, meeting) {
-        case (.recording, _): (line, dot) = ("Listening…", .systemRed)
-        case (.transcribing, _): (line, dot) = ("Transcribing…", .systemOrange)
-        case (_, "recording"): (line, dot) = (status["meeting_title"] as? String ?? "Recording a meeting", .systemRed)
-        case (_, "paused"): (line, dot) = ("Paused: " + (status["meeting_title"] as? String ?? "meeting"), .systemOrange)
-        default: (line, dot) = ("Ready", .systemGreen)
+        case (.recording, _): (line, dot) = (L("Listening…"), .systemRed)
+        case (.transcribing, _): (line, dot) = (L("Transcribing…"), .systemOrange)
+        case (_, "recording"): (line, dot) = (status["meeting_title"] as? String ?? L("Recording a meeting"), .systemRed)
+        case (_, "paused"): (line, dot) = (L("Paused: %@", status["meeting_title"] as? String ?? L("meeting")), .systemOrange)
+        default:
+            (line, dot) = dictationOn || meetingsOn || inPersonOn || filesOn ? (L("Ready"), .systemGreen)
+                : (L("Every feature is off"), .systemGray)
         }
         let header = NSMenuItem(title: line, action: nil, keyEquivalent: "")
         header.image = AppDelegate.dot(dot)
         header.attributedTitle = NSAttributedString(string: line, attributes: [.font: NSFont.menuFont(ofSize: 13)])
         header.isEnabled = false
         menu.addItem(header)
-        let detail = NSMenuItem(title: "\(language) · on the Neural Engine", action: nil, keyEquivalent: "")
-        detail.attributedTitle = NSAttributedString(string: "\(language) · on the Neural Engine", attributes: [
+        let engine = dictationOn ? L("%@ · on the Neural Engine", language) : L("On the Neural Engine")
+        let detail = NSMenuItem(title: engine, action: nil, keyEquivalent: "")
+        detail.attributedTitle = NSAttributedString(string: engine, attributes: [
             .font: NSFont.menuFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
         detail.indentationLevel = 1
         detail.isEnabled = false
         menu.addItem(detail)
         if let pending = status["speakers_pending"] as? [Any], !pending.isEmpty {
-            let i = add("Telling speakers apart…", "person.2.wave.2", nil, nil)
+            let i = add(menu, L("Telling speakers apart…"), "person.2.wave.2", nil, nil)
             i.isEnabled = false
         }
         if let update = status["update"] as? [String: Any], let version = update["version"] as? String {
-            add("Update to BMeet \(version)…", "arrow.down.circle", nil, #selector(menuUpdate))
+            add(menu, L("Update to BMeet %@…", version), "arrow.down.circle", nil, #selector(menuUpdate))
         }
         menu.addItem(.separator())
-        if dictation.state == .recording {
-            add("Stop Dictation", "stop.circle", "dictate", #selector(menuDictate))
-        } else {
-            add("Dictate", "mic", "dictate", #selector(menuDictate))
-        }
-        add("Dictate to Clipboard", "doc.on.clipboard", "dictate-clipboard", #selector(menuDictateClipboard))
-        if dictation.state != .idle { add("Cancel Dictation", "xmark.circle", nil, #selector(menuCancel)) }
-        menu.addItem(.separator())
-        if meeting == "idle" {
-            add("Start Meeting", "record.circle", "meeting", #selector(menuMeeting))
-            add("Start In-Person Meeting", "person.3", "meeting-in-person", #selector(menuInPerson))
-        } else {
-            add("Stop Meeting", "stop.circle", "meeting", #selector(menuMeeting))
-            add(meeting == "paused" ? "Resume Meeting" : "Pause Meeting", meeting == "paused" ? "play.circle" : "pause.circle",
-                nil, #selector(menuPause))
-            if let live = status["meeting_live"] as? String, !live.isEmpty {
-                add("Show Live Transcript", "text.bubble", nil, #selector(menuOpenMeetings))
+        if dictationOn {
+            if dictation.state == .recording {
+                add(menu, L("Stop Dictation"), "stop.circle", "dictate", #selector(menuDictate))
+            } else {
+                add(menu, L("Dictate"), "mic", "dictate", #selector(menuDictate))
             }
+            add(menu, L("Dictate to Clipboard"), "doc.on.clipboard", "dictate-clipboard", #selector(menuDictateClipboard))
+            if dictation.state != .idle { add(menu, L("Cancel Dictation"), "xmark.circle", nil, #selector(menuCancel)) }
+            menu.addItem(.separator())
         }
-        menu.addItem(.separator())
-        let langs = (status["languages"] as? [String]) ?? Settings.languages
-        let langItem = add("Dictation Language", "globe", nil, nil)
-        let sub = NSMenu()
-        for l in langs {
-            let i = NSMenuItem(title: Locale.current.localizedString(forLanguageCode: l).map { "\($0) (\(l))" } ?? l,
-                               action: #selector(menuLanguage(_:)), keyEquivalent: "")
-            i.target = self
-            i.state = l.uppercased() == language ? .on : .off
-            i.representedObject = l
-            sub.addItem(i)
+        // (a meeting that runs can be stopped whatever the switches say; only starting one follows them)
+        if meeting != "idle" {
+            add(menu, L("Stop Meeting"), "stop.circle", "meeting", #selector(menuMeeting))
+            add(menu, meeting == "paused" ? L("Resume Meeting") : L("Pause Meeting"),
+                meeting == "paused" ? "play.circle" : "pause.circle", nil, #selector(menuPause))
+            if let live = status["meeting_live"] as? String, !live.isEmpty {
+                add(menu, L("Show Live Transcript"), "text.bubble", nil, #selector(menuOpenMeetings))
+            }
+            menu.addItem(.separator())
+        } else if meetingsOn || inPersonOn {
+            if meetingsOn { add(menu, L("Start Meeting"), "record.circle", "meeting", #selector(menuMeeting)) }
+            if inPersonOn { add(menu, L("Start In-Person Meeting"), "person.3", "meeting-in-person", #selector(menuInPerson)) }
+            menu.addItem(.separator())
         }
-        sub.addItem(.separator())
-        let next = NSMenuItem(title: "Next Language", action: #selector(menuNextLanguage), keyEquivalent: "")
-        next.target = self
-        if let k = hotKeys.menuKeys["language"] { next.keyEquivalent = k.key; next.keyEquivalentModifierMask = k.mods }
-        sub.addItem(next)
-        langItem.submenu = sub
-        let recentItem = add("Recent Transcripts", "clock", nil, nil)
+        if dictationOn {
+            let langs = (status["languages"] as? [String]) ?? Settings.languages
+            let langItem = add(menu, L("Dictation Language"), "globe", nil, nil)
+            let sub = NSMenu()
+            for l in langs {
+                let i = NSMenuItem(title: "\(Interface.languageName(l)) (\(l))", action: #selector(menuLanguage(_:)), keyEquivalent: "")
+                i.target = self
+                i.state = l.uppercased() == language ? .on : .off
+                i.representedObject = l
+                sub.addItem(i)
+            }
+            sub.addItem(.separator())
+            let next = NSMenuItem(title: L("Next Language"), action: #selector(menuNextLanguage), keyEquivalent: "")
+            next.target = self
+            if let k = hotKeys.menuKeys["language"] { next.keyEquivalent = k.key; next.keyEquivalentModifierMask = k.mods }
+            sub.addItem(next)
+            langItem.submenu = sub
+        }
+        let recentItem = add(menu, L("Recent Transcripts"), "clock", nil, nil)
         let rsub = NSMenu()
         fillRecent(rsub)
         recentItem.submenu = rsub
         recentMenu = rsub
         menu.addItem(.separator())
-        add("Open BMeet…", "macwindow", nil, #selector(menuOpenMeetings))
-        add("Transcribe a File…", "waveform.badge.plus", nil, #selector(menuTranscribeFile))
-        let settings = add("Settings", "gearshape", nil, nil)
-        let ssub = NSMenu()
-        toggleItem(ssub, "Show the Words While You Speak", Settings.liveText) { Settings.set("live-dictation", $0 ? "on" : "off") }
-        toggleItem(ssub, "Tell Meeting Speakers Apart", Settings.speakers) { Settings.set("speakers", $0 ? "on" : "off") }
-        toggleItem(ssub, "Start BMeet at Login", Settings.startAtLogin) { [weak self] on in
-            Settings.set("start-at-login", on ? "on" : "off")
-            self?.loginItem()
-        }
-        toggleItem(ssub, "Check for Updates Automatically", Settings.updateCheck) { Settings.set("update-check", $0 ? "on" : "off") }
-        ssub.addItem(.separator())
-        let ax = NSMenuItem(title: AXIsProcessTrusted() ? "Pasting Allowed" : "Allow Pasting (Accessibility)…",
-                            action: AXIsProcessTrusted() ? nil : #selector(menuAccessibility), keyEquivalent: "")
-        ax.target = self
-        ax.image = NSImage(systemSymbolName: AXIsProcessTrusted() ? "checkmark.circle" : "hand.raised",
-                           accessibilityDescription: nil)
-        ssub.addItem(ax)
-        let folder = NSMenuItem(title: "Open Settings Folder", action: #selector(menuSettingsFolder), keyEquivalent: "")
-        folder.target = self
-        folder.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
-        ssub.addItem(folder)
-        settings.submenu = ssub
+        add(menu, L("Open BMeet…"), "macwindow", nil, #selector(menuOpenMeetings))
+        if filesOn { add(menu, L("Transcribe a File…"), "waveform.badge.plus", nil, #selector(menuTranscribeFile)) }
+        let settings = add(menu, L("Settings…"), "gearshape", nil, #selector(menuSettings))
+        settings.keyEquivalent = ","
+        settings.keyEquivalentModifierMask = .command
         menu.addItem(.separator())
-        add("Check for Updates…", nil, nil, #selector(menuCheckUpdate))
-        add("About BMeet", nil, nil, #selector(menuAbout))
-        let quit = NSMenuItem(title: "Quit BMeet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        add(menu, L("Check for Updates…"), nil, nil, #selector(menuCheckUpdate))
+        add(menu, L("About BMeet"), nil, nil, #selector(menuAbout))
+        let quit = NSMenuItem(title: L("Quit BMeet"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
-        loadRecent()
     }
 
     /// A menu item with an SF Symbol, and the global shortcut of `hotkey` shown the Mac way.
     @discardableResult
-    private func add(_ title: String, _ symbol: String?, _ hotkey: String?, _ action: Selector?) -> NSMenuItem {
+    private func add(_ menu: NSMenu, _ title: String, _ symbol: String?, _ hotkey: String?, _ action: Selector?) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
         i.target = self
         if let symbol { i.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
@@ -436,26 +566,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
-    @objc private func menuAbout() {
-        NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .credits: NSAttributedString(string: "Dictation, meeting transcripts and file transcription on this Mac's Neural Engine: "
-                                         + "what you say is not uploaded. Meeting transcripts are saved in ~/Documents/Meetings, "
-                                         + "which iCloud Drive uploads when Desktop & Documents sync is on.\ngithub.com/baakhoff/bmeet",
-                                         attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]),
-        ])
-    }
-
-    private var toggles: [NSMenuItem: (Bool) -> Void] = [:]
-
-    private func toggleItem(_ m: NSMenu, _ title: String, _ value: Bool, _ set: @escaping (Bool) -> Void) {
-        let i = NSMenuItem(title: title, action: #selector(menuToggle(_:)), keyEquivalent: "")
-        i.target = self
-        i.state = value ? .on : .off
-        toggles[i] = set
-        m.addItem(i)
-    }
-
     private func fillRecent(_ rsub: NSMenu) {
         rsub.removeAllItems()
         for r in recent.prefix(8) {
@@ -468,10 +578,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                               accessibilityDescription: nil)
             rsub.addItem(i)
         }
-        if rsub.items.isEmpty { rsub.addItem(withTitle: "Nothing yet", action: nil, keyEquivalent: "").isEnabled = false }
+        if rsub.items.isEmpty { rsub.addItem(withTitle: L("Nothing yet"), action: nil, keyEquivalent: "").isEnabled = false }
     }
 
     private func loadRecent() {
+        guard !checking else { return }
         run(Paths.python, ["-I", Paths.ctl.path, "recent", "--limit", "8"], capture: true) { [weak self] out in
             guard let self, let data = out?.data(using: .utf8),
                   let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
@@ -493,20 +604,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         if let p = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
     }
     @objc private func menuTranscribeFile() { openWindow(["transcribe"]) }
-    @objc private func menuToggle(_ sender: NSMenuItem) { toggles[sender]?(sender.state != .on) }
+    @objc private func menuSettings() { showSettings(.general) }
+    @objc private func menuAbout() { showSettings(.about) }
     @objc private func menuCheckUpdate() { checkUpdate(auto: false) }
+    @objc private func menuUpdate() { startUpdate() }
+
     /// The update runs in Terminal (`bmeet-ctl update --terminal`): the installer quits BMeet and
     /// opens the new one at the end, and it may ask there (Homebrew, the Command Line Tools).
-    @objc private func menuUpdate() {
+    func startUpdate() {
+        guard !checking else { return }
         run(Paths.python, ["-I", Paths.ctl.path, "update", "--terminal"], log: "update.log") { _ in }
-    }
-    @objc private func menuSettingsFolder() {
-        try? FileManager.default.createDirectory(at: Paths.config, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(Paths.config)
-    }
-    @objc private func menuAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
     }
 
     // MARK: Finder: right-click > Quick Actions / Services
@@ -524,6 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc func openInBMeet(_ board: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        guard filesAllowed() else { return }
         openWindow(["transcribe"] + files(board).flatMap { ["--file", $0] })
     }
 
@@ -535,7 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     /// Run from BMeet.app (not the bare executable of a build or a test).
     private var inBundle: Bool {
-        Bundle.main.bundleIdentifier != nil && ProcessInfo.processInfo.environment["BMEET_NO_NOTIFY"] == nil
+        !checking && Bundle.main.bundleIdentifier != nil && ProcessInfo.processInfo.environment["BMEET_NO_NOTIFY"] == nil
     }
 
     func post(_ title: String, _ body: String) {
@@ -582,8 +690,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     /// bmeet-ctl looks for a newer release of BMeet for macOS on GitHub (`auto`: when it is due).
     /// The menu shows one from the status; a notification says so once per release, and every
-    /// time you asked (Check for Updates…), with what it found.
-    private func checkUpdate(auto: Bool) {
+    /// time you asked (Check for Updates…, Check Now), with what it found.
+    func checkUpdate(auto: Bool) {
+        guard !checking else { return }
+        if !auto {
+            updateChecking = true
+            settingsWindow?.fillAbout()
+        }
         run(Paths.python, ["-I", Paths.ctl.path, "update", "--check", "--json"] + (auto ? ["--auto"] : []),
             capture: true) { [weak self] out in
             guard let self else { return }
@@ -594,18 +707,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let version = (answer?["update"] as? [String: Any])?["version"] as? String
             if auto {
                 if let version, answer?["new"] as? Bool == true {
-                    self.post("BMeet \(version) is available", "Update from BMeet's menu (the microphone in the menu bar).")
-                }
-            } else if let answer, answer["error"] as? String == nil {
-                if let version {
-                    self.post("BMeet \(version) is available", "Choose Update to BMeet \(version)… in BMeet's menu.")
-                } else {
-                    self.post("BMeet is up to date", "BMeet \(answer["installed"] as? String ?? "") is the newest release.")
+                    self.post(L("BMeet %@ is available", version), L("Update from BMeet's menu (the microphone in the menu bar)."))
                 }
             } else {
-                self.post("Could not look for updates", answer?["error"] as? String ?? "bmeet-ctl did not answer")
+                self.updateChecking = false
+                self.updateError = answer == nil ? L("bmeet-ctl did not answer") : answer?["error"] as? String
+                if let answer, answer["error"] as? String == nil {
+                    if let version {
+                        self.post(L("BMeet %@ is available", version), L("Choose Update to BMeet %@… in BMeet's menu.", version))
+                    } else {
+                        self.post(L("BMeet is up to date"), L("BMeet %@ is the newest release.", answer["installed"] as? String ?? ""))
+                    }
+                } else {
+                    self.post(L("Could not look for updates"), self.updateError ?? "")
+                }
             }
             self.poll()
+            self.settingsWindow?.fillAbout()
         }
     }
 

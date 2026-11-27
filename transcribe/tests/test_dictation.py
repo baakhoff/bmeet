@@ -452,8 +452,9 @@ sys.exit(nt.dictate_serve(args, Engines()))
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
     def test_the_setting_is_read_when_it_is_needed(self):
-        # ~/.config/bmeet/unload-after changed between two dictations: 60 minutes keeps the
-        # model after the first, 0 lets it go right after the second, without a restart
+        # ~/.config/bmeet/unload-after changed while the engine waits, without a restart: with 60
+        # minutes it keeps the model after a dictation; set to 0, the model goes at its next look,
+        # and after the next dictation (which loads it again) right away
         s = Speech().say("Delta echo.", pause=0.8)
         wav = self.wav(s)
         setting = self.tmp / "config/bmeet/unload-after"
@@ -464,10 +465,11 @@ sys.exit(nt.dictate_serve(args, Engines()))
         time.sleep(1.0)
         self.assertNotIn("harness: release", self.said())
         setting.write_text("0\n")
-        self.assertEqual(self.dictation(proc, wav)["text"], "Delta echo.")
         self.wait_said("harness: release", 1, timeout=2.0)
-        self.assertTrue(any("(unload-after is 0)" in x for x in self.said()), self.said())
-        self.assertEqual(sum(x == "harness: load ru" for x in self.said()), 1)   # (kept for the second)
+        self.assertEqual(self.dictation(proc, wav)["text"], "Delta echo.")
+        self.wait_said("harness: release", 2, timeout=2.0)
+        self.assertEqual(sum("(unload-after is 0)" in x for x in self.said()), 2, self.said())
+        self.assertEqual(sum(x == "harness: load ru" for x in self.said()), 2)
 
     def test_memory_pressure_lets_go_of_the_model(self):
         # macOS says memory is short while the engine waits with a model: it goes at the next look,

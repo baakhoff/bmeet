@@ -38,6 +38,7 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
   - one that is killed leaves the line and a notification;
   - one that fails leaves the line without a second notification;
   - one that works leaves neither.
+- `CoreMLPredict`: `coreml_predict` through coremltools' own `predict()` code, with a stand-in for Core ML that keeps what it is given: Core ML gets only the copies BMeet watches (a float16 input too), and they are freed once it lets go.
 - `CoreMLInputs`, local only (CI has no models): the installed GigaAM, Nemotron and TitaNet on the Neural Engine, on Russian speech made with `say`, with pauses after each prediction longer than Core ML takes to let go of its inputs; and a speaker pass of an in-person recording.
 - `transcribe/tests/test_dictation.py`: the dictation engine releases its model when idle, loads it again for the next dictation, reads `unload-after` when it is needed, and lets go on memory pressure.
 - **Tests no longer reach the BMeet.app running on the Mac:**

@@ -29,11 +29,20 @@ npu-transcribe --help
 
 **Other ways to start it:**
 - **Dolphin:** right-click audio or video → **Transcribe (NPU)**. It runs in a Konsole window and sends a notification when done.
-- **BMeet app:** the **Transcribe a file** page has a queue and progress display.
+- **BMeet app:** the **Transcribe a file** page has a queue and progress display. Its **Engine** passes `--engine` and `--model`:
+
+  | Engine | passes | |
+  |---|---|---|
+  | Automatic (the default) | `--engine auto --model turbo` | GigaAM for Russian, given or detected, when it is installed and nothing is translated; Whisper turbo otherwise |
+  | GigaAM v3 (Russian) | `--engine gigaam --model turbo --language ru` | offered when GigaAM is installed and Russian is in `~/.config/bmeet/languages`; never with `--translate` |
+  | Whisper large-v3 turbo | `--engine whisper --model turbo` | |
+  | Whisper small | `--engine whisper --model small` | what Translate chooses (turbo was not trained to translate) |
+
+  With Automatic and GigaAM, turbo is the Whisper that redoes the sentences with English terms (below). The queue's *Options* column shows what will run, and, from npu-transcribe's `done:` line, what ran (`GigaAM v3 · ru`, `Whisper turbo · en`).
 
 ## Russian: GigaAM v3
 
-For Russian, npu-transcribe uses [GigaAM v3](https://github.com/salute-developers/GigaAM) (Sber, MIT; the *e2e CTC* variant, which writes punctuation and capitals). Whisper still detects the language, and it handles every other language and `--translate`. `--engine whisper` keeps Whisper for Russian too.
+For Russian, npu-transcribe uses [GigaAM v3](https://github.com/salute-developers/GigaAM) (Sber, MIT; the *e2e CTC* variant, which writes punctuation and capitals). Whisper still detects the language, and it handles every other language and `--translate`. `--engine whisper` keeps Whisper for Russian too, and `--engine gigaam` takes GigaAM without detecting the language. The BMeet app offers the same choice (*Engine*, above).
 
 **Measured** on 40 utterances (16 min, 2,286 words) of the Russian IT podcast [Podlodka](https://huggingface.co/datasets/bond005/podlodka_speech) (its test and validation splits). WER is on lower-case words without punctuation, ё = е.
 

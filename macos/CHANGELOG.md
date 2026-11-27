@@ -7,6 +7,21 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **The engine in the BMeet window's *Transcribe a File*:** *Automatic* (GigaAM v3 for Russian, Whisper turbo otherwise), *GigaAM v3 (Russian)*, *Whisper large-v3 turbo* or *Whisper small*. Before, the page offered only a Whisper size, so GigaAM could not be chosen or seen, though BMeet already used it for Russian. GigaAM is offered when it is installed and Russian is one of your languages; it sets the language to Russian, and Translate turns it off. The *Options* column says what ran (`GigaAM v3 · ru`).
+- **The window follows the features you turn off** (`~/.config/bmeet/dictation`, `meetings`, `in-person-meetings`, `file-transcription`) while it is open: their buttons, menu items and shortcuts (⌘3, ⌘O) go; the Meetings and Transcribed Files pages keep their lists. `bmeet-ctl dictate`, `lang` and `meeting start` then refuse, with status 3.
+- **The window and the meeting notifications in Russian,** after `~/.config/bmeet/interface-language`: `system` (the default: the first of the Mac's preferred languages that is English or Russian), `en` or `ru`. After a change, the open window offers **Restart**.
+- **`bmeet-ctl settings [PAGE]`** opens BMeet's Settings window on a page (`general`, `features`, `languages`, `shortcuts`, `about`); the window's *Settings…* (⌘,) and *About BMeet* use it. A BMeet.app that does not answer gets the folder `~/.config/bmeet`, as *Settings…* opened before.
+
+### Changed
+- **Languages in *Transcribe a File*:** *Detect automatically* and the languages that are on; English is no longer always offered.
+- **`bmeet-ctl status`** adds `features` and `interface_language`. Its `live_dictation` is `on` without the file, as BMeet.app reads it (it said `off`), and its `language` is always one of `languages` (the first, when the file names none of them).
+
+### Tests
+- **`bmeet/app/tests/test_bmeet.py`:** every text of the window and of bmeet-meeting's notifications has its Russian line (a test reads the sources); the window in Russian; a notification reaching a stand-in BMeet.app in Russian; the engine choice; the feature switches while the window is open, the Mac menus; `bmeet-ctl settings` with a stand-in control socket in a runtime folder of the test's own.
+
 ## [0.9.1] - 2026-10-27
 
 ### Added

@@ -7,6 +7,21 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **The engine in the app's *Transcribe a file*:** *Automatic* (GigaAM v3 for Russian, Whisper turbo otherwise), *GigaAM v3 (Russian)*, *Whisper large-v3 turbo* or *Whisper small*, passed to npu-transcribe as `--engine` and `--model`. Before, the page offered only a Whisper size, so GigaAM, which npu-transcribe already used for Russian, could not be chosen or seen. GigaAM is offered when it is installed and Russian is one of your languages; it sets the language to Russian, and Translate turns it off. The *Options* column says what ran (`GigaAM v3 · ru`), and *Transcribed files* names the model (`GigaAM v3`, `Whisper turbo`).
+- **Features can be turned off:** `~/.config/bmeet/dictation`, `meetings`, `in-person-meetings` and `file-transcription` saying `off`. Its controls leave the app while it is open (dictation's buttons, the buttons that start a meeting, the *Transcribe a file* page, Ctrl+O, *Transcribe again*); the *Meetings* and *Transcribed files* pages keep their lists. `bmeet-ctl dictate`, `bmeet-ctl lang` and `bmeet-ctl meeting start` then refuse, with status 3; stopping a meeting that runs still works.
+- **The app in Russian:** `~/.config/bmeet/interface-language` says `system` (the default: the locale, `LC_ALL`, `LC_MESSAGES` or `LANG`), `en` or `ru`. Every text of the app, language names included, comes from one table (`bmeet/app/bmeettext.py`); command-line output and transcripts stay English. After a change, the open app offers **Restart**.
+- **`bmeet-ctl settings [PAGE]`:** BMeet's settings; on Linux the folder `~/.config/bmeet`.
+
+### Changed
+- **Languages in *Transcribe a file*:** *Detect automatically* and the languages in `~/.config/bmeet/languages`; English is no longer always offered. The list follows the file while the app is open.
+- **`bmeet-ctl status`** adds `features` (`dictation`, `meetings`, `in_person_meetings`, `file_transcription`: true or false) and `interface_language` (`en` or `ru`). Every key it had stays, for the panel widget.
+
+### Tests
+- **`bmeet/app/tests/test_bmeet.py`:** a text of the app (or of macOS's meeting notifications) without its Russian line, or a Russian line without its text, fails a test that reads the sources. Also tested: the window in Russian, with nothing English left but names; the interface language from the setting and the locale; each engine, what it passes, GigaAM ↔ Russian ↔ Translate, the *Options* column, the options saved; each feature hiding exactly its controls and coming back while the window is open; `bmeet-ctl status`, its refusals, and `bmeet-ctl settings`.
+
 ## [0.8.2] - 2026-10-27
 
 ### Added

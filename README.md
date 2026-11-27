@@ -32,11 +32,13 @@ CPU and GPU are left alone. On a Mac it is a menu bar app with ⌃⌥ shortcuts:
   - Run `npu-transcribe talk.mp4`, or right-click a file in Dolphin → *Transcribe (NPU)*. You get `.srt` subtitles and a readable `.md` transcript.
   - `--speakers` (or *Transcribe with speakers* in Dolphin) labels the lines Speaker 1, Speaker 2, …
   - Whisper large-v3-turbo runs at ~25x realtime on the NPU.
+  - In the app's *Transcribe a file*, **Engine** chooses the model: *Automatic* (GigaAM v3 for Russian, Whisper turbo otherwise), *GigaAM v3 (Russian)*, *Whisper large-v3 turbo* or *Whisper small*. GigaAM is offered when it is installed and Russian is one of your languages; it sets the language to Russian, and Translate turns it off. The queue's *Options* column says which model ran (`GigaAM v3 · ru`).
 - **Russian with GigaAM v3** (Sber): about 20 % fewer word errors than Whisper on Russian conversation, at ~200x realtime on the NPU. It's used for Russian meetings and files automatically. GigaAM garbles English terms, so Whisper redoes the sentences where it hears some: on a Russian IT podcast, 54 % of the English terms came out right instead of 22 % (details in [docs/npu-transcribe.md](docs/npu-transcribe.md#english-terms-in-russian-speech)).
 - **Everything on the NPU:** speech recognition, language detection and telling the speakers apart. The CPU only decodes audio and does small arithmetic.
 - **BMeet app:**
   - Meeting history, transcribed files and a transcription queue, with search.
   - Export, copy and delete transcripts.
+  - In English or Russian (see [Configure](#configure)).
 - **Panel widget:** a microphone icon that shows what is happening (ready, listening, transcribing, recording). Click it for dictation, meeting and language controls and your recent transcripts.
 - **Several languages:** any language Whisper knows. **Meta+Shift+H** cycles through the ones you pick.
 
@@ -130,6 +132,7 @@ npu-transcribe interview.m4a                    # interview.srt + interview.md
 npu-transcribe --speakers interview.m4a         # ... with Speaker 1, Speaker 2, ...
 npu-transcribe --language de --translate a.ogg  # German speech -> English text
 bmeet-ctl status                                # JSON state (what the widget shows)
+bmeet-ctl settings                              # the settings (on Linux: the folder ~/.config/bmeet)
 voxtype meeting list                            # all meetings
 ```
 
@@ -161,7 +164,9 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 
 ## Configure
 
-- **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`.
+- **Dictation languages:** `~/.config/bmeet/languages`, for example `en de fr`. They are also the languages the app's *Transcribe a file* offers, next to *Detect automatically*.
+- **Features you don't use:** `~/.config/bmeet/dictation`, `meetings`, `in-person-meetings` and `file-transcription` each say `on` (the default) or `off`. A feature that is off disappears from the app while it is open: its buttons, its *Transcribe a file* page, its shortcuts in the app. What it made stays listed under *Meetings* and *Transcribed files*. `bmeet-ctl dictate` and `bmeet-ctl lang` then refuse, and so does `bmeet-ctl meeting start`; a meeting that runs can still be stopped. A refusal says why and exits with status 3.
+- **Interface language:** `~/.config/bmeet/interface-language` says `system` (the default: the first of your system's languages that is English or Russian, else English; on Linux the locale, `LC_ALL`, `LC_MESSAGES` or `LANG`), `en` or `ru`. The app, and on a Mac the meeting notifications, speak it; command-line output and transcripts stay English. After a change, the open app offers **Restart**.
 - **Text while you speak:** `~/.config/bmeet/live-dictation` says `on`, `panel` or `off` (the default; see above).
 - **Meeting speakers:** `~/.config/bmeet/speakers` says `on` or `off`. When two people end up as one, or one person is split in two, see [docs/troubleshooting.md](docs/troubleshooting.md#meeting-speakers).
 - **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.

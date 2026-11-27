@@ -309,7 +309,11 @@ class Controls(Base):
         self.f.act("unload:60")
         self.assertEqual(self.f.get("unload-after"), "60")
         self.f.set("unload-after", "10")   # (by hand: shown as it is)
-        self.assertIn("10 min", self.f.act("page:general")["texts"])
+        self.assertEqual(self.f.act("page:general")["unload"], "10 min")
+        self.f.set("unload-after", "90")   # (outside 0-60: the nearest end, as the engines read it)
+        self.assertEqual(self.f.act("page:general")["unload"], "60 minutes")
+        self.f.set("unload-after", "-3")
+        self.assertEqual(self.f.act("page:general")["unload"], "Right after use")
 
     def test_remembered_voices_ask_and_off_forgets_them(self) -> None:
         self.f.act("answer:no", "voices")

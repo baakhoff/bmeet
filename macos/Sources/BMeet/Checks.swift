@@ -368,7 +368,7 @@ enum Checks {
         out(["files": files, "shortcuts": app.hotKeys.labels, "page": window.page.rawValue, "title": window.window.title,
              "toolbar": (window.window.toolbar?.items ?? []).map(\.label), "message": window.shortcutMessage.stringValue,
              "rows": Array(window.rows.prefix(6)), "lang": Interface.language, "recording": window.recorders.values.contains(where: \.isRecording),
-             "texts": texts(in: window.window.contentView ?? NSView())])
+             "unload": window.unloadPopup.titleOfSelectedItem ?? "", "texts": texts(in: window.window.contentView ?? NSView())])
         return 0
     }
 

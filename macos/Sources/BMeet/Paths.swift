@@ -93,9 +93,11 @@ enum Settings {
         return Interface.languages.contains { $0.code == value } ? value : "system"
     }
     /// Minutes a process that waits for work keeps a model after its last use (0: none), 5 by default.
+    /// A number outside 0-60 counts as the nearest end, as npu-transcribe and bmeet-whisper read it.
     static var unloadAfter: Int {
-        guard let minutes = Int(word("unload-after", default: "5")), (0...60).contains(minutes) else { return 5 }
-        return minutes
+        guard let first = word("unload-after", default: "5").split(whereSeparator: \.isWhitespace).first,
+              let minutes = Int(first) else { return 5 }
+        return min(max(minutes, 0), 60)
     }
 
     static func set(_ name: String, _ value: String) { Paths.write(value, to: file(name)) }

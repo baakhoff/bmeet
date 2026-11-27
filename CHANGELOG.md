@@ -7,6 +7,21 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **The dictation model is released when you stop dictating:** with text while you speak on (`live-dictation`), `bmeet-dictate` ends its engine, and the memory its model takes, `unload-after` minutes after the last dictation. That is `~/.config/bmeet/unload-after`, in minutes (0–60, default 5; `0`: right after each dictation), read when it is needed. Before, the model stayed loaded for good (GigaAM ~0.6 GB, Whisper turbo ~3.8 GB).
+  - The next dictation starts the engine again. It starts recording first and loads the model while you speak, so nothing said meanwhile is lost.
+  - The engine (`npu-transcribe --dictate`) also releases its model on the same clock by itself.
+  - voxtype keeps its own whisper-small loaded, as before: its `on_demand_loading` would load the model for every dictation (~3 s each time), with no idle timer to choose instead.
+- **`npu-transcribe --queue`:** runs started with it go one at a time (a lock in `$XDG_RUNTIME_DIR/bmeet`, which a crash lets go of too). A file started while another is being transcribed then waits instead of loading the models a second time. Dolphin's menu does not pass it yet.
+
+### Tests
+- `transcribe/tests/test_dictation.py`: the dictation engine releases its model when idle, loads it again for the next dictation, and reads `unload-after` when it is needed.
+- `bmeet/dictate/tests/test_dictate.py`:
+  - the engine ends after a dictation when `unload-after` is 0, and the next dictation starts a new one;
+  - run on a Mac, its `bmeet-ctl` calls had reached the BMeet.app running there (bmeet-ctl's Mac path). They now take the Linux path, in a runtime folder of their own, and the file refuses to start a command that could reach the Mac's.
+
 ## [0.8.2] - 2026-10-27
 
 ### Added

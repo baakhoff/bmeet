@@ -18,8 +18,9 @@ BMeet does all of it, with the same pieces:
   BMeet window shows. When the meeting stops, it becomes the Markdown copy in
   ~/Documents/Meetings (YYYY-MM-DD_HHMM-meeting.md, as on Linux).
 - npu-transcribe --meeting (the speaker pass: Person 1, Person 2, ...) then replaces it, and the
-  audio is deleted. With ~/.config/bmeet/speakers "off" there is no speaker pass and the audio
-  is deleted as soon as the live transcript is done.
+  audio is deleted. A pass that fails or crashes leaves the live copy, with a line that says the
+  voices were not told apart (and a notification). With ~/.config/bmeet/speakers "off" there is no
+  speaker pass and the audio is deleted as soon as the live transcript is done.
 - The meetings are listed in ~/.local/share/bmeet/meetings/index.db, with the columns of
   voxtype's index, so bmeet-ctl and the BMeet app read both alike.
 The state goes where bmeet-ctl looks for voxtype's: $XDG_RUNTIME_DIR/bmeet/meeting_state
@@ -210,7 +211,8 @@ def unit_stop(name: str, sig: int = signal.SIGINT, timeout: float = 15.0) -> Non
 
 def run_unit(argv: list[str]) -> int:
     """run-unit NAME [--nice N] [--after JSON] -- CMD...: the unit itself. Passes SIGINT/SIGTERM
-    on to CMD, waits for it, runs --after, removes its pid file."""
+    on to CMD, waits for it, runs --after (with CMD's exit status in BMEET_UNIT_STATUS: negative
+    for a signal, as Python gives it), removes its pid file."""
     name, rest = argv[0], argv[1:]
     nice, after = 0, None
     while rest and rest[0] != "--":
@@ -237,7 +239,7 @@ def run_unit(argv: list[str]) -> int:
     code = child.wait()
     print(f"{PROG}: unit {name} ended with status {code}", file=sys.stderr, flush=True)
     if after:
-        subprocess.run(after, check=False)
+        subprocess.run(after, check=False, env=dict(os.environ, BMEET_UNIT_STATUS=str(code)))
     if read_first_line(pid_file) == str(os.getpid()):
         pid_file.unlink(missing_ok=True)
     return code
@@ -520,13 +522,56 @@ def speaker_pass(name: str, folder: Path, file: Path) -> None:
     voices = ["--voices", str(VOICES_DIR)] if on("remember-voices", "off") else []
     (folder / "speaker-pass").write_text(f"{file}\n")
     cmd = [PYTHON, "-I", str(TRANSCRIBE), "--meeting", str(folder), "--output", str(file), *voices, "--notify"]
-    after = ["rm", "-rf", str(folder)]
+    after = [PYTHON, "-I", str(Path(__file__).resolve()), "speakers-ended", name, str(file)]
     whisper_up()
     if not unit_start(f"bmeet-speakers-{name}", cmd, after=after, nice=10):
-        subprocess.run(after, check=False)
-        notify("Speakers not told apart", "Could not start npu-transcribe; the transcript has You/Remote only", ok=False)
+        speakers_ended(name, file, None)
     # (a separate unit drops the RAM disk when the pass is over)
     unit_start(f"bmeet-cleanup-{name}", [PYTHON, "-I", str(Path(__file__).resolve()), "wait-and-cleanup", name])
+
+
+LIVE_MARKS = ("- **Transcribed:** as people talked (live)", "- **Live:** transcribed as people talk")
+
+
+def speakers_ended(name: str, file: Path, status: int | None) -> int:
+    """speakers-ended NAME FILE: the `after` of the speaker pass's unit (its exit status in
+    BMEET_UNIT_STATUS; None: it could not be started). The recording is deleted, however the pass
+    ended. If it failed, the transcript is still the one written during the meeting: a line under
+    its Meeting Info says the voices were not told apart, and why. npu-transcribe reports its own
+    errors (status 1, with a notification); one that crashed or was killed cannot, so this does."""
+    if status is None:
+        how = "could not be started"
+    elif status < 0:
+        try:
+            sig = signal.Signals(-status).name
+        except ValueError:
+            sig = f"signal {-status}"
+        crash = sig in ("SIGSEGV", "SIGBUS", "SIGILL", "SIGABRT", "SIGFPE", "SIGTRAP")
+        how = f"{'crashed' if crash else 'was ended'} ({sig})"
+    else:
+        how = f"ended with status {status}"
+    if status != 0:
+        log(f"the speaker pass of {name} {how}")
+        try:
+            text = file.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        head, sep, rest = text.partition("\n\n## Transcript\n")
+        if sep and any(mark in head for mark in LIVE_MARKS):   # (not replaced by the pass)
+            tmp = file.with_name(f".{file.name}.{os.getpid()}")
+            with contextlib.suppress(OSError):
+                tmp.write_text(f"{head}\n- **Speaker pass:** the voices were not told apart: it {how}{sep}{rest}",
+                               encoding="utf-8")
+                tmp.replace(file)
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+        if status != 1:
+            notify("Speakers not told apart",
+                   f"The speaker pass {how}. The transcript stays as it was written during the meeting: {file}",
+                   ok=False)
+    if name:
+        subprocess.run(["rm", "-rf", str(AUDIO_ROOT / name)], check=False)
+    return 0
 
 
 def wait_and_cleanup(name: str) -> int:
@@ -659,6 +704,12 @@ def main(argv: list[str]) -> int:
         return run_unit(args)
     if cmd == "wait-and-cleanup":
         return wait_and_cleanup(args[0])
+    if cmd == "speakers-ended":
+        try:
+            status = int(os.environ.get("BMEET_UNIT_STATUS", "0"))
+        except ValueError:
+            status = 0
+        return speakers_ended(args[0], Path(args[1]), status)
     if cmd == "recorder-ended":
         return recorder_ended(args[0])
     if cmd == "list":

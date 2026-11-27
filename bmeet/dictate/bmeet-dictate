@@ -3,8 +3,11 @@
 
 When ~/.config/bmeet/live-dictation says "on" (or "panel"), `bmeet-ctl dictate` (Meta+H,
 Meta+Alt+H) and `bmeet-ctl cancel` come here instead of going to voxtype (docs/live-dictation.md).
-The first one starts this as the user unit bmeet-dictate, which keeps `npu-transcribe --dictate`
-(the speech model on the NPU: GigaAM for Russian, Whisper for the other languages) loaded.
+The first one starts this as the user unit bmeet-dictate, which runs `npu-transcribe --dictate`
+(the speech model on the NPU: GigaAM for Russian, Whisper for the other languages). The engine,
+and the memory its model takes, goes `unload-after` minutes after the last dictation
+(~/.config/bmeet/unload-after, 0-60, default 5; 0: right after each dictation), and the next
+dictation starts it again: it starts recording first and loads the model meanwhile.
 
 "on": the text goes into the text field you are in while you speak. KWin runs one input method
 at a time (System Settings > Keyboard > Virtual Keyboard); for the length of a dictation this
@@ -32,7 +35,7 @@ transcribing).
 Env (tests): BMEET_DICTATE_ENGINE (the engine command, default: npu-transcribe), BMEET_DICTATE_OUTPUT
 =file:PATH (append what would be pasted or copied to PATH instead: nothing is typed or copied),
 BMEET_DICTATE_SOURCE=FILE (that audio instead of the microphone), BMEET_RUNTIME_DIR, BMEET_STATE_DIR,
-VOXTYPE_CONFIG.
+VOXTYPE_CONFIG, BMEET_UNLOAD_AFTER_SECONDS (`unload-after` in seconds).
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -63,6 +67,9 @@ MODE_FILE = CONFIG / "bmeet/live-dictation"
 SLOT_FILE = STATE_DIR / "input-method.json"   # what KWin's input-method slot held before a dictation
 IM_DESKTOP = RUNTIME / "bmeet-im.desktop"      # how KWin starts bmeet-im (written at start-up)
 VOXTYPE_CONFIG = Path(os.environ.get("VOXTYPE_CONFIG") or CONFIG / "voxtype/config.toml")
+UNLOAD_FILE = CONFIG / "bmeet/unload-after"
+UNLOAD_AFTER_DEFAULT = 5 * 60.0   # seconds (the setting is in minutes)
+IDLE_LOOK_MS = 30_000         # while the engine waits, the setting is read again this often
 MAX_SECONDS = 120             # voxtype's [audio] max_duration_secs
 SHOWN_CHARS = 400             # the panel shows the end of the text (about three lines)
 PANEL_GRACE_MS = 600          # no text field took the input method this long after the start: the panel
@@ -72,6 +79,21 @@ PASTE_KEYS = ["29:1", "47:1", "47:0", "29:0"]   # Ctrl+V for ydotool (voxtype's 
 
 def log(msg: str) -> None:
     print(f"{PROG}: {msg}", file=sys.stderr, flush=True)
+
+
+def unload_after() -> float:
+    """Seconds the engine waits after a dictation before it goes: ~/.config/bmeet/unload-after, in
+    minutes (0-60; a number outside counts as the nearest end, a missing or unreadable file as 5),
+    read each time. As npu-transcribe's unload_after(); BMEET_UNLOAD_AFTER_SECONDS: tests only."""
+    try:
+        if (seconds := float(os.environ.get("BMEET_UNLOAD_AFTER_SECONDS", "-1"))) >= 0:
+            return seconds
+    except ValueError:
+        pass
+    try:
+        return min(max(int(UNLOAD_FILE.read_text(encoding="utf-8").split()[0]), 0), 60) * 60.0
+    except (OSError, ValueError, IndexError, UnicodeDecodeError):
+        return UNLOAD_AFTER_DEFAULT
 
 
 def mode() -> str:
@@ -350,30 +372,56 @@ def serve() -> int:
             self.commit_wait = QTimer(self)
             self.commit_wait.setSingleShot(True)
             self.commit_wait.timeout.connect(lambda: self.finish(None))
+            self.idle = QTimer(self)           # the engine goes `unload-after` after the last dictation
+            self.idle.setSingleShot(True)
+            self.idle.timeout.connect(self.idle_check)
+            self.idle_since = time.monotonic()
             self.set_state("idle")
             write_im_desktop()
             if SLOT_FILE.exists():   # (an earlier run ended while it held the slot)
                 self.give_back("left over from an earlier run")
-            self.start_engine()
+            self.start_engine(preload=True)
 
         # -- the engine
-        def start_engine(self) -> None:
-            cmd = engine_command() + ["--dictate", "--language", dictation_language()]
-            self.engine = QProcess(self)
-            self.engine.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedErrorChannel)
-            self.engine.readyReadStandardOutput.connect(self.engine_output)
-            self.engine.finished.connect(self.engine_gone)
+        def start_engine(self, preload: bool = False) -> None:
+            """preload (the first one): it loads the model for the dictation language before it
+            says it is ready. Later ones load it at their first start, after they have started
+            recording, so what is said while the model loads is kept."""
+            cmd = engine_command() + ["--dictate"] + (["--language", dictation_language()] if preload else [])
+            engine = self.engine = QProcess(self)
+            engine.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedErrorChannel)
+            engine.readyReadStandardOutput.connect(lambda: self.engine_output(engine))
+            engine.finished.connect(lambda *_: self.engine_gone(engine))
             self.ready, self.out = False, b""
-            self.engine.start(cmd[0], cmd[1:])
+            engine.start(cmd[0], cmd[1:])
             log(f"engine: {shlex.join(cmd)}")
+
+        def idle_soon(self) -> None:
+            """No dictation now: the engine goes `unload-after` from now (the setting is read again
+            at least every IDLE_LOOK_MS, so a change applies while it waits)."""
+            self.idle_since = time.monotonic()
+            self.idle.start(min(IDLE_LOOK_MS, int(unload_after() * 1000)))
+
+        def idle_check(self) -> None:
+            if self.engine is None or self.state != "idle" or self.queued:
+                return
+            waited, keep = time.monotonic() - self.idle_since, unload_after()
+            if waited < keep:
+                self.idle.start(min(IDLE_LOOK_MS, int((keep - waited) * 1000) + 1))
+                return
+            log(f"engine: ended after {waited:.0f} s without a dictation (unload-after); the next one starts it again")
+            engine, self.engine, self.ready = self.engine, None, False
+            engine.closeWriteChannel()         # (it ends when its stdin closes)
 
         def to_engine(self, event: dict) -> None:
             if self.engine is not None:
                 self.engine.write(json.dumps(event).encode() + b"\n")
 
-        def engine_output(self) -> None:
-            assert self.engine is not None
-            self.out += bytes(self.engine.readAllStandardOutput())
+        def engine_output(self, engine: QProcess) -> None:
+            data = bytes(engine.readAllStandardOutput())
+            if engine is not self.engine:      # (one that was let go and is still ending)
+                return
+            self.out += data
             while b"\n" in self.out:
                 line, self.out = self.out.split(b"\n", 1)
                 try:
@@ -388,6 +436,8 @@ def serve() -> int:
                 if self.queued:
                     queued, self.queued = self.queued, None
                     self.begin(queued == "clipboard")
+                elif self.state == "idle":
+                    self.idle_soon()
             elif ev.get("started"):
                 log(f"dictating: {ev.get('language')}, {ev.get('model')} on {ev.get('device')}"
                     + (", into the text field" if self.taken else ""))
@@ -412,7 +462,10 @@ def serve() -> int:
                 self.limit.stop()
                 self.end_dictation()
 
-        def engine_gone(self) -> None:
+        def engine_gone(self, engine: QProcess) -> None:
+            engine.deleteLater()
+            if engine is not self.engine:      # (let go of when idle: ended as asked)
+                return
             if self.state != "idle":
                 log("ERROR: the engine stopped during a dictation")
                 self.limit.stop()
@@ -513,6 +566,7 @@ def serve() -> int:
             self.panel.show_text(text + (" …" if self.state == "transcribing" else ""))
 
         def begin(self, clipboard: bool) -> None:
+            self.idle.stop()
             if self.engine is None:
                 self.start_engine()
             self.clipboard, self.final, self.draft, self.committed, self.text = clipboard, "", "", "", ""
@@ -553,6 +607,7 @@ def serve() -> int:
             if self.taken:
                 self.to_im({"cancel": True})
                 self.give_back()
+            self.idle_soon()
 
         def command(self, line: str) -> dict:
             words = line.split()
@@ -580,7 +635,8 @@ def serve() -> int:
                 return {"error": f"unknown command: {cmd}"}
             return {"state": self.state, "final": self.final, "draft": self.draft, "mode": mode(),
                     "panel": self.panel.isVisible(), "panel_text": self.panel.rich if self.panel.isVisible() else "",
-                    "field": self.field, "input_method": self.taken, "engine_ready": self.ready, "last": self.last}
+                    "field": self.field, "input_method": self.taken, "engine": self.engine is not None,
+                    "engine_ready": self.ready, "last": self.last}
 
         def connection(self) -> None:
             conn = self.server.nextPendingConnection()

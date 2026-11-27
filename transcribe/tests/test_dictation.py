@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests of npu-transcribe's dictation (--dictate, --dictate-file): the text while you
-speak, when words become final, long dictations, and the engine's commands and events. No models,
+speak, when words become final, long dictations, the engine's commands and events, and when it
+lets go of its model (unload-after, memory pressure); also the file queue (--queue). No models,
 no NPU, no microphone: a fake model hears each word as a burst of noise of its own loudness.
 
 Run: python3 -I transcribe/tests/test_dictation.py -v      (needs numpy; the server test, ffmpeg)
@@ -299,9 +300,12 @@ while True:
 
 
 class Server(unittest.TestCase):
-    """--dictate: commands on stdin, events on stdout (the fake model, a file instead of the microphone)."""
+    """--dictate: commands on stdin, events on stdout (the fake model, a file instead of the microphone).
+    The harness says on stderr when the engine loads a model ("harness: load ru") and lets go of
+    them ("harness: release"); macOS's memory pressure is "warning" while HARNESS_PRESSURE names a
+    file that exists, and the engine looks every HARNESS_TICK seconds while it waits."""
     HARNESS = r"""
-import importlib.machinery, importlib.util, sys
+import importlib.machinery, importlib.util, os, sys
 sys.path.insert(0, sys.argv[1])
 import json
 import test_dictation as t
@@ -310,7 +314,12 @@ t.VOCAB.words = json.loads(sys.argv[2])
 class Engines:
     _whisper = _gigaam = None
     def for_language(self, language, words=False):
+        print(f"harness: load {language}", file=sys.stderr, flush=True)
         return (t.FakeGigaAM() if language == "ru" else t.FakeWhisper()), language
+    def release(self):
+        print("harness: release", file=sys.stderr, flush=True)
+nt.memory_pressure = lambda: "warning" if os.path.exists(os.environ.get("HARNESS_PRESSURE", "/nonexistent")) else ""
+nt.IDLE_TICK = float(os.environ.get("HARNESS_TICK", nt.IDLE_TICK))
 args = nt.parse_args(["--dictate", "--language", "ru"])
 sys.exit(nt.dictate_serve(args, Engines()))
 """
@@ -319,9 +328,53 @@ sys.exit(nt.dictate_serve(args, Engines()))
         self.tmp = HERE / ".work-dictation"
         shutil.rmtree(self.tmp, ignore_errors=True)
         self.tmp.mkdir()
+        # (the setting from a folder of this test's own, never your ~/.config/bmeet; on a Mac a
+        # runtime folder of its own too, never the running BMeet's)
+        self.env = dict(os.environ, XDG_CONFIG_HOME=str(self.tmp / "config"), BMEET_RUNTIME_ROOT=str(self.tmp / "run"))
+        for k in ("BMEET_UNLOAD_AFTER_SECONDS", "HARNESS_PRESSURE", "HARNESS_TICK"):
+            self.env.pop(k, None)
+        (self.tmp / "config/bmeet").mkdir(parents=True)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def engine(self, **env) -> subprocess.Popen:
+        """The engine in the harness, its stderr in self.tmp/stderr (self.said())."""
+        self.err = open(self.tmp / "stderr", "w")
+        self.addCleanup(self.err.close)
+        proc = subprocess.Popen([sys.executable, "-I", "-c", self.HARNESS, str(HERE), json.dumps(VOCAB.words)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, text=True,
+                                env=dict(self.env, **env))
+
+        def end() -> None:
+            proc.kill()
+            proc.wait()
+            for f in (proc.stdin, proc.stdout):
+                if not f.closed:
+                    f.close()
+        self.addCleanup(end)
+        return proc
+
+    def said(self) -> list[str]:
+        """The harness's lines and the engine's own about letting go, so far."""
+        return [line.strip() for line in (self.tmp / "stderr").read_text().splitlines()
+                if line.startswith("harness:") or "released" in line]
+
+    def wait_said(self, line: str, count: int, timeout: float = 5.0) -> None:
+        end = time.monotonic() + timeout
+        while sum(line in x for x in self.said()) < count:
+            if time.monotonic() > end:
+                self.fail(f"not {count} x {line!r}: {self.said()}")
+            time.sleep(0.05)
+
+    def dictation(self, proc, wav: Path, language: str = "ru") -> dict:
+        """One dictation of `wav` (at 4x), to its "done" event."""
+        send = lambda cmd: (proc.stdin.write(json.dumps(cmd) + "\n"), proc.stdin.flush())
+        send({"start": {"language": language, "file": str(wav), "speed": 4}})
+        self.read_until(proc, "started")
+        time.sleep(1.0)
+        send({"stop": {}})
+        return self.read_until(proc, "done")[-1]
 
     def wav(self, speech: Speech) -> Path:
         path = self.tmp / "said.wav"
@@ -351,7 +404,7 @@ sys.exit(nt.dictate_serve(args, Engines()))
         wav = self.wav(s)
         proc = subprocess.Popen([sys.executable, "-I", "-c", self.HARNESS, str(HERE),
                                  json.dumps(VOCAB.words)], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=self.env)
         try:
             ready = self.read_until(proc, "ready")[-1]
             self.assertEqual((ready["language"], ready["model"]), ("ru", "gigaam-v3-ctc"))
@@ -379,6 +432,106 @@ sys.exit(nt.dictate_serve(args, Engines()))
             for f in (proc.stdin, proc.stdout):
                 if not f.closed:
                     f.close()
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_idle_model_goes_and_comes_back(self):
+        # unload-after (here 0.5 s, the tests' own override): the model loaded at the start goes
+        # when nothing is dictated, the next dictation loads it again and hears everything, and it
+        # goes again afterwards
+        s = Speech().say("Alpha bravo charlie.", pause=0.8)
+        wav = self.wav(s)
+        proc = self.engine(BMEET_UNLOAD_AFTER_SECONDS="0.5")
+        self.read_until(proc, "ready")
+        self.wait_said("harness: release", 1)
+        self.assertEqual(self.said()[0], "harness: load ru")
+        self.assertTrue(any("dictation: released gigaam-v3-ctc (unused for" in x for x in self.said()), self.said())
+        self.assertEqual(self.dictation(proc, wav)["text"], "Alpha bravo charlie.")
+        self.wait_said("harness: release", 2)
+        harness = [x for x in self.said() if x.startswith("harness:")]
+        self.assertEqual(harness, ["harness: load ru", "harness: release", "harness: load ru", "harness: release"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_the_setting_is_read_when_it_is_needed(self):
+        # ~/.config/bmeet/unload-after changed between two dictations: 60 minutes keeps the
+        # model after the first, 0 lets it go right after the second, without a restart
+        s = Speech().say("Delta echo.", pause=0.8)
+        wav = self.wav(s)
+        setting = self.tmp / "config/bmeet/unload-after"
+        setting.write_text("60\n")
+        proc = self.engine(HARNESS_TICK="0.1")
+        self.read_until(proc, "ready")
+        self.assertEqual(self.dictation(proc, wav)["text"], "Delta echo.")
+        time.sleep(1.0)
+        self.assertNotIn("harness: release", self.said())
+        setting.write_text("0\n")
+        self.assertEqual(self.dictation(proc, wav)["text"], "Delta echo.")
+        self.wait_said("harness: release", 1, timeout=2.0)
+        self.assertTrue(any("(unload-after is 0)" in x for x in self.said()), self.said())
+        self.assertEqual(sum(x == "harness: load ru" for x in self.said()), 1)   # (kept for the second)
+
+    def test_memory_pressure_lets_go_of_the_model(self):
+        # macOS says memory is short while the engine waits with a model: it goes at the next look,
+        # though unload-after (60 minutes) would keep it
+        (self.tmp / "config/bmeet/unload-after").write_text("60\n")
+        pressure = self.tmp / "pressure"
+        proc = self.engine(HARNESS_PRESSURE=str(pressure), HARNESS_TICK="0.1")
+        self.read_until(proc, "ready")
+        time.sleep(0.5)
+        self.assertNotIn("harness: release", self.said())
+        pressure.touch()
+        self.wait_said("harness: release", 1, timeout=2.0)
+        self.assertTrue(any("(memory pressure: warning)" in x for x in self.said()), self.said())
+
+
+class FileQueue(unittest.TestCase):
+    """--queue: runs take BMeet's file queue one at a time; one that crashes lets go of it."""
+    HOLD = r"""
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("npu_transcribe", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+nt = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = nt
+loader.exec_module(nt)
+turn = nt.wait_for_turn()
+print("my turn", flush=True)
+sys.stdin.readline()
+"""
+
+    def setUp(self):
+        self.tmp = HERE / ".work-queue"
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.tmp.mkdir()
+        # (its runtime folder: on a Mac BMEET_RUNTIME_ROOT, never the running BMeet's)
+        self.env = dict(os.environ, BMEET_RUNTIME_ROOT=str(self.tmp), XDG_RUNTIME_DIR=str(self.tmp))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_holding(self) -> subprocess.Popen:
+        p = subprocess.Popen([sys.executable, "-I", "-c", self.HOLD, str(TOOL)], env=self.env, text=True,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: (p.kill(), p.wait(), p.stdin.close(), p.stdout.close(), p.stderr.close()))
+        return p
+
+    def has_turn(self, p: subprocess.Popen, within: float) -> bool:
+        return bool(select.select([p.stdout], [], [], within)[0]) and p.stdout.readline().strip() == "my turn"
+
+    def test_one_at_a_time_and_a_crash_lets_go(self):
+        first = self.run_holding()
+        self.assertTrue(self.has_turn(first, 15))
+        self.assertTrue((self.tmp / "bmeet/file-queue.lock").exists())
+        second = self.run_holding()
+        self.assertFalse(self.has_turn(second, 1.5))      # (waits while the first holds it)
+        first.kill()                                       # (as a crash ends it)
+        self.assertTrue(self.has_turn(second, 15))
+        second.stdin.close()
+        self.assertEqual(second.wait(10), 0)
+        self.assertIn("waiting for the file transcription started before this one", second.stderr.read())
+
+    def test_only_for_files(self):
+        with self.assertRaises(SystemExit):
+            nt.parse_args(["--queue", "--live", "/tmp/x"])
+        self.assertTrue(nt.parse_args(["--queue", "a.wav"]).queue)
 
 
 if __name__ == "__main__":

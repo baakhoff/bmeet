@@ -25,7 +25,7 @@ Meta+H, Meta+Alt+H, the widget and the app then go to BMeet's dictation (`bmeet-
   - **Your setting is safe:** it is written to `~/.local/state/bmeet/input-method.json` before anything changes, and that note is only deleted once it is put back. If BMeet crashes or the laptop reboots mid-dictation, the next start of `bmeet-dictate` puts it back.
   - **The cost:** during a dictation the on-screen keyboard can't come up (in tablet mode, tapping a field shows none until you stop).
 - **`panel`:** nothing in KWin.
-- **Both:** `bmeet-dictate` runs as the user unit `bmeet-dictate`, started by the first Meta+H. It keeps the model for your language loaded: GigaAM ~0.6 GB, Whisper turbo ~3.8 GB. voxtype's daemon keeps running for meetings. The microphone (`pw-record`, named *BMeet dictation*) is only open while you dictate.
+- **Both:** `bmeet-dictate` runs as the user unit `bmeet-dictate`, started by the first Meta+H. It keeps the model for your language loaded between dictations (GigaAM ~0.6 GB, Whisper turbo ~3.8 GB), for `unload-after` minutes after the last one (`~/.config/bmeet/unload-after`, default 5; `0`: right after each dictation). It then ends the engine, and the next Meta+H starts it again: it records at once and loads the model meanwhile, so nothing you say is lost. voxtype's daemon keeps running for meetings. The microphone (`pw-record`, named *BMeet dictation*) is only open while you dictate.
 
 ## How it works
 

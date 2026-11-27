@@ -11,11 +11,24 @@ enum Paths {
         (env["XDG_CONFIG_HOME"].map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent(".config"))
             .appendingPathComponent("bmeet")
     }
+    /// bmeet-ctl's last update check (update.json) is in here.
+    static var cache: URL {
+        (env["XDG_CACHE_HOME"].map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent(".cache"))
+            .appendingPathComponent("bmeet")
+    }
+    /// The models (macos/install.sh, npu-transcribe's MODELS_DIR).
+    static var models: URL { env["NPU_MODELS_DIR"].map { URL(fileURLWithPath: $0) } ?? data.appendingPathComponent("npu-models") }
+    /// The remembered voices (the window's VOICES_DIR).
+    static var voices: URL { env["BMEET_VOICES_DIR"].map { URL(fileURLWithPath: $0) } ?? data.appendingPathComponent("bmeet/voices") }
 
     /// BMeet's program files: $BMEET_SRC, else the install (~/.local/share/bmeet/src).
     static var src: URL { env["BMEET_SRC"].map { URL(fileURLWithPath: $0) } ?? data.appendingPathComponent("bmeet/src") }
     /// The venv's Python (numpy, Core ML, PyQt6).
-    static var python: URL { env["BMEET_PYTHON"].map { URL(fileURLWithPath: $0) } ?? data.appendingPathComponent("bmeet/venv/bin/python") }
+    static var python: URL {
+        pythonForCheck ?? env["BMEET_PYTHON"].map { URL(fileURLWithPath: $0) } ?? data.appendingPathComponent("bmeet/venv/bin/python")
+    }
+    /// A check that is given no stand-in for Python runs none of BMeet's programs: /usr/bin/false.
+    static var pythonForCheck: URL?
 
     static var ctl: URL { src.appendingPathComponent("bmeet/bmeet-ctl") }
     static var meeting: URL { src.appendingPathComponent("macos/bmeet-meeting") }
@@ -36,7 +49,8 @@ enum Paths {
         return URL(fileURLWithPath: root).appendingPathComponent("bmeet")
     }
 
-    static var logs: URL { home.appendingPathComponent("Library/Logs/BMeet") }
+    /// ~/Library/Logs/BMeet ($BMEET_LOGS: a test's own folder).
+    static var logs: URL { env["BMEET_LOGS"].map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent("Library/Logs/BMeet") }
 
     static func read(_ url: URL, default value: String = "") -> String {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return value }
@@ -50,21 +64,111 @@ enum Paths {
     }
 }
 
-/// The settings BMeet keeps in ~/.config/bmeet (one word per file, as on Linux).
+/// The settings BMeet keeps in ~/.config/bmeet: one value per file, as on Linux, a missing file
+/// meaning the default. Each is read when it is needed (the Settings window, the BMeet window and
+/// bmeet-ctl write them; docs/macos.md lists them).
 enum Settings {
-    static var language: String { Paths.read(Paths.config.appendingPathComponent("language"), default: "en") }
+    static func file(_ name: String) -> URL { Paths.config.appendingPathComponent(name) }
+    static func word(_ name: String, default value: String) -> String { Paths.read(file(name), default: value) }
+
+    /// The current dictation language, always one of `languages`: the first of them while the file
+    /// names none of them (missing, written by hand, or a `bmeet-ctl lang` to one that is off), as
+    /// bmeet-ctl reads it too.
+    static var language: String {
+        let on = languages
+        let chosen = word("language", default: on[0]).lowercased()
+        return on.contains(chosen) ? chosen : on[0]
+    }
     static var languages: [String] {
-        let words = Paths.read(Paths.config.appendingPathComponent("languages"), default: "en")
+        let words = word("languages", default: "en")
             .replacingOccurrences(of: ",", with: " ").split(separator: " ").map { $0.lowercased() }
         var seen = Set<String>()
-        return words.filter { $0.range(of: "^[a-z]{2,3}$", options: .regularExpression) != nil && seen.insert($0).inserted }
+        let codes = words.filter { $0.range(of: "^[a-z]{2,3}$", options: .regularExpression) != nil && seen.insert($0).inserted }
+        return codes.isEmpty ? ["en"] : codes
     }
     /// Text while you speak: "on" (the default on a Mac: a panel shows it) or "off".
-    static var liveText: Bool { Paths.read(Paths.config.appendingPathComponent("live-dictation"), default: "on") != "off" }
-    static var speakers: Bool { Paths.read(Paths.config.appendingPathComponent("speakers"), default: "on") == "on" }
-    static var startAtLogin: Bool { Paths.read(Paths.config.appendingPathComponent("start-at-login"), default: "on") == "on" }
+    static var liveText: Bool { word("live-dictation", default: "on") != "off" }
+    static var speakers: Bool { word("speakers", default: "on") == "on" }
+    static var startAtLogin: Bool { word("start-at-login", default: "on") == "on" }
     /// Look for a newer release once a day (bmeet-ctl update --check --auto): "on" (the default) or "off".
-    static var updateCheck: Bool { Paths.read(Paths.config.appendingPathComponent("update-check"), default: "on") != "off" }
+    static var updateCheck: Bool { word("update-check", default: "on") != "off" }
+    /// Voice fingerprints of the people you named (off unless you turn them on; README, Privacy).
+    static var rememberVoices: Bool { word("remember-voices", default: "off") == "on" }
+    /// "system" (the default), "en" or "ru"; anything else counts as "system".
+    static var interfaceLanguage: String {
+        let value = word("interface-language", default: "system").lowercased()
+        return Interface.languages.contains { $0.code == value } ? value : "system"
+    }
+    /// Minutes a process that waits for work keeps a model after its last use (0: none), 5 by default.
+    /// A number outside 0-60 counts as the nearest end, as npu-transcribe and bmeet-whisper read it.
+    static var unloadAfter: Int {
+        guard let first = word("unload-after", default: "5").split(whereSeparator: \.isWhitespace).first,
+              let minutes = Int(first) else { return 5 }
+        return min(max(minutes, 0), 60)
+    }
 
-    static func set(_ name: String, _ value: String) { Paths.write(value, to: Paths.config.appendingPathComponent(name)) }
+    static func set(_ name: String, _ value: String) { Paths.write(value, to: file(name)) }
+
+    /// The dictation languages that are on (never none), and the current one among them: it
+    /// stays if it is still on, else the first one takes its place.
+    static func setLanguages(_ codes: [String]) {
+        var seen = Set<String>()
+        let on = codes.filter { seen.insert($0).inserted }
+        guard !on.isEmpty else { return }
+        set("languages", on.joined(separator: " "))
+        if !on.contains(word("language", default: "").lowercased()) { set("language", on[0]) }
+    }
+
+    /// Everything BMeet.app follows, read at once: compared with the last reading, it says what
+    /// changed (AppDelegate.settingsChanged).
+    struct Snapshot: Equatable {
+        var features: [Feature: Bool] = [:]
+        var hotkeys = ""
+        var interfaceLanguage = ""
+        var languages: [String] = []
+        var language = ""
+        var liveText = true, speakers = true, rememberVoices = false, startAtLogin = true, updateCheck = true
+        var unloadAfter = 5
+
+        static func read() -> Snapshot {
+            var s = Snapshot()
+            for f in Feature.allCases { s.features[f] = f.isOn }
+            s.hotkeys = (try? String(contentsOf: file("hotkeys"), encoding: .utf8)) ?? ""
+            s.interfaceLanguage = Settings.interfaceLanguage
+            s.languages = Settings.languages
+            s.language = Settings.language
+            s.liveText = Settings.liveText
+            s.speakers = Settings.speakers
+            s.rememberVoices = Settings.rememberVoices
+            s.startAtLogin = Settings.startAtLogin
+            s.updateCheck = Settings.updateCheck
+            s.unloadAfter = Settings.unloadAfter
+            return s
+        }
+    }
+}
+
+/// What can be turned off in Settings → Features. A feature that is off is gone from BMeet.app:
+/// its shortcuts, its menu items, its panel and notifications; the control socket refuses it.
+enum Feature: String, CaseIterable {
+    case dictation
+    case meetings
+    case inPersonMeetings = "in-person-meetings"
+    case fileTranscription = "file-transcription"
+
+    var isOn: Bool { Settings.word(rawValue, default: "on") != "off" }
+
+    func set(_ on: Bool) { Settings.set(rawValue, on ? "on" : "off") }
+
+    /// The shortcuts that belong to it (HotKeys.defaults).
+    var hotKeys: [String] {
+        switch self {
+        case .dictation: return ["dictate", "dictate-clipboard", "language"]
+        case .meetings: return ["meeting"]
+        case .inPersonMeetings: return ["meeting-in-person"]
+        case .fileTranscription: return []
+        }
+    }
+
+    static func of(hotKey action: String) -> Feature? { allCases.first { $0.hotKeys.contains(action) } }
 }

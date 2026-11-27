@@ -1,0 +1,7 @@
+/* What macOS shows about BMeet.app itself on a Mac whose language is Russian: the questions
+   for the permissions, and the copyright line in Finder. The keys are macos/app/Info.plist's;
+   the app's name stays BMeet. */
+NSMicrophoneUsageDescription = "BMeet записывает ваш микрофон для диктовки и расшифровки встреч. Речь расшифровывается на этом Mac, на его Neural Engine, и никуда не отправляется.";
+NSAudioCaptureUsageDescription = "BMeet записывает звук, который играет ваш Mac (другую сторону звонка), для расшифровки встреч. Он остается на этом Mac, только в памяти, пока расшифровка не готова.";
+NSDocumentsFolderUsageDescription = "BMeet сохраняет расшифровки встреч в вашей папке «Документы», в Documents/Meetings.";
+NSHumanReadableCopyright = "Лицензия MIT";

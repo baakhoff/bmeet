@@ -17,6 +17,18 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
   - **The dictation engine** (`npu-transcribe --dictate`) releases GigaAM `unload-after` after the last dictation, without waiting for BMeet.app to end it, and loads it again at the next one. It starts recording first, so nothing said meanwhile is lost.
   - **Memory pressure:** bmeet-whisper releases its models on macOS's memory-pressure warning or critical event, once the request that runs (if one does) is done, and says so in `whisper.log`. The dictation engine reads the same level on its idle tick, every 30 s while it holds a model (one system call, no process).
 - **`npu-transcribe --queue`:** runs started with it go one at a time (a lock in the runtime folder, which a crash lets go of too). A file started while another is being transcribed then waits instead of loading the models a second time. Finder's services do not pass it yet.
+- **A Settings window** in BMeet.app: **Settings… ⌘,** in the menu (in place of the Settings submenu), *About BMeet*, and the control socket's new `{"op": "settings", "page": "general"}`. Five pages behind a toolbar, each control saved at once into its file in `~/.config/bmeet`:
+  - **General:** the interface language, start at login, the daily update check, *Free memory after* (`unload-after`: right after use, 1, 5, 15, 30 or 60 minutes), pasting (Accessibility), the settings folder.
+  - **Features:** dictation (with the words while you speak), online meetings, in-person meetings, telling speakers apart, remembered voices (with a question that says what is kept; off forgets them), file transcription.
+  - **Languages:** every language Whisper knows, with a switch and a search, names in the interface language; the dictation language among the ones that are on. At least one stays on.
+  - **Shortcuts:** each shortcut changed by pressing the new keys, or turned off, and registered again at once.
+  - **About:** the version, **Check Now** or **Update…**, *What's New*, the models installed and their licences, the log folder.
+- **Features can be turned off:** a feature that is off is gone from BMeet.app at once, and back when it is turned on: its shortcuts are not registered, its menu items go, the dictation panel never shows, and the control socket's `dictate` and `meeting` ops refuse it (a meeting that runs can still be stopped). Finder's services stay, as macOS takes them from the signed Info.plist; with file transcription off they say so in a notification and transcribe nothing.
+- **BMeet.app in Russian:** its menu, the Settings window and its notifications, with the interface language as a setting (`interface-language`: System, English, Русский), changed while BMeet runs. On a Mac whose language is Russian, Finder's services and the permission questions are in Russian too.
+
+### Changed
+- BMeet.app follows the files in `~/.config/bmeet` while it runs (within 2 s), whoever wrote them: the shortcuts in `hotkeys` and a feature's switch no longer need a restart.
+- The speech engine of dictation ends after `unload-after` minutes without a dictation (5 by default; it was 15), or right after each one with `0`, and when dictation is turned off.
 
 ### Fixed
 - **The speaker pass crashed in Core ML (status -11), and the meeting lost its speakers.** Core ML keeps a prediction's inputs after `predict()` returns, and later lets go of them on a thread of its own (`MLE5ExecutionStream`'s reset queue, 1.2 s after GigaAM's first prediction). coremltools 9.0 passes numpy arrays to it without a copy, and drops its reference to them there, without Python's lock. When that was an array's last reference, numpy freed it on a thread Python does not know, and Python crashed (`EXC_BAD_ACCESS` at `0x10`).
@@ -45,6 +57,8 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
   - `bmeet/dictate/tests/test_dictate.py` ran `bmeet-ctl` on its Mac path, which sent `dictate` to the real control socket. On 2026-11-27 that started dictations from the microphone in the running BMeet.app. Its commands now take bmeet-ctl's Linux path in a runtime folder of their own, and the file refuses to start a command that could reach the Mac's.
   - The meeting tests posted real notifications through `osascript`. A test's notifications now go to a file (`BMEET_NOTIFY_LOG`), and with a test's runtime folder (`BMEET_RUNTIME_ROOT`) `bmeetmac.notify` never runs `osascript`.
   - bmeet-ctl's tests fail instead of running `open` (which would open BMeet.app) or `osascript`.
+- `macos/tests/test_settings.py`, through BMeet's own check modes, which show nothing and use a test's own folders: every Settings page in English and Russian fits a 13-inch screen and cuts no text; each feature off removes exactly its menu items and shortcuts; the controls write the files as HotKeys.swift and the rest read them back; shortcuts are registered again with macOS as the switches change (⌃⌥⇧⌘ with F13–F20 only); the control socket refuses what is off; the translations in the bundle.
+- `macos/tools/check-strings.py` (CI's lint job): every text of BMeet.app has its Russian line, and no line is left over.
 
 ## [0.9.1] - 2026-10-27
 

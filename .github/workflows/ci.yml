@@ -21,7 +21,7 @@ jobs:
           shellcheck --version
           shellcheck -S warning install.sh uninstall.sh system/*.sh voxtype/*.sh voxtype/bin/* \
             transcribe/*.sh transcribe/tests/*.sh bmeet/app/*.sh bmeet/app/tests/*.sh \
-            bmeet/plasmoid/*.sh bmeet/chrome/*.sh bmeet/dictate/tests/*.sh macos/*.sh \
+            bmeet/plasmoid/*.sh bmeet/chrome/*.sh bmeet/dictate/tests/*.sh macos/*.sh macos/app/*.sh \
             release/check-versions release/notes release/publish release/release release/platforms.sh
       - name: Python syntax
         run: |
@@ -34,6 +34,8 @@ jobs:
                    $(git ls-files '*.py'); do
             python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
           done
+      - name: BMeet.app's Russian texts (every L("…") has its line in macos/app/ru.lproj)
+        run: python3 -I macos/tools/check-strings.py
       - name: Chrome extension
         run: |
           python3 -m json.tool bmeet/chrome/extension/manifest.json >/dev/null
@@ -115,6 +117,8 @@ jobs:
             $(python3-config --embed --ldflags) -o /tmp/bmeet-window
       - name: The Mac parts (stand-ins for the Whisper server and BMeet.app; files instead of the devices)
         run: python -I macos/tests/test_macos.py -v
+      - name: BMeet.app's Settings window, feature switches and translations (its check modes, off screen)
+        run: python -I macos/tests/test_settings.py -v
       - name: BMeet window + bmeet-ctl tests (offscreen; the Linux window, as on Linux)
         env:
           QT_QPA_PLATFORM: offscreen

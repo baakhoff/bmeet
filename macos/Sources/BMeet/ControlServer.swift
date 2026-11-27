@@ -6,8 +6,12 @@
 //   {"op": "meeting", "action": "toggle", "in_person": false}
 //   {"op": "language", "language": "ru"}                  (bmeet-ctl lang wrote it already)
 //   {"op": "open", "args": ["meetings"]}                  the BMeet window
+//   {"op": "settings", "page": "general"}                 the Settings window on that page (general,
+//                                                         features, languages, shortcuts, about; else general)
 //   {"op": "notify", "title": ..., "body": ..., "ok": true}
 //   {"op": "status"}                                      {"dictation": "idle", "accessibility": true, ...}
+// A feature turned off in Settings is refused: {"ok": false, "error": "dictation is off (...)"}
+// for "dictate", and for a "meeting" that would start one (stop, pause and resume still work).
 
 import Darwin
 import Foundation

@@ -7,6 +7,45 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Models are released when nothing uses them,** by one setting: `~/.config/bmeet/unload-after`, in minutes (0–60, default 5; `0`: right after each use). Each process reads it when it decides, so a change applies without a restart. What each process holds and when it lets go: [docs/macos.md](../docs/macos.md#memory).
+  - **bmeet-whisper** releases each model `unload-after` after its last use. The install's model (turbo) gets the whole time; small (for translating) and a copy on the CPU get at most 3 minutes. Before, turbo stayed loaded until the server exited, 10 minutes after the last connection.
+  - Only requests that use a model count. A client that only looks whether the server is up, or asks for its status, no longer keeps the server and turbo alive. The server exits once it has held no model and had no work for 10 minutes.
+  - Its `status` says what is loaded, since when and when it goes. A new `unload` op releases every model, or one. `bmeetmac.whisper_unload()` is its client, and the installer's warm-up uses it to let go of small at once.
+  - **The dictation engine** (`npu-transcribe --dictate`) releases GigaAM `unload-after` after the last dictation, without waiting for BMeet.app to end it, and loads it again at the next one. It starts recording first, so nothing said meanwhile is lost.
+  - **Memory pressure:** bmeet-whisper releases its models on macOS's memory-pressure warning or critical event, once the request that runs (if one does) is done, and says so in `whisper.log`. The dictation engine reads the same level on its idle tick, every 30 s while it holds a model (one system call, no process).
+- **`npu-transcribe --queue`:** runs started with it go one at a time (a lock in the runtime folder, which a crash lets go of too). A file started while another is being transcribed then waits instead of loading the models a second time. Finder's services do not pass it yet.
+
+### Fixed
+- **The speaker pass crashed in Core ML (status -11), and the meeting lost its speakers.** Core ML keeps a prediction's inputs after `predict()` returns, and later lets go of them on a thread of its own (`MLE5ExecutionStream`'s reset queue, 1.2 s after GigaAM's first prediction). coremltools 9.0 passes numpy arrays to it without a copy, and drops its reference to them there, without Python's lock. When that was an array's last reference, numpy freed it on a thread Python does not know, and Python crashed (`EXC_BAD_ACCESS` at `0x10`).
+  - In the pass of 2026-11-27 that array was GigaAM's `feature_lengths`: the pass ran GigaAM once, then waited for Whisper. Four of the installer's model checks crashed the same way on 2026-11-26.
+  - Now every Core ML input is a copy that BMeet keeps until Core ML has let go of it, so Core ML's release never frees anything (`bmeetmac.coreml_predict`, used by npu-transcribe and `macos/prepare-coreml`). The details: [docs/npu-transcribe.md](../docs/npu-transcribe.md#findings-and-workarounds).
+- **A speaker pass that crashed left no word of it:** the transcript stayed the live one (*You* / *Remote*, or *Room*), with nothing to say why. Now a pass that ends badly leaves a line under the transcript's Meeting Info: the voices were not told apart, and why (it crashed, was ended, or failed). When npu-transcribe could not report it itself (a crash or a kill), a notification says so too.
+- **A translation, or the installer's warm-up, displaced turbo:** the server kept loaded the model of the last transcription, so one use of small made turbo the one released after 3 minutes. Turbo now keeps its time whatever was used last.
+- **bmeet-whisper's `status` listed the models it had already released.**
+
+### Tests
+- `macos/tests/test_macos.py`, with the real bmeet-whisper and stand-in models (`BMEET_WHISPER_TEST=1`, tests only):
+  - a model goes after `unload-after` while clients keep looking and asking for the status;
+  - `unload`;
+  - the setting is read when it is needed;
+  - memory pressure, injected with a test-only op;
+  - turbo keeps its time after small;
+  - the server exits when idle.
+- The speaker pass:
+  - one that is killed leaves the line and a notification;
+  - one that fails leaves the line without a second notification;
+  - one that works leaves neither.
+- `CoreMLPredict`: `coreml_predict` through coremltools' own `predict()` code, with a stand-in for Core ML that keeps what it is given: Core ML gets only the copies BMeet watches (a float16 input too), and they are freed once it lets go.
+- `CoreMLInputs`, local only (CI has no models): the installed GigaAM, Nemotron and TitaNet on the Neural Engine, on Russian speech made with `say`, with pauses after each prediction longer than Core ML takes to let go of its inputs; and a speaker pass of an in-person recording.
+- `transcribe/tests/test_dictation.py`: the dictation engine releases its model when idle, loads it again for the next dictation, reads `unload-after` when it is needed, and lets go on memory pressure.
+- **Tests no longer reach the BMeet.app running on the Mac:**
+  - `bmeet/dictate/tests/test_dictate.py` ran `bmeet-ctl` on its Mac path, which sent `dictate` to the real control socket. On 2026-11-27 that started dictations from the microphone in the running BMeet.app. Its commands now take bmeet-ctl's Linux path in a runtime folder of their own, and the file refuses to start a command that could reach the Mac's.
+  - The meeting tests posted real notifications through `osascript`. A test's notifications now go to a file (`BMEET_NOTIFY_LOG`), and with a test's runtime folder (`BMEET_RUNTIME_ROOT`) `bmeetmac.notify` never runs `osascript`.
+  - bmeet-ctl's tests fail instead of running `open` (which would open BMeet.app) or `osascript`.
+
 ## [0.9.1] - 2026-10-27
 
 ### Added

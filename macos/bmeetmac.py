@@ -11,11 +11,13 @@ Meeting audio is the exception: it stays in RAM, on the RAM disk that BMeet.app 
 `$XDG_RUNTIME_DIR/bmeet/meeting-audio` (audio_in_ram()).
 
 Also here: where the native helpers are (bmeet-whisper, bmeet-record), the client of the
-Whisper server (WhisperKit on the Neural Engine), the client of BMeet.app's control socket,
+Whisper server (WhisperKit on the Neural Engine), predictions of the Core ML models that are
+safe from Core ML's own threads (coreml_predict), the client of BMeet.app's control socket,
 and notifications.
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import functools
 import json
@@ -24,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -188,6 +191,125 @@ def whisper(request: dict, samples=None, timeout: float | None = None) -> dict:
     return answer
 
 
+def whisper_unload(model: str | None = None, compute: str | None = None) -> list[str] | None:
+    """Have the Whisper server release `model` (every model when None; on `compute` only, "ane" or
+    "cpu", when given) now. Returns what it released, or None when no server runs (none is
+    started for this)."""
+    request = {"op": "unload", **({"model": model} if model else {}), **({"compute": compute} if compute else {})}
+    try:
+        with _connect(whisper_socket(), 5) as s:
+            s.settimeout(None)    # (it waits for the request that runs)
+            s.sendall(json.dumps(request).encode() + b"\n")
+            line = s.makefile("rb").readline()
+    except OSError:
+        return None
+    answer = json.loads(line) if line else {}
+    if not answer.get("ok"):
+        raise RuntimeError(answer.get("error") or "bmeet-whisper failed")
+    return answer.get("unloaded", [])
+
+
+def memory_pressure() -> str:
+    """"warning" or "critical" while macOS says memory is short, else "": the level behind its
+    memory-pressure events (sysctl kern.memorystatus_vm_pressure_level: 1 normal, 2 warning,
+    4 critical). One system call, no process: cheap enough for a process's idle tick."""
+    level, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    try:
+        if ctypes.CDLL(None).sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level),
+                                          ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            return ""
+    except (OSError, AttributeError):
+        return ""
+    return {2: "warning", 4: "critical"}.get(level.value, "")
+
+
+# --------------------------------------------------------------------------- Core ML
+
+# Core ML keeps the inputs of a model's last prediction after predict() has returned, and lets go
+# of them later: at the model's next prediction, when the model is freed, or on a thread of its
+# own (the reset queue of MLE5ExecutionStream, ~1 s after the first prediction of a model loaded
+# on the Neural Engine, macOS 27). coremltools (9.0) passes numpy arrays to it without a copy: its
+# MLMultiArray (PybindCompatibleArray) keeps a reference to the array and drops it in its
+# destructor, without Python's lock and on a thread that Python does not know. Where that is the
+# last reference, numpy frees the array there, and Python 3.13 crashes (EXC_BAD_ACCESS at 0x10:
+# the thread state it looks for is NULL). That ended the speaker pass of 2026-11-27 (GigaAM's
+# feature_lengths, an int32 array nothing else held, freed while the pass waited for Whisper) and
+# four of the install's model checks of 2026-11-26.
+# So every input Core ML gets is a copy that only _HELD refers to, through the dict handed to
+# predict(), until Core ML has let go of it. Nothing in Python touches those arrays meanwhile (a
+# reference count changed from two threads at once could come out wrong): whether Core ML still
+# holds one is read from the array's reference count in memory, without changing it. One that is
+# back to 1 (only that dict) is Core ML's no longer, and is freed here, by Python.
+_HELD: list[list] = []          # [dict handed to predict(), addresses of its arrays, predict() returned]
+_HELD_LOCK = threading.Lock()
+
+
+def _refcount(address: int) -> int:
+    return ctypes.c_ssize_t.from_address(address).value
+
+
+@functools.lru_cache(maxsize=None)
+def _refcounts_readable() -> bool:
+    """Is the reference count where _refcount() reads it (CPython with the GIL: ob_refcnt first)?
+    One more reference must show as one more there (whatever sys.getrefcount counts itself)."""
+    probe = object()
+    before = _refcount(id(probe))
+    keep = [probe]   # noqa: F841  (a second reference)
+    return _refcount(id(probe)) == before + 1
+
+
+# What coreml_predict() hands Core ML for each numpy dtype: int64 as int32 (Core ML takes no
+# int64), and float16 as float32 here, because coremltools would otherwise replace a float16
+# array in the dict by a float32 copy of its own (MLModel._update_float16_multiarray_input_to_float32),
+# which Core ML would then hold without _HELD knowing of it.
+_FED_AS = {"int64": "int32", "float16": "float32"}
+
+
+def coreml_predict(model, inputs: dict) -> dict:
+    """model.predict(inputs) for a coremltools model, with inputs that Core ML may let go of on
+    any thread (see above). int64 arrays are given as int32 and float16 as float32 (_FED_AS)."""
+    import numpy as np
+    feed = {}
+    for name, value in inputs.items():
+        given = np.asarray(value)
+        feed[name] = np.array(given, dtype=_FED_AS.get(given.dtype.name, given.dtype), order="C", copy=True)
+    entry = [feed, tuple(id(a) for a in feed.values()), False]
+    with _HELD_LOCK:
+        _drop_released()
+        _HELD.append(entry)
+    try:
+        return model.predict(feed)
+    finally:
+        with _HELD_LOCK:
+            entry[2] = True
+
+
+def release_coreml_inputs() -> int:
+    """Free the inputs Core ML has let go of (each prediction does it too; a process that goes idle
+    calls it). Returns how many predictions' inputs are still held."""
+    with _HELD_LOCK:
+        _drop_released()
+        return len(_HELD)
+
+
+def _drop_released() -> None:
+    """(with _HELD_LOCK) Drop the entries whose predict() has returned and whose arrays are back to
+    one reference each. On a Python where the count cannot be read so, everything stays: safe."""
+    if _refcounts_readable():
+        _HELD[:] = [e for e in _HELD if not e[2] or any(_refcount(address) > 1 for address in e[1])]
+
+
+@atexit.register
+def _keep_held_inputs() -> None:
+    """At exit, inputs Core ML still holds must not be freed by Python's shutdown (Core ML would
+    then drop the last reference later, on its own thread): their dicts get one more reference,
+    from nowhere, so they stay. (Only Python touches a dict's count: Core ML holds the arrays.)"""
+    with _HELD_LOCK:
+        _drop_released()
+        for e in _HELD:
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(e[0]))
+
+
 # --------------------------------------------------------------------------- BMeet.app
 
 def agent_socket() -> Path:
@@ -213,8 +335,16 @@ def agent_running() -> bool:
 
 
 def notify(summary: str, body: str = "", ok: bool = True) -> None:
-    """A notification from BMeet (BMeet.app posts it), else through osascript."""
+    """A notification from BMeet (BMeet.app posts it), else through osascript. Tests: with
+    BMEET_NOTIFY_LOG it is appended to that file as a JSON line instead, and with BMEET_RUNTIME_ROOT
+    (a test's runtime folder) osascript is never used, so a test never puts one on the screen."""
+    if log := os.environ.get("BMEET_NOTIFY_LOG"):
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"title": summary, "body": body, "ok": ok}, ensure_ascii=False) + "\n")
+        return
     if agent({"op": "notify", "title": summary, "body": body, "ok": ok}) is not None:
+        return
+    if os.environ.get("BMEET_RUNTIME_ROOT"):
         return
     if shutil.which("osascript"):
         # (ensure_ascii=False: AppleScript strings have no \u escapes; quotes and backslashes are escaped)

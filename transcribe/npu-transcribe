@@ -231,6 +231,10 @@ MIN_MUTED_SECONDS = 1.0       # shorter stretches without sound are left alone
 SELF_MIN_SECONDS = 15         # learn only from meetings with at least this much of your speech
 SELF_OUTLIER = 0.5            # a meeting's fingerprint less similar than this to yours is not learned
 MAX_SELF_PRINTS = 10          # your fingerprints kept: the latest meetings
+# A process that waits for work (the dictation engine) lets go of its model this long after its
+# last use: ~/.config/bmeet/unload-after says how long (unload_after()); this is its default.
+UNLOAD_AFTER_DEFAULT = 5 * 60.0
+IDLE_TICK = 30.0              # ... and while it waits with a model, it looks at that and at memory this often
 PROG = "npu-transcribe"
 STDERR_LOCK = threading.Lock()  # log() and the progress ticker share stderr
 UMASK = os.umask(0o022)
@@ -614,8 +618,9 @@ class CoreMLNet:
         self.model = ct.models.CompiledMLModel(str(path), compute_units=units)
 
     def infer(self, inputs: dict) -> dict:
-        feed = {k: (v.astype(np.int32) if v.dtype == np.int64 else v) for k, v in inputs.items()}
-        return self.model.predict(feed)
+        # (through bmeetmac: Core ML lets go of the inputs later, on a thread of its own, and an
+        # array freed there crashed the speaker pass)
+        return bmeetmac.coreml_predict(self.model, inputs)
 
 
 def coreml_net(path: Path, devices: list[str], what: str) -> tuple[CoreMLNet, str]:
@@ -2403,6 +2408,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true",
                    help="replace existing NAME.srt/.md/.txt instead of writing NAME.2.* etc.")
     p.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    p.add_argument("--queue", action="store_true",
+                   help="files: wait until the other runs started with --queue are done (one at a time, "
+                        "so that files started together do not each load the models at once)")
     p.add_argument("--engine", default="auto", choices=("auto", "whisper", "gigaam"),
                    help="speech model: auto (default: GigaAM for Russian if installed, Whisper for "
                         "other languages and --translate), whisper, or gigaam (Russian only)")
@@ -2451,6 +2459,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         p.error("--voices only works with --meeting")
     elif not args.files:
         p.error("the following arguments are required: FILE")
+    if args.queue and not args.files:
+        p.error("--queue is for files")
     if args.speakers and (missing := speaker_models_missing()):
         p.error(f"speaker model missing: {missing[0]} (run the installer again)")
     args.formats = [f.strip().lower() for f in args.format.split(",") if f.strip()]
@@ -2513,6 +2523,13 @@ class Engines:
             self._speakers = SpeakerModels(list(self.devices))
         return self._speakers
 
+    def release(self) -> None:
+        """Let go of every model (each is loaded again when next needed). On a Mac, Whisper is only
+        a client of bmeet-whisper, which releases its model by its own clock."""
+        self._whisper = self._gigaam = self._speakers = None
+        if MAC:   # (the inputs Core ML has let go of now that its models are gone)
+            bmeetmac.release_coreml_inputs()
+
     def detect(self, blocks: Generator[tuple[float, np.ndarray], None, None]) -> str:
         """Whisper's guess of the language of the first block with sound ("?" if none).
         A language that is not one of yours (~/.config/bmeet/languages) is checked on the
@@ -2569,6 +2586,29 @@ class Engines:
                                             and not self.args.translate and gigaam_ready()):
             return self.gigaam(), "ru"
         return self.whisper(words), language
+
+
+def unload_after() -> float:
+    """Seconds a process that waits for work keeps a model after its last use: BMeet's setting
+    ~/.config/bmeet/unload-after, in minutes (0-60, 0: right after each use; a number outside counts
+    as the nearest end, a missing or unreadable file as 5). Read each time it is needed, so a
+    change applies without a restart. BMEET_UNLOAD_AFTER_SECONDS gives it in seconds (tests only)."""
+    try:
+        if (seconds := float(os.environ.get("BMEET_UNLOAD_AFTER_SECONDS", "-1"))) >= 0:
+            return seconds
+    except ValueError:
+        pass
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "bmeet/unload-after"
+    try:
+        return min(max(int(path.read_text(encoding="utf-8").split()[0]), 0), 60) * 60.0
+    except (OSError, ValueError, IndexError, UnicodeDecodeError):
+        return UNLOAD_AFTER_DEFAULT
+
+
+def memory_pressure() -> str:
+    """"warning" or "critical" while macOS says memory is short, else "". (Linux: always "": it is
+    not watched there; bmeet-dictate ends the engine by the setting.)"""
+    return bmeetmac.memory_pressure() if MAC else ""
 
 
 def user_languages() -> set[str]:
@@ -3063,7 +3103,9 @@ class LiveMeeting:
             language = engines.detect(array_blocks(sound[:BLOCK_SECONDS * SAMPLE_RATE]))
         self.engine, language = engines.for_language(language, words=True)
         if isinstance(self.engine, GigaAM):
-            engines._whisper = None  # (only needed for detecting the language: frees ~2 GB)
+            # (only needed for detecting the language: on Linux this frees its ~2 GB; on a Mac it
+            # drops a client, and bmeet-whisper releases the model by its own clock)
+            engines._whisper = None
         else:
             self.kwargs = {"return_timestamps": True, "task": "transcribe", "word_timestamps": True}
             if language not in ("auto", "?"):
@@ -3492,8 +3534,10 @@ def dictate_serve(args: argparse.Namespace, engines: Engines) -> int:
     {"start": {"language": "ru"}} starts a dictation from the microphone (with "file": PATH, that
     audio as if it were being said), {"stop": {}} ends it, {"cancel": {}} drops it. Events go to
     stdout as JSON lines: {"ready"} once the model for --language is loaded, {"started"}, the text
-    as it changes ({"final", "draft"}), {"done", "text"}, {"cancelled"}, {"error"}. The model
-    stays loaded between dictations. Ends when stdin closes."""
+    as it changes ({"final", "draft"}), {"done", "text"}, {"cancelled"}, {"error"}. Between
+    dictations the model stays loaded for `unload-after` (unload_after(); 0: it goes right after
+    each dictation), and on a Mac until memory is short; the next dictation loads it again (it
+    starts recording first, so nothing said meanwhile is lost). Ends when stdin closes."""
     model = None
     if args.language != "auto":
         model = dictation_model(engines, args.language)
@@ -3503,8 +3547,22 @@ def dictate_serve(args: argparse.Namespace, engines: Engines) -> int:
     source: FileSource | MicSource | None = None
     clock = Clock()
     pending, c0 = b"", 0.0
+    last_use = time.monotonic()   # the model was loaded or last used then
     while True:
-        wait = None if d is None else max(0.0, DICTATE_TICK - clock.now() % DICTATE_TICK)
+        if d is not None:
+            last_use = time.monotonic()
+        elif model is not None:   # waiting with a model: does it go?
+            idle, keep = time.monotonic() - last_use, unload_after()
+            why = ("unload-after is 0" if keep == 0 else f"unused for {idle:.0f} s") if idle >= keep else \
+                f"memory pressure: {level}" if (level := memory_pressure()) else ""
+            if why:
+                log(f"dictation: released {engine_label(model[0])} ({why})")
+                model = None
+                engines.release()
+        if d is not None:
+            wait = max(0.0, DICTATE_TICK - clock.now() % DICTATE_TICK)
+        else:   # (no model: nothing to look at until a command comes)
+            wait = None if model is None else min(IDLE_TICK, max(0.0, last_use + unload_after() - time.monotonic()))
         if select.select([0], [], [], wait)[0]:
             data = os.read(0, 1 << 16)
             if not data:
@@ -3562,6 +3620,23 @@ def dictate_serve(args: argparse.Namespace, engines: Engines) -> int:
 
 
 
+def wait_for_turn():
+    """--queue: BMeet's file queue. Runs started with --queue hold $XDG_RUNTIME_DIR/bmeet/file-queue.lock
+    one at a time, from here until they end (a crash lets go of it too), so that a file started while
+    another is still being transcribed (Finder's services start a run per request) waits instead of
+    loading the models a second time. The order among the ones that wait is the system's, not
+    strictly the order they were started in."""
+    folder = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "bmeet"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = open(folder / "file-queue.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("waiting for the file transcription started before this one (--queue)")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
 def history_model(engine: Whisper | GigaAM | None, args: argparse.Namespace, model_dir: Path) -> str:
     """The "model" of a history line: gigaam, or --model as given (turbo, small, a path)."""
     if isinstance(engine, GigaAM):
@@ -3601,6 +3676,7 @@ def main(argv: list[str]) -> int:
         return dictate_file(args, engines)
     if args.dictate:
         return dictate_serve(args, engines)
+    turn = wait_for_turn() if args.queue else None   # noqa: F841  (held until this process ends)
 
     report: list[str] = []
     failed = 0

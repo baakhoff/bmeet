@@ -502,9 +502,24 @@ def report_plan(compiled: Path) -> float:
     return ane / total
 
 
-def load(compiled: Path, units: str = "CPU_AND_NE"):
+class Compiled:
+    """A compiled model whose predict() goes through bmeetmac.coreml_predict: Core ML lets go of a
+    prediction's inputs later, on a thread of its own, and an input freed there crashed four of
+    these checks during an install (2026-11-26)."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def predict(self, feed: dict) -> dict:
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import bmeetmac
+        return bmeetmac.coreml_predict(self.model, feed)
+
+
+def load(compiled: Path, units: str = "CPU_AND_NE") -> Compiled:
     import coremltools as ct
-    return ct.models.CompiledMLModel(str(compiled), compute_units=getattr(ct.ComputeUnit, units))
+    return Compiled(ct.models.CompiledMLModel(str(compiled), compute_units=getattr(ct.ComputeUnit, units)))
 
 
 def timed(model, feed: dict, runs: int = 3) -> tuple[dict, float]:

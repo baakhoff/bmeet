@@ -9,7 +9,8 @@
 //
 // While you speak, a small panel at the bottom of the screen shows the words (underlined while
 // they may still change); it never takes the keyboard focus, so the text goes where you were
-// typing. When you stop, the text is pasted there (the clipboard, then ⌘V; your clipboard is
+// typing. Where the island around the camera shows (Island.swift), it shows them instead, and the
+// panel stays hidden. When you stop, the text is pasted there (the clipboard, then ⌘V; your clipboard is
 // put back once the app has read it), or only copied with the clipboard shortcut. Pasting needs
 // the Accessibility permission for BMeet: without it the text stays on the clipboard.
 
@@ -27,6 +28,11 @@ final class Dictation {
     var onChange: (State) -> Void = { _ in }
     var notify: (String, String) -> Void = { _, _ in }
 
+    /// The island shows the words now, not the panel (AppDelegate: the island shows on this Mac).
+    var useIsland: () -> Bool = { false }
+    /// The words changed (the island shows them).
+    var onWords: () -> Void = {}
+
     private var engine: Process?
     private var input: FileHandle?
     private var generation = 0      // which engine's output counts (a new engine: not the last one's)
@@ -35,17 +41,34 @@ final class Dictation {
     /// the text before them, are not for the dictation that runs now.
     private var stale = 0
     private var buffer = Data()
-    private var clipboardOnly = false
+    private(set) var clipboardOnly = false
     private var idleTimer: Timer?
     private var maxTimer: Timer?
     private let panel = DictationPanel()
-    private var final = ""
-    private var draft = ""
+    /// The words so far: final, and the draft after them that may still change.
+    private(set) var final = ""
+    private(set) var draft = ""
 
     init() { writeState() }
 
     /// How often the panel was shown (or would have been, in a check).
     var panelShown: Int { panel.shown }
+
+    /// The words where they go now: the island, or the panel at the bottom of the screen.
+    private func display() {
+        if useIsland() {
+            panel.hide()
+        } else {
+            panel.show(final: final, draft: draft, listening: state == .recording, live: Settings.liveText)
+        }
+        onWords()
+    }
+
+    /// The island came or went (its switch, the screens): the words move to where they go now.
+    func redisplay() {
+        guard state != .idle else { return }
+        display()
+    }
 
     private func writeState() {
         Paths.write(state.rawValue, to: Paths.runtime.appendingPathComponent("state"))
@@ -84,7 +107,7 @@ final class Dictation {
         if engine?.isRunning != true, !startEngine() { return }
         send(["start": ["language": language]])   // (the engine switches models when the language changes)
         state = .recording
-        panel.show(final: "", draft: "", listening: true, live: Settings.liveText)
+        display()
         idleTimer?.invalidate()
         maxTimer?.invalidate()
         maxTimer = Timer.scheduledTimer(withTimeInterval: MAX_DICTATION, repeats: false) { [weak self] _ in self?.stop() }
@@ -95,7 +118,7 @@ final class Dictation {
         maxTimer?.invalidate()
         send(["stop": [:]])
         state = .transcribing
-        panel.show(final: final, draft: draft, listening: false, live: Settings.liveText)
+        display()
     }
 
     func cancel() {
@@ -233,9 +256,7 @@ final class Dictation {
         } else if let f = ev["final"] as? String {
             final = f
             draft = ev["draft"] as? String ?? ""
-            if state != .idle {
-                panel.show(final: final, draft: draft, listening: state == .recording, live: Settings.liveText)
-            }
+            if state != .idle { display() }
         }
     }
 
@@ -363,8 +384,9 @@ final class PasteText: NSObject, NSPasteboardItemDataProvider {
     }
 }
 
-/// The panel at the bottom of the screen: the words as you say them. It floats over every app
-/// and desktop (full-screen ones too), ignores the mouse and never becomes the key window.
+/// The panel at the bottom of the screen: the words as you say them, where the island around the
+/// camera does not show. It floats over every app and desktop (full-screen ones too), ignores the
+/// mouse and never becomes the key window.
 final class DictationPanel {
     private var window: NSPanel?
     private let label = NSTextField(labelWithString: "")

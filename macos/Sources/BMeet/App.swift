@@ -3,7 +3,8 @@
 // dictations, notifications, and Finder's right-click "Transcribe". Everything that records or
 // pastes runs as its child, so macOS asks for the microphone, the system audio and Accessibility
 // once, for BMeet. The BMeet window (meetings, transcribed files) is the Qt app of Linux, in
-// Contents/Helpers/BMeet Window.app. Its own Settings window is SettingsWindow.swift.
+// Contents/Helpers/BMeet Window.app. Its own Settings window is SettingsWindow.swift, and the
+// island around the camera housing, on a Mac that has one, is Island.swift.
 
 import AppKit
 import ServiceManagement
@@ -14,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private let menu = NSMenu()
     private(set) var hotKeys: HotKeys!
     let dictation = Dictation()
+    let island = Island()
     private var server: ControlServer!
     var status: [String: Any] = [:]
     private var recent: [[String: Any]] = []
@@ -41,6 +43,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         hotKeys = HotKeys { [weak self] action in self?.hotKey(action) }
         hotKeys.dryRun = checking
         seen = Settings.Snapshot.read()
+        island.holdEscape = { [weak self] hold in self?.hotKeys.holdEscape(hold) }
+        island.perform = { [weak self] action, state in self?.islandAction(action, state) }
+        island.onScreens = { [weak self] in
+            self?.refreshIsland()
+            self?.dictation.redisplay()
+            self?.settingsWindow?.fill()
+        }
+        dictation.useIsland = { [weak self] in self?.island.shows ?? false }
+        dictation.onWords = { [weak self] in self?.refreshIsland() }
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -167,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             dictation.stopEngine()
         }
         if now.unloadAfter != was.unloadAfter { dictation.scheduleIdle() }
+        if now.island != was.island { dictation.redisplay() }   // (the words go to the island or the panel)
         if now.startAtLogin != was.startAtLogin && inBundle { loginItem() }
         if now.language != was.language { dictation.languageChanged(now.language) }
         refresh()
@@ -205,6 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         guard Feature.of(hotKey: action)?.isOn != false else { return }   // (turned off in the last 2 s)
         guard !checking else { return }   // (--hotkey-check's shortcuts only test the registering)
         switch action {
+        case "escape": island.escape()
         case "dictate": dictation.toggle(clipboard: false)
         case "dictate-clipboard": dictation.toggle(clipboard: true)
         case "language": switchLanguage(nil)
@@ -237,12 +250,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                      : L("Only the other side of the call is recorded. Allow BMeet in System Settings → Privacy & Security → Microphone."))
             if inPerson { return }
         }
-        // (bmeet-meeting takes one start or stop at a time itself)
-        run(Paths.python, ["-I", Paths.meeting.path, action] + (inPerson ? ["--in-person"] : []), log: "meetings.log") {
-            [weak self] _ in
-            self?.poll()
+        // (bmeet-meeting takes one start or stop at a time itself). A stop prints the transcript's
+        // path: the island says it was saved, or shows its speaker pass.
+        island.meetingRuns += 1
+        run(Paths.python, ["-I", Paths.meeting.path, action] + (inPerson ? ["--in-person"] : []), capture: true,
+            log: "meetings.log") { [weak self] out in
+            guard let self else { return }
+            self.island.meetingRuns -= 1
+            if let file = out?.split(separator: "\n").last.map(String.init), file.hasPrefix("/"), file.hasSuffix(".md"),
+               FileManager.default.fileExists(atPath: file) {
+                self.island.transcriptWritten(file)
+                self.refreshIsland()
+            }
+            self.poll()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.poll() }
+    }
+
+    /// A control of the island was clicked, for the state it showed.
+    private func islandAction(_ action: IslandAction, _ state: IslandState) {
+        if checking { Checks.islandActions.append(action.rawValue + (action == .open ? " " + (state.file ?? "") : "")) }
+        switch action {
+        case .stop: dictation.stop()
+        case .cancel: dictation.cancel()
+        case .pause: meeting("pause", inPerson: false)
+        case .resume: meeting("resume", inPerson: false)
+        case .stopMeeting: meeting("stop", inPerson: false)
+        case .open:
+            if let file = state.file, !Checks.active { NSWorkspace.shared.open(URL(fileURLWithPath: file)) }
+        case .dismiss: break
+        }
     }
 
     private func switchLanguage(_ language: String?) {
@@ -286,7 +323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func transcribe(_ files: [String], _ extra: [String]) {
         guard !files.isEmpty, filesAllowed() else { return }
-        run(Paths.python, ["-I", Paths.transcribe.path, "--notify"] + extra + files, log: "transcribe.log") { _ in }
+        island.fileJobs += 1   // (its notifications are not the island's)
+        run(Paths.python, ["-I", Paths.transcribe.path, "--notify"] + extra + files, log: "transcribe.log") { [weak self] _ in
+            self?.island.fileJobs -= 1
+        }
         post(files.count == 1 ? L("Transcribing %@", URL(fileURLWithPath: files[0]).lastPathComponent)
                               : L("Transcribing files: %d", files.count),
              L("You get a notification when it is done; the transcript goes next to the file."))
@@ -321,7 +361,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         case "settings":
             showSettings(SettingsWindow.Page(rawValue: req["page"] as? String ?? "") ?? .general)
         case "notify":
-            post(req["title"] as? String ?? "BMeet", req["body"] as? String ?? "")
+            let title = req["title"] as? String ?? "BMeet", body = req["body"] as? String ?? ""
+            post(title, body)
+            island.notified(title, body, ok: req["ok"] as? Bool ?? true)   // (a failure of a meeting's: the island too)
+            refreshIsland()
         case "status":
             return ["ok": true, "dictation": dictation.state.rawValue, "accessibility": AXIsProcessTrusted(),
                     "pid": Int(getpid())]
@@ -381,8 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let ended = !self.status.isEmpty && (meetingChanged || passesChanged)
             let updateChanged = (s["update"] as? [String: Any])?["version"] as? String
                 != (self.status["update"] as? [String: Any])?["version"] as? String
-            self.status = s
-            self.refresh()
+            self.statusArrived(s)
             self.schedulePoll()
             if ended { self.loadRecent() }
             if updateChanged { self.settingsWindow?.fillAbout() }
@@ -427,12 +469,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return (name, tint, title)
     }
 
+    /// A `bmeet-ctl status` answer (the poll; a check's file): the menu bar icon and the island follow it.
+    func statusArrived(_ s: [String: Any]) {
+        status = s
+        island.follow(status: s)
+        refresh()
+    }
+
     private func refresh() {
+        refreshIsland()
         guard let button = item?.button else { return }
         let (name, tint, title) = icon()
         button.image = symbol(name)
         button.contentTintColor = tint
         button.title = title
+    }
+
+    /// The island shows what BMeet does now: a dictation, with its words, else what it made of the
+    /// status, the notifications and the transcripts.
+    func refreshIsland() {
+        let words = IslandState.Words(language: Settings.language, final: dictation.final, draft: dictation.draft,
+                                      live: Settings.liveText, clipboard: dictation.clipboardOnly)
+        switch dictation.state {
+        case .recording: island.dictation = .listening(words)
+        case .transcribing: island.dictation = .transcribing(words)
+        case .idle: island.dictation = nil
+        }
+        island.refresh()
     }
 
     private func symbol(_ name: String) -> NSImage? {

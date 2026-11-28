@@ -62,6 +62,9 @@ final class SettingsWindow: NSObject, NSToolbarDelegate, NSWindowDelegate, NSTab
     private var liveRow = NSView()
     private(set) var speakersBox = NSButton()
     private(set) var voicesBox = NSButton()
+    private(set) var islandBox = NSButton()
+    private var islandNote = NSTextField()
+    private var dictationNote = NSTextField()
     // Languages
     private(set) var dictationPopup = NSPopUpButton()
     private(set) var search = NSSearchField()
@@ -416,10 +419,13 @@ final class SettingsWindow: NSObject, NSToolbarDelegate, NSWindowDelegate, NSTab
         let width = SettingsWindow.width - 20
         var views: [NSView] = []
         var gaps: [(NSView, CGFloat)] = []
-        func add(_ box: NSButton, _ text: String, last: Bool = false) {
-            let note = indent(caption(text, width: width))
+        @discardableResult
+        func add(_ box: NSButton, _ text: String, last: Bool = false) -> NSTextField {
+            let label = caption(text, width: width)
+            let note = indent(label)
             views += [box, note]
             gaps += [(box, 2), (note, last ? 8 : 14)]
+            return label
         }
         featureBoxes = [:]
         for feature in Feature.allCases {
@@ -431,15 +437,18 @@ final class SettingsWindow: NSObject, NSToolbarDelegate, NSWindowDelegate, NSTab
         liveRow = indent(liveBox)
         speakersBox = checkbox(L("Tell speakers apart"), #selector(speakersChanged))
         voicesBox = checkbox(L("Remember voices"), #selector(voicesChanged))
+        islandBox = checkbox(L("Show BMeet around the camera"), #selector(islandChanged))
 
-        add(featureBoxes[.dictation]!, L("Speak, and the text is pasted where you were typing or put on the clipboard. A small panel at the bottom of the screen shows that BMeet listens."))
+        // (the dictation's caption and the island's say where BMeet shows itself on this Mac: fillFeatures)
+        dictationNote = add(featureBoxes[.dictation]!, "")
         views.append(liveRow)
         gaps.append((liveRow, 14))
         add(featureBoxes[.meetings]!, L("Records your microphone and what your Mac plays, and saves a transcript of the call with who said what."))
         add(featureBoxes[.inPersonMeetings]!, L("Records only your microphone, for a meeting in the room, and tells the voices on it apart."))
         add(speakersBox, L("Meeting transcripts get Person 1, Person 2, … instead of only You and Remote. The meeting audio stays in memory until that is done."))
         add(voicesBox, L("Later meetings call the people you named by their names. BMeet keeps a voice fingerprint of each: biometric data about other people, so turn it on only where that is fine. Turning it off forgets them all."))
-        add(featureBoxes[.fileTranscription]!, L("Turns audio and video files into text: Transcribe a File… in the menu, the BMeet window and Finder's Quick Actions."), last: true)
+        add(featureBoxes[.fileTranscription]!, L("Turns audio and video files into text: Transcribe a File… in the menu, the BMeet window and Finder's Quick Actions."))
+        islandNote = add(islandBox, "", last: true)
         let footnote = caption(L("A feature that is off leaves BMeet's menu and shortcuts. The transcripts you have stay in the BMeet window."), width: SettingsWindow.width)
         let line = separator()
         views += [line, footnote]
@@ -464,6 +473,21 @@ final class SettingsWindow: NSObject, NSToolbarDelegate, NSWindowDelegate, NSTab
         liveRow.isHidden = !Feature.dictation.isOn
         speakersBox.state = Settings.speakers ? .on : .off
         voicesBox.state = Settings.rememberVoices ? .on : .off
+        // The island: only a screen with a camera housing has one (the switch keeps its file meanwhile)
+        let housing = app.island.geometry != nil
+        islandBox.state = Settings.island ? .on : .off
+        islandBox.isEnabled = housing
+        islandNote.stringValue = housing ? L("Dictation and meetings show around the camera; click there for their controls.")
+            : L("This Mac's screen has no camera housing.")
+        dictationNote.stringValue = app.island.shows
+            ? L("Speak, and the text is pasted where you were typing or put on the clipboard. Around the camera, BMeet shows that it listens.")
+            : L("Speak, and the text is pasted where you were typing or put on the clipboard. A small panel at the bottom of the screen shows that BMeet listens.")
+    }
+
+    @objc private func islandChanged() {
+        Settings.set("island", islandBox.state == .on ? "on" : "off")
+        app.settingsChanged()
+        fillFeatures()
     }
 
     @objc private func featureChanged(_ sender: NSButton) {

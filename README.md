@@ -41,6 +41,7 @@ window, in English or Russian: see [docs/macos.md](docs/macos.md).
   - In English or Russian (see [Configure](#configure)).
 - **Panel widget:** a microphone icon that shows what is happening (ready, listening, transcribing, recording). Click it for dictation, meeting and language controls and your recent transcripts.
 - **Several languages:** any language Whisper knows. **Meta+Shift+H** cycles through the ones you pick.
+- **On a Mac:** a menu bar app with ⌃⌥ shortcuts and a Settings window. On a MacBook whose screen has a camera housing, BMeet also shows what it is doing around the camera, the way an iPhone's Dynamic Island shows a call: listening with your words, a meeting and its time, the speaker pass, the transcript saved. A click opens it, with **Pause**, **Stop**, **Cancel** and **Open** ([docs/macos.md](docs/macos.md#around-the-camera)).
 
 It builds on [voxtype](https://github.com/peteonrails/voxtype) (dictation and meetings) and
 [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai) (Whisper on the NPU).
@@ -173,7 +174,7 @@ the meeting being recorded, in RAM, and nowhere else. Without the extension, not
 - **Remembered voices:** off until you tick *Recognise them by voice in later meetings* in the app's *Name speakers…* dialog (stored in `~/.config/bmeet/remember-voices`). With them on, BMeet also learns your own voice from your microphone in online meetings, for in-person meetings.
 - **voxtype:** `~/.config/voxtype/config.toml`. Change single values with `voxtype config set KEY VALUE`, then run `systemctl --user restart voxtype`. The defaults and the reasons for them are in [docs/voxtype.md](docs/voxtype.md).
 - **Shortcuts:** System Settings → Keyboard → Shortcuts → *Voxtype: …*.
-- **On a Mac:** BMeet's Settings window (*Settings… ⌘,* in its menu) writes these files and a few more: it turns dictation, meetings, in-person meetings and file transcription off (each then leaves the menu and frees its shortcuts), turns dictation languages on and off, changes the shortcuts, sets how long a model stays in memory and the interface language (English or Russian). See [docs/macos.md](docs/macos.md#settings).
+- **On a Mac:** BMeet's Settings window (*Settings… ⌘,* in its menu) writes these files and a few more: it turns dictation, meetings, in-person meetings and file transcription off (each then leaves the menu and frees its shortcuts), turns dictation languages on and off, changes the shortcuts, sets how long a model stays in memory and the interface language (English or Russian), and turns the island around the camera on and off (`island`). See [docs/macos.md](docs/macos.md#settings).
 
 ## Privacy
 

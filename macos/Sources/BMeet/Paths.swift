@@ -94,6 +94,8 @@ enum Settings {
     static var updateCheck: Bool { word("update-check", default: "on") != "off" }
     /// Voice fingerprints of the people you named (off unless you turn them on; README, Privacy).
     static var rememberVoices: Bool { word("remember-voices", default: "off") == "on" }
+    /// BMeet around the camera housing (Island.swift): "on" (the default) or "off".
+    static var island: Bool { word("island", default: "on") != "off" }
     /// "system" (the default), "en" or "ru"; anything else counts as "system".
     static var interfaceLanguage: String {
         let value = word("interface-language", default: "system").lowercased()
@@ -128,6 +130,7 @@ enum Settings {
         var languages: [String] = []
         var language = ""
         var liveText = true, speakers = true, rememberVoices = false, startAtLogin = true, updateCheck = true
+        var island = true
         var unloadAfter = 5
 
         static func read() -> Snapshot {
@@ -142,6 +145,7 @@ enum Settings {
             s.rememberVoices = Settings.rememberVoices
             s.startAtLogin = Settings.startAtLogin
             s.updateCheck = Settings.updateCheck
+            s.island = Settings.island
             s.unloadAfter = Settings.unloadAfter
             return s
         }

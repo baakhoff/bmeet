@@ -80,6 +80,28 @@
 "Could not look for updates" = "Не удалось проверить обновления";
 "bmeet-ctl did not answer" = "bmeet-ctl не ответил";
 
+/* The island around the camera: the short text beside the camera, then the island open */
+/* after a language's name: Английский · в буфер обмена */
+"to the clipboard" = "в буфер обмена";
+"Online meeting" = "Онлайн-встреча";
+"In-person meeting" = "Очная встреча";
+"Paused. Nothing is recorded until you resume." = "Пауза. Пока вы не продолжите, ничего не записывается.";
+"Recording your microphone. The voices are told apart when you stop." = "Записывается ваш микрофон. Голоса будут различены, когда вы остановите встречу.";
+"Recording your microphone and what your Mac plays." = "Записываются ваш микрофон и звук Mac.";
+"Speakers" = "Собеседники";
+"The transcript is updated in a few minutes." = "Расшифровка обновится через несколько минут.";
+"Saved" = "Сохранено";
+"Transcript saved" = "Расшифровка сохранена";
+"Failed" = "Сбой";
+"Speakers not told apart" = "Собеседники не различены";
+"The transcript stays as it was written during the meeting." = "Расшифровка останется такой, какой была записана во время встречи.";
+/* the island's buttons */
+"Stop" = "Стоп";
+"Pause" = "Пауза";
+"Resume" = "Продолжить";
+"Open" = "Открыть";
+"OK" = "ОК";
+
 /* Settings: the pages */
 "General" = "Основные";
 "Features" = "Функции";
@@ -129,6 +151,11 @@
 "Later meetings call the people you named by their names. BMeet keeps a voice fingerprint of each: biometric data about other people, so turn it on only where that is fine. Turning it off forgets them all." = "В следующих встречах названные вами люди получают свои имена. BMeet хранит отпечаток голоса каждого, а это биометрические данные других людей: включайте это, только где это допустимо. Если выключить, BMeet забудет все голоса.";
 "File transcription" = "Расшифровка файлов";
 "Turns audio and video files into text: Transcribe a File… in the menu, the BMeet window and Finder's Quick Actions." = "Превращает аудио- и видеофайлы в текст: «Расшифровать файл…» в меню, окно BMeet и Быстрые действия в Finder.";
+/* the dictation's caption where the island around the camera shows */
+"Speak, and the text is pasted where you were typing or put on the clipboard. Around the camera, BMeet shows that it listens." = "Говорите, и текст вставится туда, где вы печатали, или попадет в буфер обмена. Что BMeet слушает, видно вокруг камеры.";
+"Show BMeet around the camera" = "Показывать BMeet вокруг камеры";
+"Dictation and meetings show around the camera; click there for their controls." = "Диктовка и встречи видны вокруг камеры; нажмите туда, чтобы управлять ими.";
+"This Mac's screen has no camera housing." = "На экране этого Mac нет выреза для камеры.";
 "A feature that is off leaves BMeet's menu and shortcuts. The transcripts you have stay in the BMeet window." = "Выключенная функция исчезает из меню BMeet и сочетаний клавиш. Готовые расшифровки остаются в окне BMeet.";
 "Remember voices?" = "Запоминать голоса?";
 "BMeet will keep a voice fingerprint of each person in your meetings, 192 numbers from which no audio or words can be recovered, and later meetings call the people you named by their names. Fingerprints are biometric data about other people: turn this on only where that is fine." = "BMeet будет хранить отпечаток голоса каждого участника ваших встреч, 192 числа, по которым нельзя восстановить ни звук, ни слова, и в следующих встречах названные вами люди получат свои имена. Отпечатки голоса — биометрические данные других людей: включайте это, только где это допустимо.";

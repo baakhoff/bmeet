@@ -1,4 +1,5 @@
-// Global shortcuts: what KDE's shortcuts (Meta+H, Meta+Alt+M, ...) do on Linux.
+// Global shortcuts: what KDE's shortcuts (Meta+H, Meta+Alt+M, ...) do on Linux. Also Esc, while
+// the island around the camera is open (holdEscape).
 //
 // Carbon's RegisterEventHotKey: the shortcut is BMeet's alone while it runs, and it needs no
 // permission (unlike watching every key, which needs Input Monitoring). The defaults put
@@ -67,21 +68,25 @@ final class HotKeys {
         Paths.write(lines.joined(separator: "\n"), to: file)
     }
 
+    private func installHandler() {
+        guard handler == nil, !dryRun else { return }
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, user in
+            var id = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &id)
+            let me = Unmanaged<HotKeys>.fromOpaque(user!).takeUnretainedValue()
+            let action: String? = id.id == HotKeys.escapeID ? "escape" : me.actions[id.id]
+            if let action { DispatchQueue.main.async { me.onPress(action) } }
+            return noErr
+        }, 1, &spec, me, &handler)
+    }
+
     /// Registers the plan, letting go of what was registered before.
     func register() {
         unregister()
-        if handler == nil && !dryRun {
-            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-            let me = Unmanaged.passUnretained(self).toOpaque()
-            InstallEventHandler(GetApplicationEventTarget(), { _, event, user in
-                var id = EventHotKeyID()
-                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
-                                  MemoryLayout<EventHotKeyID>.size, nil, &id)
-                let me = Unmanaged<HotKeys>.fromOpaque(user!).takeUnretainedValue()
-                if let action = me.actions[id.id] { DispatchQueue.main.async { me.onPress(action) } }
-                return noErr
-            }, 1, &spec, me, &handler)
-        }
+        installHandler()
         for (action, combo) in HotKeys.plan() {
             guard let (key, mods, label) = HotKeys.parse(combo) else {
                 NSLogLine("hotkeys: cannot read \(action) = \(combo)")
@@ -122,6 +127,30 @@ final class HotKeys {
 
     /// How many shortcuts are registered with macOS now (a check).
     var registeredCount: Int { refs.count }
+
+    private static let escapeID = UInt32.max
+    private var escapeRef: EventHotKeyRef?
+    /// Esc is BMeet's now (a check: would be).
+    private(set) var escapeHeld = false
+
+    /// Esc alone, held while the island is open: Esc closes it, without the keyboard focus ever
+    /// coming to BMeet. Let go as soon as the island closes, so Esc is the apps' again. It is no
+    /// shortcut of the hotkeys file: registering those again leaves it alone.
+    func holdEscape(_ hold: Bool) {
+        guard hold != escapeHeld else { return }
+        escapeHeld = hold
+        guard !dryRun else { return }
+        if hold {
+            installHandler()
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(kVK_Escape), 0, EventHotKeyID(signature: OSType(0x424D_4554), id: HotKeys.escapeID),
+                                             GetApplicationEventTarget(), 0, &ref)
+            if status == noErr { escapeRef = ref } else { NSLogLine("the island: Esc is taken by another app (\(status))") }
+        } else if let ref = escapeRef {
+            UnregisterEventHotKey(ref)
+            escapeRef = nil
+        }
+    }
 
     /// The combo as a menu item's key equivalent (shown in the menu the Mac way: ⌃⌥H).
     static func menuKey(_ combo: String) -> (key: String, mods: NSEvent.ModifierFlags)? {

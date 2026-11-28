@@ -119,6 +119,8 @@ jobs:
         run: python -I macos/tests/test_macos.py -v
       - name: BMeet.app's Settings window, feature switches and translations (its check modes, off screen)
         run: python -I macos/tests/test_settings.py -v
+      - name: BMeet.app's island around the camera (its check modes, off screen, for given housings)
+        run: python -I macos/tests/test_island.py -v
       - name: BMeet window + bmeet-ctl tests (offscreen; the Linux window, as on Linux)
         env:
           QT_QPA_PLATFORM: offscreen

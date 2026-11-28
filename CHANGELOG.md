@@ -9,27 +9,41 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 
 ## [0.9.0] - 2026-11-28
 
+The BMeet app in Russian, a choice of engine for files with GigaAM v3 among them, and switches for the features you don't use. Text while you speak lets go of its model when you stop dictating.
+
+**To update:** BMeet 0.8.2 offers this release within a day: **Update…** in the BMeet window and the panel widget. In a terminal, `bmeet-ctl update` does the same. From 0.8.1, run the install line once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | bash
+```
+
 ### Added
+- **The app in Russian:** `~/.config/bmeet/interface-language` says `system` (the default: the locale, `LC_ALL`, `LC_MESSAGES` or `LANG`), `en` or `ru`. So with a Russian locale the app speaks Russian after this update; `echo en > ~/.config/bmeet/interface-language` keeps it English.
+  - Every text of the app, language names included, comes from one table (`bmeet/app/bmeettext.py`). The panel widget, command-line output and transcripts stay English.
+  - After a change, the open app offers **Restart**.
+- **The engine in the app's *Transcribe a file*:** *Automatic* (GigaAM v3 for Russian, Whisper turbo otherwise), *GigaAM v3 (Russian)*, *Whisper large-v3 turbo* or *Whisper small*, passed to npu-transcribe as `--engine` and `--model`. Before, the page offered only a Whisper size, so GigaAM, which npu-transcribe already used for Russian, could not be chosen or seen. GigaAM is offered when it is installed and Russian is one of your languages; it sets the language to Russian, and Translate turns it off. The *Options* column says what ran (`GigaAM v3 · ru`), and *Transcribed files* names the model (`GigaAM v3`, `Whisper turbo`).
+- **Features can be turned off:** `~/.config/bmeet/dictation`, `meetings`, `in-person-meetings` and `file-transcription` saying `off`.
+  - Their controls leave the app while it is open (dictation's buttons, the buttons that start a meeting, the *Transcribe a file* page, Ctrl+O, *Transcribe again*); the *Meetings* and *Transcribed files* pages keep their lists.
+  - `bmeet-ctl dictate` (so Meta+H and Meta+Alt+H), `bmeet-ctl lang` and `bmeet-ctl meeting start` then refuse, with status 3; stopping a meeting that runs still works.
+  - Not yet: the panel widget, the meeting and language shortcuts (Meta+Alt+M, Meta+Alt+Shift+M, Meta+Shift+H) and Dolphin's menu do not follow the switches.
 - **The dictation model is released when you stop dictating:** with text while you speak on (`live-dictation`), `bmeet-dictate` ends its engine, and the memory its model takes, `unload-after` minutes after the last dictation. That is `~/.config/bmeet/unload-after`, in minutes (0–60, default 5; `0`: right after each dictation), read when it is needed. Before, the model stayed loaded for good (GigaAM ~0.6 GB, Whisper turbo ~3.8 GB).
   - The next dictation starts the engine again. It starts recording first and loads the model while you speak, so nothing said meanwhile is lost.
   - The engine (`npu-transcribe --dictate`) also releases its model on the same clock by itself.
   - voxtype keeps its own whisper-small loaded, as before: its `on_demand_loading` would load the model for every dictation (~3 s each time), with no idle timer to choose instead.
+- **`bmeet-ctl settings`** opens BMeet's settings folder, `~/.config/bmeet`, in the file manager.
 - **`npu-transcribe --queue`:** runs started with it go one at a time (a lock in `$XDG_RUNTIME_DIR/bmeet`, which a crash lets go of too). A file started while another is being transcribed then waits instead of loading the models a second time. Dolphin's menu does not pass it yet.
-- **The engine in the app's *Transcribe a file*:** *Automatic* (GigaAM v3 for Russian, Whisper turbo otherwise), *GigaAM v3 (Russian)*, *Whisper large-v3 turbo* or *Whisper small*, passed to npu-transcribe as `--engine` and `--model`. Before, the page offered only a Whisper size, so GigaAM, which npu-transcribe already used for Russian, could not be chosen or seen. GigaAM is offered when it is installed and Russian is one of your languages; it sets the language to Russian, and Translate turns it off. The *Options* column says what ran (`GigaAM v3 · ru`), and *Transcribed files* names the model (`GigaAM v3`, `Whisper turbo`).
-- **Features can be turned off:** `~/.config/bmeet/dictation`, `meetings`, `in-person-meetings` and `file-transcription` saying `off`. Its controls leave the app while it is open (dictation's buttons, the buttons that start a meeting, the *Transcribe a file* page, Ctrl+O, *Transcribe again*); the *Meetings* and *Transcribed files* pages keep their lists. `bmeet-ctl dictate`, `bmeet-ctl lang` and `bmeet-ctl meeting start` then refuse, with status 3; stopping a meeting that runs still works.
-- **The app in Russian:** `~/.config/bmeet/interface-language` says `system` (the default: the locale, `LC_ALL`, `LC_MESSAGES` or `LANG`), `en` or `ru`. Every text of the app, language names included, comes from one table (`bmeet/app/bmeettext.py`); command-line output and transcripts stay English. After a change, the open app offers **Restart**.
-- **`bmeet-ctl settings [PAGE]`:** BMeet's settings; on Linux the folder `~/.config/bmeet`.
 
 ### Changed
 - **Languages in *Transcribe a file*:** *Detect automatically* and the languages in `~/.config/bmeet/languages`; English is no longer always offered. The list follows the file while the app is open.
 - **`bmeet-ctl status`** adds `features` (`dictation`, `meetings`, `in_person_meetings`, `file_transcription`: true or false) and `interface_language` (`en` or `ru`). Every key it had stays, for the panel widget.
 
+### Fixed
+- **An empty *Meetings* or *Transcribed files* list showed nothing:** the text that says it is empty never appeared. It does now.
+
 ### Tests
 - `transcribe/tests/test_dictation.py`: the dictation engine releases its model when idle, loads it again for the next dictation, and reads `unload-after` when it is needed.
-- `bmeet/dictate/tests/test_dictate.py`:
-  - the engine ends after a dictation when `unload-after` is 0, and the next dictation starts a new one;
-  - run on a Mac, its `bmeet-ctl` calls had reached the BMeet.app running there (bmeet-ctl's Mac path). They now take the Linux path, in a runtime folder of their own, and the file refuses to start a command that could reach the Mac's.
-- **`bmeet/app/tests/test_bmeet.py`:** a text of the app (or of macOS's meeting notifications) without its Russian line, or a Russian line without its text, fails a test that reads the sources. Also tested: the window in Russian, with nothing English left but names; the interface language from the setting and the locale; each engine, what it passes, GigaAM ↔ Russian ↔ Translate, the *Options* column, the options saved; each feature hiding exactly its controls and coming back while the window is open; `bmeet-ctl status`, its refusals, and `bmeet-ctl settings`.
+- `bmeet/dictate/tests/test_dictate.py`: the engine ends after a dictation when `unload-after` is 0, and the next dictation starts a new one.
+- **`bmeet/app/tests/test_bmeet.py`:** a text of the app without its Russian line, or a Russian line without its text, fails a test that reads the sources. Also tested: the window in Russian, with nothing English left but names; the interface language from the setting and the locale; each engine, what it passes, GigaAM ↔ Russian ↔ Translate, the *Options* column, the options saved; each feature hiding exactly its controls and coming back while the window is open; `bmeet-ctl status`, its refusals, and `bmeet-ctl settings`.
 
 ## [0.8.2] - 2026-10-27
 

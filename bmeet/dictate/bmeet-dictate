@@ -52,7 +52,7 @@ import time
 import tomllib
 from pathlib import Path
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 PROG = "bmeet-dictate"
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()

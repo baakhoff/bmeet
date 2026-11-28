@@ -7,7 +7,7 @@ code both share are in both ([docs/releasing.md](../docs/releasing.md)). The for
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.10.0] - 2026-11-28
 
 ### Added
 - **Models are released when nothing uses them,** by one setting: `~/.config/bmeet/unload-after`, in minutes (0–60, default 5; `0`: right after each use). Each process reads it when it decides, so a change applies without a restart. What each process holds and when it lets go: [docs/macos.md](../docs/macos.md#memory).
@@ -145,6 +145,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
   - bmeet-ctl's commands to BMeet.app.
 - **The app's tests on a Mac:** they run there too (`BMEET_PLATFORM=linux` runs the Linux window with its fake voxtype), and keep their files out of your own Trash.
 
-[Unreleased]: https://github.com/baakhoff/bmeet/compare/macos-v0.9.1...main
+[Unreleased]: https://github.com/baakhoff/bmeet/compare/macos-v0.10.0...main
+[0.10.0]: https://github.com/baakhoff/bmeet/releases/tag/macos-v0.10.0
 [0.9.1]: https://github.com/baakhoff/bmeet/releases/tag/macos-v0.9.1
 [0.9.0]: https://github.com/baakhoff/bmeet/releases/tag/macos-v0.9.0

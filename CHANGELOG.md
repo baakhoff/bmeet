@@ -7,7 +7,7 @@ All notable changes to BMeet for Linux are documented here: its releases are the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] - 2026-11-28
 
 ### Added
 - **The dictation model is released when you stop dictating:** with text while you speak on (`live-dictation`), `bmeet-dictate` ends its engine, and the memory its model takes, `unload-after` minutes after the last dictation. That is `~/.config/bmeet/unload-after`, in minutes (0–60, default 5; `0`: right after each dictation), read when it is needed. Before, the model stayed loaded for good (GigaAM ~0.6 GB, Whisper turbo ~3.8 GB).
@@ -264,7 +264,8 @@ First public release.
 - **`voicenotes-ctl`:** a JSON interface for the widget and app.
 - **Tools:** the `verify.sh` health check, offscreen app tests and the npu-transcribe benchmark.
 
-[Unreleased]: https://github.com/baakhoff/bmeet/compare/v0.8.2...main
+[Unreleased]: https://github.com/baakhoff/bmeet/compare/v0.9.0...main
+[0.9.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.9.0
 [0.8.2]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.2
 [0.8.1]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.1
 [0.8.0]: https://github.com/baakhoff/bmeet/releases/tag/v0.8.0

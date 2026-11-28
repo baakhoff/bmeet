@@ -224,6 +224,10 @@ final class Island {
             guard let self, case .idle = self.state else { return }
             self.panel?.orderOut(nil)
         }
+        view.onSettled = { [weak self] in
+            guard let self, !self.monitors.isEmpty else { return }
+            self.mouseMoved()
+        }
         if !Island.offScreen {
             NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
                                                    queue: .main) { [weak self] _ in
@@ -269,9 +273,12 @@ final class Island {
     /// has saved its transcript, or left the line that says the voices were not told apart.
     func follow(status s: [String: Any]) {
         let m = s["meeting"] as? String ?? "idle"
-        let now = (s["speakers_pending"] as? [String]) ?? []
-        for file in pending where !now.contains(file) { passEnded(file) }
-        pending = now
+        let listed = (s["speakers_pending"] as? [String]) ?? []
+        // (a pass that a stop has just started may be missing from a status that bmeet-ctl began
+        // before it: it has not ended while its recording still names it)
+        let starting = pending.filter { !listed.contains($0) && Island.passRuns(for: $0) }
+        for file in pending where !listed.contains(file) && !starting.contains(file) { passEnded(file) }
+        pending = listed + starting
         if m == "recording" || m == "paused" {
             if meeting == nil { saved = nil }   // (a new meeting: the last one's "Saved" is over)
             let started = s["meeting_started"] as? Double ?? (s["meeting_started"] as? Int).map(Double.init)
@@ -305,6 +312,7 @@ final class Island {
     private func passEnded(_ file: String) {
         let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
         if text.contains("- **Speaker pass:** the voices were not told apart") {   // (macos/bmeet-meeting writes it)
+            saved = nil
             if let f = failure {
                 failure = (f.title, f.detail, f.file ?? file)
             } else {
@@ -342,7 +350,14 @@ final class Island {
     // MARK: showing it
 
     func present(_ new: IslandState) {
-        let next: IslandState = shows ? new : .idle
+        let showing = shows
+        // (what the island cannot show now is not kept for later: its notification said it, and a
+        // "Failed" kept while the island was off or the lid closed would show up stale)
+        if !showing {
+            failure = nil
+            saved = nil
+        }
+        let next: IslandState = showing ? new : .idle
         let was = state
         state = next
         if case .idle = next {
@@ -452,19 +467,23 @@ final class Island {
     // MARK: the mouse
 
     /// Clicks reach the island only inside its shape: elsewhere the panel lets them through to
-    /// the menu bar and the apps below. A click elsewhere closes it when it is open.
+    /// the menu bar and the apps below. A click elsewhere closes it when it is open. Where the
+    /// mouse is counts again whenever the shape changes, as it may grow or shrink under a mouse
+    /// that does not move.
     private func watchMouse() {
-        guard monitors.isEmpty, !Island.offScreen else { return }
-        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: { [weak self] _ in
-            self?.mouseMoved()
-        }) { monitors.append(m) }
-        if let m = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] event in
-            self?.mouseMoved()
-            return event
-        }) { monitors.append(m) }
-        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
-            self?.close()
-        }) { monitors.append(m) }
+        guard !Island.offScreen else { return }
+        if monitors.isEmpty {
+            if let m = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: { [weak self] _ in
+                self?.mouseMoved()
+            }) { monitors.append(m) }
+            if let m = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] event in
+                self?.mouseMoved()
+                return event
+            }) { monitors.append(m) }
+            if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in
+                self?.close()
+            }) { monitors.append(m) }
+        }
         mouseMoved()
     }
 
@@ -579,6 +598,8 @@ final class IslandView: NSView {
     /// The size the view needs (the panel follows it), and the island has shrunk into the housing.
     var onSize: (NSSize) -> Void = { _ in }
     var onClosed: () -> Void = {}
+    /// A motion has ended: the shape is where it was going.
+    var onSettled: () -> Void = {}
 
     private(set) var content = IslandContent()
     private(set) var isOpen = false
@@ -801,9 +822,11 @@ final class IslandView: NSView {
             closing = false
             shape = Shape(width: 0, height: 0, radius: 0)
             content = IslandContent()
+            sign.sign = .none   // (a listening dot's pulse would go on in the hidden panel)
             onClosed()
             alphaValue = 1
         }
+        onSettled()
     }
 
     /// How far a spring has gone from 0 to 1 after `t` seconds (it may pass 1 and come back):

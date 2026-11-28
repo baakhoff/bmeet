@@ -24,9 +24,11 @@ holds, is only noted.
   hands the words back to it when it goes.
 - Settings -> Features: the row, disabled on a Mac without a housing; the switch writes its file.
 - A click opens it and holds Esc; Esc or a click outside closes it (a click outside its shape
-  goes through); hover grows it a little; its controls ask BMeet for the right thing.
+  goes through); Esc is let go however the open island goes (the state ends, the switch, the
+  housing); hover grows it a little; its controls ask BMeet for the right thing.
 - What BMeet makes of `bmeet-ctl status` answers: a meeting and its time, paused, in person; the
-  speaker pass, then saved or not told apart; a failure that waits until it is looked at.
+  speaker pass, then saved or not told apart; a failure that waits until it is looked at, and
+  none kept from while the island could not show it.
 - The pictures: PNGs at twice the size (a Retina screen's), and a sheet of every state.
 """
 from __future__ import annotations
@@ -396,6 +398,21 @@ class Clicks(Base):
         self.assertFalse(outside["escape_held"])
         self.assertEqual(outside["state"], "speakers")
 
+    def test_esc_is_let_go_however_the_open_island_goes(self) -> None:
+        # (an Esc left held would be taken from every app): the state ends, the switch is turned
+        # off, the housing goes (the lid closed, the display changed)
+        for state in ("meeting", "listening", "failed"):
+            for act in ("end", "island-off", "no-housing"):
+                with self.subTest(state=state, act=act):
+                    self.f.set("island", "on")   # (island-off turned it off in the folders)
+                    click, gone = self.acts(state, "click", act)
+                    self.assertTrue(click["open"])
+                    self.assertTrue(click["escape_held"])
+                    self.assertFalse(gone["island"])
+                    self.assertFalse(gone["open"])
+                    self.assertFalse(gone["escape_held"])
+                    self.assertEqual(gone["panel"], act != "end")   # (the dictation panel is back)
+
     def test_a_second_click_closes_it(self) -> None:
         first, second = self.acts("meeting", "click", "click")
         self.assertTrue(first["open"])
@@ -510,6 +527,25 @@ class Status(Base):
         (folder / "speaker-pass").write_text(file + "\n")   # (what bmeet-meeting marks the recording with)
         line = self.f.status(meeting(), IDLE | {"written": file, "speakers_pending": [file]})[-1]
         self.assertEqual(line["state"], "speakers")
+
+    def test_a_status_from_before_the_speaker_pass_does_not_end_it(self) -> None:
+        # a poll that began before the stop marked the recording comes back after the stop printed
+        # the transcript: the pass has not ended (no "Saved" while it runs)
+        file = str(self.transcript())
+        folder = self.f.run_dir / "meeting-audio/2026-11-28_1405"
+        folder.mkdir(parents=True)
+        (folder / "speaker-pass").write_text(file + "\n")
+        lines = self.f.status(meeting(), IDLE | {"written": file}, IDLE)
+        self.assertEqual([line["state"] for line in lines], ["meeting", "speakers", "speakers"])
+
+    def test_a_failure_the_island_could_not_show_is_not_kept(self) -> None:
+        # (with the island off when it came, turning it on later shows nothing stale)
+        self.f.set("island", "off")
+        crash = {"title": "Meeting recording stopped unexpectedly", "body": "", "ok": False}
+        lines = self.f.status(meeting() | {"notify": [crash]}, IDLE, more=("--act", "island-on"))
+        self.assertEqual([line["state"] for line in lines], ["idle", "idle", "idle"])
+        self.assertFalse(lines[-1]["panel"])    # (the island is on again: it only has nothing to show)
+        self.assertFalse(lines[-1]["island"])
 
     def test_a_new_meeting_ends_the_last_ones_saved(self) -> None:
         file = str(self.transcript())

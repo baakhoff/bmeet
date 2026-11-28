@@ -39,7 +39,7 @@ enum Checks {
                      "notify": [{title, body, ok}], notifications that came after it, and
                      "written": PATH, what a stop printed).
                      ACT (after one state, or the last FILE): click outside escape hover leave
-                     button:ACTION
+                     end island-off island-on no-housing button:ACTION
                Any check: --screen W,H --housing X,W,H|none, the screen and its camera housing
                      in points (X from the screen's left edge); --screen real: this Mac's
         """
@@ -586,9 +586,21 @@ enum Checks {
                 }
             case "escape": island.escape()   // (what the Esc hot key does)
             case "hover", "leave": island.setHover(act == "hover")
+            // The ways the island goes, each as BMeet takes it: what it knows says nothing runs
+            // (after a STATE alone, nothing does), the switch is turned off or on, the housing goes
+            case "end": app.refreshIsland()
+            case "island-off", "island-on":
+                Settings.set("island", act == "island-on" ? "on" : "off")
+                app.settingsChanged()
+            case "no-housing":
+                Island.checkGeometry = nil
+                Island.checkMeasuresScreens = false
+                island.measure()
+                island.onScreens()
             default:
                 guard act.hasPrefix("button:"), let button = view.buttons.first(where: { "button:" + $0.what.rawValue == act }) else {
-                    complain("no act \(act) here: click outside escape hover leave button:ACTION (\(view.buttons.map(\.what.rawValue)))")
+                    complain("no act \(act) here: click outside escape hover leave end island-off island-on no-housing "
+                             + "button:ACTION (\(view.buttons.map(\.what.rawValue)))")
                     return 2
                 }
                 button.performClick(nil)

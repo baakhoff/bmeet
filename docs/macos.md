@@ -85,7 +85,35 @@ BMeet lives in the menu bar: a microphone. It turns red while you dictate or a m
 
 A feature turned off in Settings → Features is gone from the menu and its shortcuts are free for other apps; the menu shows only what is on (with everything off, its first line says so). A meeting that runs can always be stopped from the menu, even with meetings turned off.
 
-While you dictate, a small panel at the bottom of the screen shows the words as you say them. It is underlined while a word may still change, and it floats over full-screen apps too. It never takes the keyboard focus, so the text goes where you were typing. When you stop, BMeet puts the text on the clipboard, presses ⌘V, and gives you your clipboard back. `~/.config/bmeet/live-dictation` saying `off` hides the words (the panel then only shows *Listening…*).
+While you dictate, a small panel at the bottom of the screen shows the words as you say them. It is underlined while a word may still change, and it floats over full-screen apps too. It never takes the keyboard focus, so the text goes where you were typing. When you stop, BMeet puts the text on the clipboard, presses ⌘V, and gives you your clipboard back. `~/.config/bmeet/live-dictation` saying `off` hides the words (the panel then only shows *Listening…*). On a Mac whose screen has a camera housing, the island around the camera shows all of this instead, and the panel stays hidden ([below](#around-the-camera)).
+
+### Around the camera
+
+On a Mac whose screen has a camera housing at the top, BMeet shows what it is doing around it, the way an iPhone shows a call or a timer in its Dynamic Island. macOS has no API for this (Apple's Live Activities are not available on the Mac), so BMeet draws its own: a black shape joined to the housing, its corners rounded to the housing's height.
+
+![Every state of the island, closed and open, on a dark menu bar](macos-island-dark.png)
+
+*The island in each state, closed and open, at the geometry of a MacBook Pro M5 Pro (a housing 70 × 47.5 points in a screen of 1800 × 1182). These are BMeet's own drawing, made off screen by `BMeet --island-check all --picture DIR`, not screenshots. The same on a light menu bar: [macos-island-light.png](macos-island-light.png); in Russian: [macos-island-ru.png](macos-island-ru.png).*
+
+| What BMeet does | Closed: beside the housing | Open: a click on it |
+|---|---|---|
+| nothing | nothing: the housing stays as it is | – |
+| you dictate | a pulsing red dot and the language (*EN*). With *Show the words while you speak* on, it opens downward with the words as you say them, underlined while they may still change | *Listening…*, the language, the words, **Stop** and **Cancel** |
+| it transcribes your last words | a spinner and the language | *Transcribing…*, **Cancel** |
+| an online meeting records | a red dot and the meeting's time | what is recorded, **Pause** and **Stop** |
+| an in-person meeting records | a sign of two people and the time | the same |
+| a meeting is paused | a pause sign and the time | **Resume** and **Stop** |
+| the speaker pass works after a meeting | a spinner and *Speakers* | *Telling speakers apart…*, **Open** (the transcript as it is now) |
+| a transcript was saved | a check mark and *Saved*; it closes by itself 5 seconds later, unless it is open or under the mouse | its file name and **Open** |
+| something failed | a warning sign and *Failed*, until you have opened it and closed it again | what went wrong, **OK**, and **Open** when there is a transcript |
+
+- **One at a time:** a dictation first, then a meeting that records, then a failure, then the speaker pass, then *Saved*. A new meeting ends the last one's *Saved*.
+- **Saved and failed:** *Saved* comes when a speaker pass ends and its transcript has no line saying the voices were not told apart, and when a meeting stops with speakers off and bmeet-meeting says where it saved the transcript. *Failed* comes when that line is there (*Speakers not told apart*), and for a notification of BMeet's that says something failed while a meeting records, stops or has its speakers told apart, or within 30 seconds after one recorded: a meeting not started, a transcript not saved, a recorder that stopped unexpectedly. It shows the notification's title and text. While a file transcription that BMeet started (Finder's services) runs, no notification counts, as it may be the file's.
+- **Never the keyboard focus:** it never becomes the active window and never activates BMeet, so dictated text still goes where you were typing, and **Stop** pastes there. Clicks outside its shape go through to the menu bar and the apps below.
+- **Closing it:** a click outside it, a second click on it, or Esc. BMeet holds Esc only while the island is open (a shortcut of its own, so it needs no keyboard focus); while it is open, Esc closes it instead of reaching the app in front, and as soon as it closes, Esc is the apps' again.
+- **Motion:** it widens and opens on a spring and grows a little under the mouse, to show it can be clicked. With *Reduce motion* on (System Settings → Accessibility → Display), it fades instead.
+- **Where:** above the menu bar, over full-screen apps, on every Space, on the screen with the housing (the built-in display with its lid open), whichever screen has the menu bar. BMeet measures the housing from macOS (the screen's safe area at the top and the two areas beside the housing), so it follows any housing: a wide, low notch of an older MacBook as well. When a display is added or removed or the resolution changes, it measures again. With the lid closed, on a Mac without a housing, or with the island turned off (Settings → Features → *Show BMeet around the camera*, `~/.config/bmeet/island`), there is no island, and the dictation panel at the bottom of the screen shows the words as before.
+- **Not in it:** file transcriptions and updates. The menu bar icon stays as it is.
 
 ### How it looks
 
@@ -100,6 +128,7 @@ While you dictate, a small panel at the bottom of the screen shows the words as 
   - *Transcribe a File* offers the engine: *Automatic* (GigaAM v3 for Russian), *GigaAM v3*, *Whisper turbo*, *Whisper small* ([npu-transcribe.md](npu-transcribe.md)).
 - **The menu bar:** each item has an SF Symbol, and the shortcuts show the Mac way, from the same `hotkeys` file. The first line shows the state with a colored dot.
 - **The dictation panel:** a red dot pulses while BMeet listens, next to the language.
+- **The island:** black like the housing and joined to it, with SF Symbols and the system's red, green and yellow for the states ([Around the camera](#around-the-camera)).
 - **The Settings window:** a toolbar with five pages, as in Apple's own apps (below).
 
 ![… and in dark mode](macos-window-dark.png)
@@ -113,7 +142,7 @@ While you dictate, a small panel at the bottom of the screen shows the words as 
 | Page | What is on it |
 |---|---|
 | **General** | *Language*: BMeet's interface language, *System*, *English* or *Русский* (`interface-language`). *Start BMeet at login* (`start-at-login`). *Check for updates automatically* (`update-check`). *Free memory after*: right after use, 1, 5 (the default), 15, 30 or 60 minutes (`unload-after`): how long a speech model stays in memory after its last use; loading Whisper turbo again takes a few seconds, and a few minutes the first time after an update, while macOS compiles it. *Pasting*: whether macOS lets BMeet paste (Accessibility), with *Allow Pasting…* (shown while dictation is on). *Open in Finder* for the settings folder |
-| **Features** | Switches for **dictation** (`dictation`, with *Show the words while you speak*, `live-dictation`, under it while dictation is on), **online meetings** (`meetings`), **in-person meetings** (`in-person-meetings`), *Tell speakers apart* (`speakers`), *Remember voices* (`remember-voices`) and **file transcription** (`file-transcription`), each with a line on what it does |
+| **Features** | Switches for **dictation** (`dictation`, with *Show the words while you speak*, `live-dictation`, under it while dictation is on), **online meetings** (`meetings`), **in-person meetings** (`in-person-meetings`), *Tell speakers apart* (`speakers`), *Remember voices* (`remember-voices`), **file transcription** (`file-transcription`) and *Show BMeet around the camera* (`island`, [the island](#around-the-camera)), each with a line on what it does. On a Mac whose screen has no camera housing, the last one is greyed and its line says so. Dictation's line says where BMeet shows that it listens: around the camera, or in the panel at the bottom of the screen |
 | **Languages** | The dictation language, chosen among the ones that are on (`language`), and every language Whisper knows with a switch (`languages`), searchable by name or code, names in the interface language, the ones on first. At least one stays on; when the current one is turned off, the first one left takes its place. A note says that Russian goes to GigaAM v3 (or to Whisper, without it) |
 | **Shortcuts** | Each of the five shortcuts, changed by clicking it and pressing the new keys (⌃, ⌥ or ⌘ with a letter, a digit or Space, or an F key alone); ⌫ turns one off, Esc keeps it, *Restore Defaults* (`hotkeys`). Keys that another of BMeet's shortcuts has are refused; a shortcut another app holds says *Taken by another app*. The shortcuts of a feature that is off are greyed: *Off on the Features page* |
 | **About** | The version, whether a newer release is out with **Check Now** or **Update…** (as the menu's update items), *What's New* (the new release's notes, else this changelog), the models installed and their licences (Whisper and WhisperKit: MIT; GigaAM v3: MIT; Nemotron 3 Diarization: OpenMDW-1.1; TitaNet-small: CC-BY-4.0; BMeet: MIT), github.com/baakhoff/bmeet and *Open Log Folder* |
@@ -141,6 +170,7 @@ The meetings and files transcribed before stay in the BMeet window and in *Recen
 | `interface-language` | `system` (default), `en` or `ru` |
 | `unload-after` | minutes, 0–60 (default 5): how long a process that waits for work keeps a model after its last use; `0`: right after each use. BMeet.app ends its speech engine after that long without a dictation ([Memory](#memory)) |
 | `live-dictation` | `on` (default on a Mac) or `off`: the words while you speak |
+| `island` | `on` (default) / `off`: BMeet around the camera housing, on a Mac that has one ([Around the camera](#around-the-camera)); off, the dictation panel at the bottom of the screen shows the words |
 | `speakers` | `on` / `off`: tell meeting speakers apart (Person 1, Person 2, …) |
 | `remember-voices` | `on` / `off` (default): as on Linux; also set in the window's *Name speakers…* |
 | `start-at-login` | `on` / `off` |
@@ -152,7 +182,7 @@ The meetings and files transcribed before stay in the BMeet window and in *Recen
 ```
  ⌃⌥H / menu ──┐
  ⌃⌥M / menu ──┼─> BMeet.app (menu bar, Swift) ─┬─> npu-transcribe --dictate ──> bmeet-record raw (microphone)
- bmeet-ctl ───┘   agent.sock                   │       text events -> the panel; ⌘V at the end
+ bmeet-ctl ───┘   agent.sock                   │       text events -> the island or the panel; ⌘V at the end
                                                └─> bmeet-meeting start|stop (Python)
                                                      ├─ RAM disk on $XDG_RUNTIME_DIR/bmeet/meeting-audio
                                                      ├─ bmeet-record meeting DIR   (mic + Core Audio tap of the system audio)
@@ -173,7 +203,7 @@ The meetings and files transcribed before stay in the BMeet window and in *Recen
 | `$XDG_RUNTIME_DIR` (tmpfs) | macOS has no such variable: `macos/bmeetmac.py` points it at your user's temp folder, the same for every process. The meeting audio goes to a RAM disk that bmeet-meeting mounts there (hidden from Finder) and detaches when no recording is left: it never reaches the disk |
 | systemd user units | bmeet-meeting's "units": detached processes with pid files in `$XDG_RUNTIME_DIR/bmeet/units`, and what to run when each ends |
 | KDE shortcuts, the panel widget | BMeet.app's shortcuts (Carbon hot keys: no Input Monitoring permission) and its menu bar icon |
-| ydotool / wl-copy, KWin's input method | the clipboard, ⌘V (CGEvent; Accessibility), and the panel at the bottom of the screen |
+| ydotool / wl-copy, KWin's input method | the clipboard, ⌘V (CGEvent; Accessibility), and the island around the camera or the panel at the bottom of the screen |
 | Dolphin service menu | BMeet.app's Services (Finder → Quick Actions / Services) |
 | notify-send | BMeet.app's notifications (`bmeetmac.notify`) |
 | The app on the system PyQt6 | the same app on the venv's PyQt6, inside `BMeet.app/Contents/Helpers/BMeet Window.app`: `macos/window/launcher.c` runs Python inside that bundle, so macOS shows *BMeet* with its icon, not *Python* |
@@ -224,7 +254,8 @@ BMeet keeps a model loaded only while it may be needed soon. One setting says ho
 
 ## Differences from Linux
 
-- **No text into the field while you speak:** on Linux BMeet can be KWin's input method. On a Mac the words show in the floating panel and are pasted when you stop.
+- **No text into the field while you speak:** on Linux BMeet can be KWin's input method. On a Mac the words show in the island around the camera, or in the floating panel, and are pasted when you stop.
+- **The island around the camera** is the Mac's alone: Linux has the panel widget instead.
 - **No pyannote fallback** for telling voices apart. The Mac install always has Nemotron, and ONNX Runtime, which pyannote would need, crashes next to Core ML in one process.
 - **One Whisper model:** dictation uses Whisper turbo, like files and meetings; Linux's voxtype uses Whisper small. It is fast enough on the Neural Engine, and it is already loaded.
 - **The meeting audio is always recorded while a meeting runs** (in RAM): there is no voxtype that transcribes it itself. With `speakers` off it is deleted as soon as the live transcript is done, instead of after the speaker pass.
@@ -238,6 +269,7 @@ macos/.build/release/bmeet-whisper transcribe talk.f32 --words   # raw float32 1
 QT_QPA_PLATFORM=offscreen ~/.local/share/bmeet/venv/bin/python -I bmeet/app/tests/test_bmeet.py   # the app's tests
 ~/.local/share/bmeet/venv/bin/python -I macos/tests/test_macos.py                               # the Mac parts
 python3 -I macos/tests/test_settings.py                                                        # BMeet.app's Settings window
+python3 -I macos/tests/test_island.py                                                          # the island around the camera
 python3 -I macos/tools/check-strings.py                                                        # BMeet.app's Russian texts
 ```
 
@@ -256,6 +288,13 @@ python3 -I macos/tools/check-strings.py                                         
   - `--settings-act`: the Settings window's controls worked as a click or a key press would, and the files they wrote;
   - `--control-check`: the control socket with a stand-in for BMeet's Python, so nothing records: the `settings` op, and `dictate` and `meeting` refusing what is off;
   - `--hotkey-check`: shortcuts registered with macOS again as the switches change, with ⌃⌥⇧⌘ and F13–F20 only, which nobody uses.
+- `macos/tests/test_island.py` drives `--island-check`, and the checks above with a housing given:
+  - Every check takes `--screen W,H --housing X,W,H` (points, X from the screen's left edge): the screen and camera housing its island has. Without them a check has no housing, never this Mac's; `--screen real` measures this Mac's screens.
+  - `--island-check STATE|all [--open] [--act ACT...]`: the island laid out off screen, one JSON line each: its frame, its texts, its controls, and whether it is right: centred on the housing, at least as wide and as tall, on the screen, no text cut short, outside its shape or under the camera, every text translated. `all` is every state, closed and open. The acts are what the mouse and Esc do: `click` (at a point on the island), `outside` (a click outside its shape, which must go through), `escape`, `hover`, `leave`, `button:pause` and the other controls, which print what they asked BMeet to do.
+  - `--island-check status --status FILE...`: what BMeet makes of `bmeet-ctl status` answers in turn, with `"notify"` (the notifications that came after one) and `"written"` (the transcript a stop printed), and the acts after the last.
+  - `--picture DIR` with `--appearance light|dark` draws each state into PNGs at twice the size, on a menu bar of that look, and with `all` a sheet of them (`docs/macos-island-*.png` are these).
+  - The tests: this Mac's housing (70 × 47.5 points in 1800 × 1182) and an older notch (185 × 32 in 1512 × 982); no island without a housing or with the switch off, and the dictation panel instead (through `--control-check` and a dictation with the stand-in engine); the Features page's row; the clicks, Esc and the controls; the states BMeet derives from the status.
+  - Not tested by a check, because nothing is shown: how the island looks and moves on the real screen, whether it lines up with the real housing to the pixel, whether clicks reach it above the menu bar, full-screen apps and Spaces, and *Saved* closing by itself (its timer runs only on the screen).
 - The native parts build with the Command Line Tools alone (`swift build`). WhisperKit is pinned in `macos/Package.resolved`.
 
 ## Troubleshooting

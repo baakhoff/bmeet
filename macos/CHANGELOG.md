@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/baakhoff/bmeet/main/install.sh | ba
 - **`npu-transcribe --queue`:** runs started with it go one at a time (a lock in the runtime folder, which a crash lets go of too). A file started while another is being transcribed then waits instead of loading the models a second time. Finder's services do not pass it yet.
 
 ### Changed
-- BMeet.app follows the files in `~/.config/bmeet` while it runs (within 2 s), whoever wrote them: the shortcuts in `hotkeys` and a feature's switch no longer need a restart.
+- **BMeet.app follows the files in `~/.config/bmeet`** while it runs (within 2 s), whoever wrote them: the shortcuts in `hotkeys` and a feature's switch no longer need a restart.
 - **Languages in *Transcribe a File*:** *Detect automatically* and the languages that are on; English is no longer always offered.
 - **`bmeet-ctl status`** adds `features` and `interface_language`. Its `live_dictation` is `on` without the file, as BMeet.app reads it (it said `off`), and its `language` is always one of `languages` (the first, when the file names none of them).
 
